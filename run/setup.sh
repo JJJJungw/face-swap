@@ -4,8 +4,8 @@
 set -e
 cd "$(dirname "$0")/.."
 
-# 0) 시스템 도구
-sudo apt-get update -y && sudo apt-get install -y ffmpeg git || true
+# 0) 시스템 도구 (python3-venv 포함 — venv 생성에 필요)
+sudo apt-get update -y && sudo apt-get install -y ffmpeg git python3-venv python3-pip || true
 
 # 1) 파이썬 가상환경
 python3 -m venv .venv
