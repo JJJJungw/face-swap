@@ -1,0 +1,15 @@
+# python
+.venv/
+__pycache__/
+*.pyc
+# 실행 산출물 / 모델 가중치 (레포에 올리지 않음)
+out/
+outputs/
+*.pt
+*.pth
+*.safetensors
+*.ckpt
+*.onnx
+# 대용량 입력/결과 미디어
+*.mp4
+*.mov

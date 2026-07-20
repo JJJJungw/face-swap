@@ -1,0 +1,18 @@
+flowchart TD
+    A["입력 영상<br/>(mp4/mov)"] -->|ffmpeg| B["① 디먹스<br/>프레임 분해 + 오디오 분리<br/>fps·해상도 추출"]
+    B --> C{"프레임 루프<br/>frame[i]"}
+
+    C -->|"기존 face-detect 모듈<br/>(또는 Mediapipe)"| D["② 얼굴 검출<br/>bbox + 랜드마크"]
+    D -->|"OpenCV warpAffine"| E["③ 정렬·크롭 512×512<br/>+ 역변환행렬 M⁻¹ 저장"]
+    E -->|"PyTorch<br/>animegan2(MIT) / DCT-Net(Apache)"| F["④ 카툰 스타일화<br/>(표정·구조 보존)"]
+    F -->|"RAFT(torchvision) /<br/>Farneback(OpenCV) optical flow"| G["⑤ 시간적 일관성 보정<br/>이전 프레임과 flow 블렌딩<br/>→ 깜빡임 제거"]
+    G -->|"OpenCV warpAffine(M⁻¹)<br/>+ seamlessClone/알파마스크"| H["⑥ 원본 프레임에 역합성<br/>(배경 유지 시)"]
+    H --> C
+
+    C -->|모든 프레임 완료| I["스타일 프레임 시퀀스<br/>frame_out[0..N]"]
+    I -->|"ffmpeg 인코딩<br/>+ 원본 오디오 mux"| J["출력 영상<br/>(mp4, 원본 fps)"]
+
+    subgraph SWAP["교체 가능 지점 (품질↑ 트랙)"]
+        F -.->|GPU 확보 시| K["Wan2.x+VACE(Apache) /<br/>AnimateDiff(Apache)<br/>= ④+⑤ 통합"]
+        E -.->|얼굴중심 아바타| L["LivePortrait(MIT)<br/>= 키프레임1장 + 원본표정 구동"]
+    end
