@@ -10,7 +10,9 @@ FLUX.1-schnell 영상 카툰화 테스트 (per-frame img2img)
   python run/flux_video_test.py --video clip.mp4
   python run/flux_video_test.py --video clip.mp4 --fps 8 --size 512 --strength 0.5 --smooth 0.3
 """
-import argparse, os, subprocess, glob, shutil, torch
+import os
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+import argparse, subprocess, glob, shutil, torch
 from PIL import Image
 from diffusers import FluxImg2ImgPipeline
 
@@ -53,7 +55,7 @@ def main():
     # 2) 모델 로드 (프롬프트 임베딩 1회 계산해 프레임마다 텍스트 인코딩 생략 → 속도↑)
     pipe = FluxImg2ImgPipeline.from_pretrained(
         "black-forest-labs/FLUX.1-schnell", torch_dtype=torch.bfloat16)
-    pipe.enable_model_cpu_offload()
+    pipe.enable_sequential_cpu_offload()  # L4 24GB 대응 (영상 다량 처리는 4bit 양자화 권장)
     with torch.no_grad():
         pe, ppe, _ = pipe.encode_prompt(prompt=args.prompt, prompt_2=args.prompt,
                                         device=pipe._execution_device, num_images_per_prompt=1)
