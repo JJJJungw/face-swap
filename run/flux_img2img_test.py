@@ -54,15 +54,12 @@ def main():
             num_inference_steps=max(args.steps, int(args.steps / st) + 1),
             generator=gen,
         ).images[0]
-        # 결과 단독 저장
-        out.save(os.path.join(args.out, f"result_{st:.2f}.jpg"))
-        # 원본|결과 비교 저장
-        cmp = Image.new("RGB", (init.width * 2, init.height), "white")
-        cmp.paste(init, (0, 0)); cmp.paste(out, (init.width, 0))
-        cmp.save(os.path.join(args.out, f"compare_{st:.2f}.jpg"))
-        print(f"saved result_{st:.2f}.jpg / compare_{st:.2f}.jpg")
+        # 결과 한 장만 저장
+        p = os.path.join(args.out, f"result_{st:.2f}.jpg")
+        out.save(p)
+        print("saved", p)
 
-    print("\n완료 → out/ 에서 result_*.jpg(결과) 및 compare_*.jpg(원본|결과) 확인")
+    print("\n완료 → out/ 에서 result_*.jpg 확인")
 
 if __name__ == "__main__":
     main()
