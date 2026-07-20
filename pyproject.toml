@@ -1,0 +1,23 @@
+[project]
+name = "face-swap"
+version = "0.1.0"
+description = "Face cartoonization pipeline (photo/video -> semi-realistic anime). Apache/MIT stack."
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+    "torchvision",
+    "diffusers>=0.30",
+    "transformers",
+    "accelerate",
+    "safetensors",
+    "sentencepiece",
+    "protobuf",
+    "peft",
+    "opencv-python",
+    "pillow",
+    "numpy",
+]
+
+# 애플리케이션(라이브러리 아님) — 프로젝트 자체 빌드는 하지 않음
+[tool.uv]
+package = false
