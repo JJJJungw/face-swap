@@ -31,10 +31,10 @@ def main():
     ap.add_argument("--fps", type=int, default=24)
     ap.add_argument("--size", type=int, default=512, help="긴 변 기준 처리 해상도")
     ap.add_argument("--batch", type=int, default=8)
-    ap.add_argument("--out", default="video_out")
+    ap.add_argument("--out", default="out")
     args = ap.parse_args()
 
-    fin = os.path.join(args.out, "in"); fout = os.path.join(args.out, "out")
+    fin = os.path.join(args.out, "frames_in"); fout = os.path.join(args.out, "frames_out")
     for d in (fin, fout): shutil.rmtree(d, ignore_errors=True); os.makedirs(d, exist_ok=True)
 
     # 1) 프레임 분해 + 오디오
@@ -49,7 +49,7 @@ def main():
     ensure_ckpt(); sys.path.insert(0, CKPT_DIR)
     from model import Generator
     torch.backends.cudnn.benchmark = True
-    dev = "cuda"; m = Generator().to(dev).eval().to(memory_format=torch.channels_last)
+    dev = "cuda"; m = Generator().to(dev).eval()   # FP32 (animegan2는 fp16에서 색 깨짐)
 
     im0 = Image.open(frames[0]); w, h = im0.size; sc = args.size / max(w, h)
     nw = max(64, int(round(w*sc/8))*8); nh = max(64, int(round(h*sc/8))*8)
@@ -59,10 +59,10 @@ def main():
     for i in range(0, len(frames), args.batch):
         chunk = frames[i:i+args.batch]
         batch = torch.stack([to_tensor(Image.open(p).convert("RGB").resize((nw, nh), Image.LANCZOS))*2-1
-                             for p in chunk]).to(dev).to(memory_format=torch.channels_last)
-        with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
+                             for p in chunk]).to(dev)
+        with torch.no_grad():
             y = m(batch)
-        y = (y.float()*0.5+0.5).clip(0, 1).cpu()
+        y = (y*0.5+0.5).clip(0, 1).cpu()
         for j, p in enumerate(chunk):
             to_pil_image(y[j]).save(os.path.join(fout, os.path.basename(p)))
         done += len(chunk); print(f"  {done}/{len(frames)}", end="\r")
