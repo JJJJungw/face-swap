@@ -44,7 +44,11 @@ def load_pipe():
         REPO, subfolder="text_encoder_2", quantization_config=nf4h, torch_dtype=torch.bfloat16)
     pipe = FluxImg2ImgPipeline.from_pretrained(
         REPO, transformer=transformer, text_encoder_2=te2, torch_dtype=torch.bfloat16)
-    pipe.enable_model_cpu_offload()   # 양자화 상태라 빠르고 24GB에 안전
+    # RAM 15GB뿐 → CPU offload 금지. 4bit 모델은 이미 GPU에 있고, 나머지(VAE/CLIP)만 GPU로.
+    # (offload 없이 GPU 상주 → RAM 안 건드림 → 프리즈 방지 + 더 빠름)
+    pipe.vae.to("cuda")
+    pipe.text_encoder.to("cuda")
+    pipe.enable_vae_tiling()          # 1024 디코딩 메모리 절약
     return pipe
 
 def main():
