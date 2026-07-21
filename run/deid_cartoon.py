@@ -1,40 +1,62 @@
 #!/usr/bin/env python3
-"""얼굴 검출(YOLOX ONNX) → 크기 임계값 이상 얼굴만 카툰화 → 타원 페더 합성 → 영상
-- 검출: face-deidentification의 detector.py + policy.py 로직을 독립 재현 (onnxruntime, 그쪽 레포 의존 X)
-- 카툰: 교체 가능한 스타일러 슬롯. 지금은 animegan2(파이프라인 메커니즘 검증용 placeholder)
-        → 나중에 Flux 증류로 만든 3D카툰 학생모델(ONNX)로 교체.
-- 합성: blur.py의 타원 페더 마스크 방식 재현.
+"""얼굴 검출(YOLOX ONNX) → 크면 카툰 / 작으면 블러 → 타원 페더 합성 → 영상
+- 검출: face-deid detector.py+policy.py 독립 재현. TensorRT(--trt) 또는 CUDA.
+- 카툰: animegan2(MIT) 슬롯 + 색감 매칭(--color-match).
+- 합성: 타원 페더, 크기분기(--cartoon-min).
+- 인코딩: ffmpeg 직결 파이프(NVENC 옵션) — PNG 중간파일 없음.
 사용법:
-  python run/deid_cartoon.py --video input/swap1.mp4 --min-face 60
+  python run/deid_cartoon.py --video input/swap2.mp4 --trt --encoder nvenc --color-match 0.5
 """
-import os, sys, argparse, subprocess, shutil, ssl, urllib.request, time
+import os, sys, argparse, subprocess, ssl, urllib.request, time
 import numpy as np, cv2
 
-# ============ 검출 파라미터 (face-deid presets.py "default" 재현) ============
-DET_LOW = 0.20; NMS = 0.45; MIN_SIZE = 19
-MAX_FRAC = 0.90; BIG_FRAC = 0.45; BIG_CONF = 0.5
+# ============ 검출 파라미터 (face-deid presets "default") ============
+DET_LOW=0.20; NMS=0.45; MIN_SIZE=19; MAX_FRAC=0.90; BIG_FRAC=0.45; BIG_CONF=0.5
 
 def preproc(img, size, pad=114):
-    """레터박스 전처리 (face-deid detector.preproc 동일)."""
     h, w = img.shape[:2]; r = min(size/h, size/w)
     nh, nw = int(round(h*r)), int(round(w*r))
     resized = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LINEAR)
     canvas = np.full((size, size, 3), pad, dtype=np.uint8); canvas[:nh, :nw] = resized
     return canvas.transpose(2, 0, 1)[None].astype(np.float32), r
 
+def _preload_trt_libs():
+    """tensorrt 패키지 .so를 미리 로드(LD_LIBRARY_PATH 없이도 libnvinfer 찾게)."""
+    try:
+        import tensorrt_libs, glob, ctypes
+        d = os.path.dirname(tensorrt_libs.__file__)
+        for _ in range(2):
+            for so in sorted(glob.glob(os.path.join(d, "*.so*"))):
+                try: ctypes.CDLL(so, mode=ctypes.RTLD_GLOBAL)
+                except OSError: pass
+    except Exception: pass
+
+def build_providers(model_path, use_trt):
+    if not use_trt:
+        return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    _preload_trt_libs()
+    cache = os.path.join(os.path.dirname(os.path.abspath(model_path)) or ".", "trt_cache")
+    os.makedirs(cache, exist_ok=True)
+    trt = ("TensorrtExecutionProvider", {
+        "trt_fp16_enable": True, "trt_engine_cache_enable": True,
+        "trt_engine_cache_path": cache, "trt_timing_cache_enable": True})
+    return [trt, "CUDAExecutionProvider", "CPUExecutionProvider"]
+
 class Detector:
-    def __init__(self, model, size=1280):
+    def __init__(self, model, size=1280, use_trt=False):
         import onnxruntime as ort
-        self.sess = ort.InferenceSession(model, providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
+        self.sess = ort.InferenceSession(model, providers=build_providers(model, use_trt))
+        if not use_trt and self.sess.get_providers() == ["CPUExecutionProvider"]:
+            self.sess = ort.InferenceSession(model, providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
         self.inp = self.sess.get_inputs()[0].name; self.size = size
-        warm = np.zeros((1, 3, size, size), dtype=np.float32)
-        for _ in range(2): self.sess.run(None, {self.inp: warm})
         print("detector providers:", self.sess.get_providers())
+        warm = np.zeros((1, 3, size, size), dtype=np.float32)
+        for _ in range(3): self.sess.run(None, {self.inp: warm})   # TRT면 첫 실행에 엔진 빌드(느림)
 
     def infer(self, frame):
         blob, r = preproc(frame, self.size)
-        out = self.sess.run(None, {self.inp: blob})[0][0]     # [N, 4+1+cls]
-        sc = out[:, 4] * out[:, 5]                             # obj × face_cls
+        out = self.sess.run(None, {self.inp: blob})[0][0]
+        sc = out[:, 4] * out[:, 5]
         cx, cy, bw, bh = out[:, 0], out[:, 1], out[:, 2], out[:, 3]
         x1 = (cx-bw/2)/r; y1 = (cy-bh/2)/r; x2 = (cx+bw/2)/r; y2 = (cy+bh/2)/r
         return np.stack([x1, y1, x2, y2, sc], axis=1)
@@ -56,7 +78,7 @@ class Detector:
             res.append([float(x1[i]), float(y1[i]), float(x2[i]), float(y2[i]), float(sc[i])])
         return res
 
-# ============ 카툰 스타일러 (교체 가능 슬롯) — 지금은 animegan2 placeholder ============
+# ============ 카툰 스타일러 (교체 슬롯) — animegan2 placeholder ============
 def ensure_animegan(ckpt="gan_ckpt"):
     os.makedirs(ckpt, exist_ok=True)
     ctx = ssl.create_default_context(); ctx.check_hostname=False; ctx.verify_mode=ssl.CERT_NONE
@@ -80,58 +102,43 @@ class AnimeGAN:
         rgb = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2RGB)
         t = torch.from_numpy(rgb).permute(2, 0, 1).float().div(255).mul(2).sub(1).unsqueeze(0).to("cuda")
         with torch.no_grad():
-            y = (self.m(t)[0]*0.5+0.5).clamp(0, 1)            # batch=1 (cu130 배치버그 회피)
+            y = (self.m(t)[0]*0.5+0.5).clamp(0, 1)
         out = (y.permute(1, 2, 0).cpu().numpy()*255).astype(np.uint8)
         return cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
 
-# ============ 색감 매칭 (Reinhard LAB color transfer) ============
+# ============ 색감 매칭 + 블러 + 합성 ============
 def color_transfer(src, ref, strength=1.0):
-    """src(스타일화 결과)의 색 통계를 ref(원본 크롭)에 맞춤 → 머리색·피부톤 정렬.
-    strength: 0=끔, 1=완전일치, 그 사이는 부분."""
-    if strength <= 0:
-        return src
+    if strength <= 0: return src
     s = cv2.cvtColor(src, cv2.COLOR_BGR2LAB).astype(np.float32)
     r = cv2.cvtColor(ref, cv2.COLOR_BGR2LAB).astype(np.float32)
     for i in range(3):
-        sm, ss = s[:, :, i].mean(), s[:, :, i].std() + 1e-6
-        rm, rs = r[:, :, i].mean(), r[:, :, i].std() + 1e-6
-        s[:, :, i] = (s[:, :, i] - sm) / ss * rs + rm
-    matched = cv2.cvtColor(np.clip(s, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
-    return matched if strength >= 1.0 else cv2.addWeighted(matched, strength, src, 1 - strength, 0)
+        sm, ss = s[:, :, i].mean(), s[:, :, i].std()+1e-6
+        rm, rs = r[:, :, i].mean(), r[:, :, i].std()+1e-6
+        s[:, :, i] = (s[:, :, i]-sm)/ss*rs+rm
+    m = cv2.cvtColor(np.clip(s, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
+    return m if strength >= 1.0 else cv2.addWeighted(m, strength, src, 1-strength, 0)
 
-# ============ 작은 얼굴용 블러 (face-deid blur.py 방식) ============
 def blur_crop(crop, mode="pixelate", cap=12):
     h, w = crop.shape[:2]
-    if mode == "box":
-        return np.zeros_like(crop)
+    if mode == "box": return np.zeros_like(crop)
     if mode == "gaussian":
-        f = 16
-        sw, sh = max(1, min(w // f, cap)), max(1, min(h // f, cap))
-        small = cv2.resize(crop, (sw, sh), interpolation=cv2.INTER_LINEAR)
-        return cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
-    blocks = max(1, min(min(w, h) // 10, cap))                # pixelate(기본)
-    small = cv2.resize(crop, (blocks, blocks), interpolation=cv2.INTER_LINEAR)
-    return cv2.resize(small, (w, h), interpolation=cv2.INTER_NEAREST)
+        sw, sh = max(1, min(w//16, cap)), max(1, min(h//16, cap))
+        return cv2.resize(cv2.resize(crop, (sw, sh)), (w, h))
+    blocks = max(1, min(min(w, h)//10, cap))
+    return cv2.resize(cv2.resize(crop, (blocks, blocks)), (w, h), interpolation=cv2.INTER_NEAREST)
 
-# ============ 크롭 → (크면 카툰 / 작으면 블러) → 타원 페더 합성 ============
 def composite(frame, boxes, stylizer, cartoon_min, blur_mode="pixelate", expand=0.15, color_match=0.0):
-    """얼굴 max변 >= cartoon_min → 카툰화, 미만 → 블러. 둘 다 타원 페더 합성."""
-    H, W = frame.shape[:2]
-    nc = nb = 0
+    H, W = frame.shape[:2]; nc = nb = 0
     for x1, y1, x2, y2, sc in boxes:
-        bw, bh = x2-x1, y2-y1
-        size = max(bw, bh)
+        bw, bh = x2-x1, y2-y1; size = max(bw, bh)
         cx1 = int(max(0, x1-bw*expand)); cy1 = int(max(0, y1-bh*expand))
         cx2 = int(min(W, x2+bw*expand)); cy2 = int(min(H, y2+bh*expand))
         crop = frame[cy1:cy2, cx1:cx2]
         if crop.size == 0: continue
-        if size >= cartoon_min:                               # 큰 얼굴 → 카툰
-            proc = cv2.resize(stylizer.stylize(crop), (cx2-cx1, cy2-cy1))
-            proc = color_transfer(proc, crop, color_match)
-            nc += 1
-        else:                                                 # 작은 얼굴 → 블러
-            proc = blur_crop(crop, blur_mode)
-            nb += 1
+        if size >= cartoon_min:
+            proc = color_transfer(cv2.resize(stylizer.stylize(crop), (cx2-cx1, cy2-cy1)), crop, color_match); nc += 1
+        else:
+            proc = blur_crop(crop, blur_mode); nb += 1
         mask = np.zeros((cy2-cy1, cx2-cx1), dtype=np.uint8)
         ecx, ecy = (cx2-cx1)//2, (cy2-cy1)//2
         cv2.ellipse(mask, (ecx, ecy), (max(1, ecx-2), max(1, ecy-2)), 0, 0, 360, 255, -1)
@@ -145,43 +152,42 @@ def main():
     ap.add_argument("--video", required=True)
     ap.add_argument("--model", default="models/base_v2f2_1280_fp16.onnx")
     ap.add_argument("--size", type=int, default=1280)
-    ap.add_argument("--cartoon-min", type=int, default=120, dest="cartoon_min",
-                    help="얼굴 max변 >= 이 픽셀 → 카툰, 미만 → 블러")
-    ap.add_argument("--blur-mode", default="pixelate", choices=["pixelate", "gaussian", "box"],
-                    dest="blur_mode", help="작은 얼굴 블러 방식")
-    ap.add_argument("--color-match", type=float, default=0.0, dest="color_match",
-                    help="원본 색감에 맞추기 0~1 (0=끔, 0.5=절반, 1=완전일치)")
+    ap.add_argument("--cartoon-min", type=int, default=150, dest="cartoon_min", help="이 픽셀 이상 → 카툰, 미만 → 블러")
+    ap.add_argument("--blur-mode", default="pixelate", choices=["pixelate", "gaussian", "box"], dest="blur_mode")
+    ap.add_argument("--color-match", type=float, default=0.0, dest="color_match", help="원본 색감 매칭 0~1")
+    ap.add_argument("--trt", action="store_true", help="TensorRT 검출(첫 실행은 엔진 빌드로 느림)")
+    ap.add_argument("--encoder", default="nvenc", choices=["nvenc", "x264"], help="영상 인코더")
     ap.add_argument("--out", default="out/deid_cartoon.mp4")
     args = ap.parse_args()
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
 
-    det = Detector(args.model, args.size)
+    det = Detector(args.model, args.size, use_trt=args.trt)
     styl = AnimeGAN()
 
     cap = cv2.VideoCapture(args.video)
     W = int(cap.get(3)); H = int(cap.get(4)); fps = cap.get(5) or 30.0; total = int(cap.get(7))
-    print(f"{W}x{H} @ {fps:.0f}fps, {total} frames")
-    tmp = "out/_frames_deid"; shutil.rmtree(tmp, ignore_errors=True); os.makedirs(tmp)
+    print(f"{W}x{H} @ {fps:.0f}fps, {total} frames | encoder={args.encoder} trt={args.trt}")
+
+    # ffmpeg 직결 파이프 (raw BGR → GPU 인코딩 + 원본 오디오 mux). PNG 중간파일 없음.
+    enc = (["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "23"] if args.encoder == "nvenc"
+           else ["-c:v", "libx264", "-crf", "23"])
+    cmd = ["ffmpeg", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{W}x{H}", "-r", f"{fps}",
+           "-i", "-", "-i", args.video, "-map", "0:v", "-map", "1:a?"] + enc + \
+          ["-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", args.out]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
 
     i = 0; tot_c = tot_b = 0; t0 = time.perf_counter()
     while True:
         ok, frame = cap.read()
         if not ok: break
         i += 1
-        boxes = det.detect(frame, W, H)
-        nc, nb = composite(frame, boxes, styl, args.cartoon_min, args.blur_mode,
-                           color_match=args.color_match)
+        nc, nb = composite(frame, det.detect(frame, W, H), styl, args.cartoon_min, args.blur_mode, color_match=args.color_match)
         tot_c += nc; tot_b += nb
-        cv2.imwrite(f"{tmp}/f_{i:05d}.png", frame)
-        if i % 10 == 0: print(f"  {i}/{total}  카툰 {tot_c} / 블러 {tot_b}", end="\r")
-    cap.release(); dt = time.perf_counter()-t0; print()
-    print(f"카툰 처리 {tot_c}회 / 블러 처리 {tot_b}회 (얼굴-프레임 기준)")
-
-    subprocess.run(["ffmpeg", "-y", "-framerate", str(fps), "-i", f"{tmp}/f_%05d.png",
-                    "-i", args.video, "-map", "0:v", "-map", "1:a?",
-                    "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", args.out], check=True)
-    vid = i/fps if fps else 0
-    print(f"DONE {dt:.1f}s / video {vid:.1f}s = {dt/vid:.2f}x realtime -> {args.out}")
+        proc.stdin.write(frame.tobytes())
+        if i % 20 == 0: print(f"  {i}/{total}  카툰{tot_c}/블러{tot_b}  {i/(time.perf_counter()-t0):.1f}fps", end="\r")
+    cap.release(); proc.stdin.close(); proc.wait()
+    dt = time.perf_counter()-t0; vid = i/fps if fps else 0; print()
+    print(f"DONE {dt:.1f}s / video {vid:.1f}s = {dt/vid:.2f}x realtime  (카툰{tot_c}/블러{tot_b}) -> {args.out}")
 
 if __name__ == "__main__":
     main()
