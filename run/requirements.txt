@@ -8,4 +8,6 @@ onnxruntime-gpu==1.27.0     # CUDA13 빌드, TensorrtExecutionProvider 포함
 numpy==2.5.1
 opencv-python==5.0.0.*
 # tensorrt(--trt 가속)는 setup_venv.sh에서 CUDA13 변종으로 별도 설치:
-#   tensorrt-cu13 (meta) -> tensorrt-cu13-libs + tensorrt-cu13-bindings
+#   tensorrt-cu13==10.16.1.11  ->  tensorrt-cu13-libs + tensorrt-cu13-bindings
+#   ★ 반드시 10.x. ORT 1.27 TRT EP는 libnvinfer.so.10 요구.
+#     11.x(=libnvinfer.so.11)는 SONAME 불일치로 TRT EP 로드 실패 → CUDA 폴백됨.

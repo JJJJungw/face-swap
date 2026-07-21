@@ -9,8 +9,12 @@ PY=${PY:-python3}
 echo "== 0) 시스템 도구 (ffmpeg = NVENC 인코딩에 필요) =="
 sudo apt-get update -y && sudo apt-get install -y ffmpeg git curl || true
 
-echo "== 1) venv 생성 (.venv 재생성) =="
-rm -rf .venv
+echo "== 1) venv 생성 (.venv) =="
+if [ -d .venv ]; then
+  BAK=".venv.bak.$(date +%Y%m%d_%H%M%S)"
+  echo "  기존 .venv 발견 → 삭제하지 않고 백업: $BAK (검증 후 직접 지우면 됨)"
+  mv .venv "$BAK"
+fi
 "$PY" -m venv .venv
 # shellcheck disable=SC1091
 source .venv/bin/activate
@@ -20,10 +24,11 @@ echo "== 2) 검증된 핀 설치 (run/requirements.txt) =="
 pip install -r run/requirements.txt
 
 echo "== 3) TensorRT (CUDA13용) — --trt 검출 가속 =="
-# ORT 1.27 = CUDA13 빌드 → TRT 10.x(cu13)의 libnvinfer.so.10 로드.
+# ORT 1.27의 TRT EP는 libnvinfer.so.10 을 로드 → 반드시 TensorRT 10.x 필요.
+# (tensorrt-cu13 최신은 11.x = libnvinfer.so.11 → SONAME 불일치로 로드 실패하므로 10.x로 핀)
 # 실패해도 치명적 아님: --trt 없이 CUDA EP로 실행 가능(코드에 폴백 있음).
-pip install --extra-index-url https://pypi.nvidia.com "tensorrt-cu13" \
-  || echo "[warn] tensorrt-cu13 설치 실패 — --trt 생략하고 CUDA로 실행하세요."
+pip install --extra-index-url https://pypi.nvidia.com "tensorrt-cu13==10.16.1.11" \
+  || echo "[warn] tensorrt-cu13==10.16.1.11 설치 실패 — --trt 생략하고 CUDA로 실행하세요."
 
 echo "== 4) lock 파일 생성 (재현용 정확한 버전) =="
 pip freeze > run/requirements.lock

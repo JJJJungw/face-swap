@@ -100,20 +100,26 @@ def ensure_animegan(ckpt="gan_ckpt"):
             with urllib.request.urlopen(url, context=ctx, timeout=90) as r, open(d, "wb") as f: f.write(r.read())
 
 class AnimeGAN:
-    def __init__(self, ckpt="gan_ckpt"):
+    def __init__(self, ckpt="gan_ckpt", half=False, gan_size=0):
         ensure_animegan(ckpt); sys.path.insert(0, ckpt)
         import torch; from model import Generator
-        self.torch = torch
+        self.torch = torch; self.half = half; self.gan_size = gan_size
         self.m = Generator().to("cuda").eval()
         self.m.load_state_dict(torch.load(os.path.join(ckpt, "face_paint_512_v2.pt"), map_location="cuda"))
+        if half: self.m.half()
+        self.t = 0.0; self.n = 0                    # 계측: 누적 시간/호출수
 
     def stylize(self, face_bgr):
-        torch = self.torch
-        rgb = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2RGB)
-        t = torch.from_numpy(rgb).permute(2, 0, 1).float().div(255).mul(2).sub(1).unsqueeze(0).to("cuda")
+        torch = self.torch; t0 = time.perf_counter()
+        img = cv2.resize(face_bgr, (self.gan_size, self.gan_size), interpolation=cv2.INTER_AREA) \
+              if self.gan_size else face_bgr        # GAN 입력 고정크기(작을수록 빠름)
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        x = torch.from_numpy(rgb).permute(2, 0, 1).float().div(255).mul(2).sub(1).unsqueeze(0).to("cuda")
+        if self.half: x = x.half()
         with torch.no_grad():
-            y = (self.m(t)[0]*0.5+0.5).clamp(0, 1)
+            y = (self.m(x)[0].float()*0.5+0.5).clamp(0, 1)
         out = (y.permute(1, 2, 0).cpu().numpy()*255).astype(np.uint8)
+        self.t += time.perf_counter()-t0; self.n += 1
         return cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
 
 # ============ 색감 매칭 + 블러 + 합성 ============
@@ -167,37 +173,53 @@ def main():
     ap.add_argument("--color-match", type=float, default=0.0, dest="color_match", help="원본 색감 매칭 0~1")
     ap.add_argument("--trt", action="store_true", help="TensorRT 검출(첫 실행은 엔진 빌드로 느림)")
     ap.add_argument("--encoder", default="nvenc", choices=["nvenc", "x264"], help="영상 인코더")
+    ap.add_argument("--half", action="store_true", help="카툰 GAN fp16(속도↑)")
+    ap.add_argument("--gan-size", type=int, default=0, dest="gan_size", help="GAN 입력 고정크기(예 384). 0=크롭 원본")
+    ap.add_argument("--max-frames", type=int, default=0, dest="max_frames", help="N프레임만 처리(측정용). 0=전체")
     ap.add_argument("--out", default="out/deid_cartoon.mp4")
     args = ap.parse_args()
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
 
     det = Detector(args.model, args.size, use_trt=args.trt)
-    styl = AnimeGAN()
+    styl = AnimeGAN(half=args.half, gan_size=args.gan_size)
 
     cap = cv2.VideoCapture(args.video)
     W = int(cap.get(3)); H = int(cap.get(4)); fps = cap.get(5) or 30.0; total = int(cap.get(7))
-    print(f"{W}x{H} @ {fps:.0f}fps, {total} frames | encoder={args.encoder} trt={args.trt}")
+    print(f"{W}x{H} @ {fps:.0f}fps, {total} frames | enc={args.encoder} trt={args.trt} half={args.half} gan_size={args.gan_size}")
 
-    # ffmpeg 직결 파이프 (raw BGR → GPU 인코딩 + 원본 오디오 mux). PNG 중간파일 없음.
+    # ffmpeg 직결 파이프. -loglevel error/-nostats: 인코더 진행률 노이즈 억제(우리 fps만 출력).
     enc = (["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "23"] if args.encoder == "nvenc"
            else ["-c:v", "libx264", "-crf", "23"])
-    cmd = ["ffmpeg", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{W}x{H}", "-r", f"{fps}",
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-nostats",
+           "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{W}x{H}", "-r", f"{fps}",
            "-i", "-", "-i", args.video, "-map", "0:v", "-map", "1:a?"] + enc + \
           ["-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", args.out]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
 
-    i = 0; tot_c = tot_b = 0; t0 = time.perf_counter()
+    i = 0; tot_c = tot_b = 0; t_det = t_comp = t_write = 0.0; t0 = time.perf_counter()
     while True:
         ok, frame = cap.read()
         if not ok: break
         i += 1
-        nc, nb = composite(frame, det.detect(frame, W, H), styl, args.cartoon_min, args.blur_mode, color_match=args.color_match)
-        tot_c += nc; tot_b += nb
+        a = time.perf_counter()
+        boxes = det.detect(frame, W, H)
+        b = time.perf_counter()
+        nc, nb = composite(frame, boxes, styl, args.cartoon_min, args.blur_mode, color_match=args.color_match)
+        c = time.perf_counter()
         proc.stdin.write(frame.tobytes())
+        d = time.perf_counter()
+        t_det += b-a; t_comp += c-b; t_write += d-c; tot_c += nc; tot_b += nb
         if i % 20 == 0: print(f"  {i}/{total}  카툰{tot_c}/블러{tot_b}  {i/(time.perf_counter()-t0):.1f}fps", end="\r")
+        if args.max_frames and i >= args.max_frames: break
     cap.release(); proc.stdin.close(); proc.wait()
     dt = time.perf_counter()-t0; vid = i/fps if fps else 0; print()
     print(f"DONE {dt:.1f}s / video {vid:.1f}s = {dt/vid:.2f}x realtime  (카툰{tot_c}/블러{tot_b}) -> {args.out}")
+    # ── 단계별 평균(프레임당 ms). 스타일화는 GAN 자체 누적시간(styl.t)에서 분리 ──
+    ms = lambda s: 1000*s/max(i, 1)
+    t_styl = styl.t; t_comp_cpu = t_comp - t_styl
+    print(f"프레임당 ms: 검출 {ms(t_det):.1f} | 합성 {ms(t_comp):.1f}"
+          f"(그중 GAN {ms(t_styl):.1f}, CPU합성 {ms(t_comp_cpu):.1f}) | 인코딩write {ms(t_write):.1f}")
+    print(f"GAN 호출 {styl.n}회, 호출당 {1000*styl.t/max(styl.n,1):.1f}ms")
 
 if __name__ == "__main__":
     main()
