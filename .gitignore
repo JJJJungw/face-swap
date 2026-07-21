@@ -17,3 +17,5 @@ video_out/
 input/
 *.mp4
 *.mov
+_ref_facedeid/
+_ref_facedeid/
