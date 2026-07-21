@@ -100,13 +100,16 @@ def ensure_animegan(ckpt="gan_ckpt"):
             with urllib.request.urlopen(url, context=ctx, timeout=90) as r, open(d, "wb") as f: f.write(r.read())
 
 class AnimeGAN:
-    def __init__(self, ckpt="gan_ckpt", half=False, gan_size=0):
+    """torch eager 백엔드. --compile 시 torch.compile(고정 입력크기 권장)."""
+    def __init__(self, ckpt="gan_ckpt", half=False, gan_size=0, compile=False):
         ensure_animegan(ckpt); sys.path.insert(0, ckpt)
         import torch; from model import Generator
         self.torch = torch; self.half = half; self.gan_size = gan_size
         self.m = Generator().to("cuda").eval()
         self.m.load_state_dict(torch.load(os.path.join(ckpt, "face_paint_512_v2.pt"), map_location="cuda"))
         if half: self.m.half()
+        if compile:
+            self.m = torch.compile(self.m, mode="max-autotune")   # 첫 호출 컴파일로 느림→이후 빠름
         self.t = 0.0; self.n = 0                    # 계측: 누적 시간/호출수
 
     def stylize(self, face_bgr):
@@ -120,6 +123,44 @@ class AnimeGAN:
             y = (self.m(x)[0].float()*0.5+0.5).clamp(0, 1)
         out = (y.permute(1, 2, 0).cpu().numpy()*255).astype(np.uint8)
         self.t += time.perf_counter()-t0; self.n += 1
+        return cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
+
+# ============ GAN ONNX → TensorRT 백엔드 (가중치 동일 = 512 화질 그대로, 연산만 가속) ============
+def export_animegan_onnx(onnx_path, ckpt="gan_ckpt", size=512):
+    """AnimeGAN2 제너레이터를 고정 size로 ONNX export(정적 shape → TRT 정적엔진 최적)."""
+    ensure_animegan(ckpt)
+    if ckpt not in sys.path: sys.path.insert(0, ckpt)
+    import torch; from model import Generator
+    m = Generator().eval()
+    m.load_state_dict(torch.load(os.path.join(ckpt, "face_paint_512_v2.pt"), map_location="cpu"))
+    os.makedirs(os.path.dirname(onnx_path) or ".", exist_ok=True)
+    dummy = torch.randn(1, 3, size, size)
+    torch.onnx.export(m, dummy, onnx_path, input_names=["x"], output_names=["y"], opset_version=17)
+    print(f"[export] {onnx_path} (size={size})")
+
+class AnimeGANONNX:
+    """onnxruntime(+TensorRT EP) 백엔드. 고정 512 입력 → 검출기와 같은 TRT 파이프라인 재사용.
+    가중치 동일하므로 출력은 torch@512와 사실상 같음(fp16 미세 오차뿐)."""
+    def __init__(self, onnx_path="gan_ckpt/animegan_512.onnx", size=512, use_trt=True):
+        self.size = size
+        if not os.path.exists(onnx_path):
+            export_animegan_onnx(onnx_path, size=size)
+        import onnxruntime as ort
+        self.sess = ort.InferenceSession(onnx_path, providers=build_providers(onnx_path, use_trt))
+        self.inp = self.sess.get_inputs()[0].name
+        print("GAN providers:", self.sess.get_providers())
+        warm = np.zeros((1, 3, size, size), dtype=np.float32)
+        for _ in range(3): self.sess.run(None, {self.inp: warm})   # TRT면 첫 실행에 엔진 빌드(느림)
+        self.t = 0.0; self.n = 0
+
+    def stylize(self, face_bgr):
+        t0 = time.perf_counter()
+        img = cv2.resize(face_bgr, (self.size, self.size), interpolation=cv2.INTER_AREA)
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        x = ((rgb.astype(np.float32) / 255.0) * 2 - 1).transpose(2, 0, 1)[None]
+        y = self.sess.run(None, {self.inp: x})[0][0]
+        out = (np.clip(y * 0.5 + 0.5, 0, 1).transpose(1, 2, 0) * 255).astype(np.uint8)
+        self.t += time.perf_counter() - t0; self.n += 1
         return cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
 
 # ============ 색감 매칭 + 블러 + 합성 ============
@@ -152,7 +193,8 @@ def composite(frame, boxes, stylizer, cartoon_min, blur_mode="pixelate", expand=
         crop = frame[cy1:cy2, cx1:cx2]
         if crop.size == 0: continue
         if size >= cartoon_min:
-            proc = color_transfer(cv2.resize(stylizer.stylize(crop), (cx2-cx1, cy2-cy1)), crop, color_match); nc += 1
+            styl = cv2.resize(stylizer.stylize(crop), (cx2-cx1, cy2-cy1), interpolation=cv2.INTER_LANCZOS4)
+            proc = color_transfer(styl, crop, color_match); nc += 1
         else:
             proc = blur_crop(crop, blur_mode); nb += 1
         mask = np.zeros((cy2-cy1, cx2-cx1), dtype=np.uint8)
@@ -173,19 +215,29 @@ def main():
     ap.add_argument("--color-match", type=float, default=0.0, dest="color_match", help="원본 색감 매칭 0~1")
     ap.add_argument("--trt", action="store_true", help="TensorRT 검출(첫 실행은 엔진 빌드로 느림)")
     ap.add_argument("--encoder", default="nvenc", choices=["nvenc", "x264"], help="영상 인코더")
-    ap.add_argument("--half", action="store_true", help="카툰 GAN fp16(속도↑)")
+    ap.add_argument("--half", action="store_true", help="카툰 GAN fp16(torch 백엔드)")
     ap.add_argument("--gan-size", type=int, default=0, dest="gan_size", help="GAN 입력 고정크기(예 384). 0=크롭 원본")
+    ap.add_argument("--gan-backend", default="torch", choices=["torch", "onnx"], dest="gan_backend",
+                    help="torch=eager(+--compile/--half) | onnx=onnxruntime(+--trt로 TensorRT)")
+    ap.add_argument("--compile", action="store_true", help="torch.compile(torch 백엔드, 첫 호출 느림)")
+    ap.add_argument("--gan-onnx", default="gan_ckpt/animegan_512.onnx", dest="gan_onnx", help="ONNX GAN 경로(없으면 자동 export)")
+    ap.add_argument("--gan-onnx-size", type=int, default=512, dest="gan_onnx_size", help="ONNX GAN 고정 입력크기")
     ap.add_argument("--max-frames", type=int, default=0, dest="max_frames", help="N프레임만 처리(측정용). 0=전체")
     ap.add_argument("--out", default="out/deid_cartoon.mp4")
     args = ap.parse_args()
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
 
     det = Detector(args.model, args.size, use_trt=args.trt)
-    styl = AnimeGAN(half=args.half, gan_size=args.gan_size)
+    if args.gan_backend == "onnx":
+        styl = AnimeGANONNX(args.gan_onnx, size=args.gan_onnx_size, use_trt=args.trt)  # 512 고정, TRT 가속
+    else:
+        gs = args.gan_size or (512 if args.compile else 0)   # compile은 고정크기 필요→기본 512
+        styl = AnimeGAN(half=args.half, gan_size=gs, compile=args.compile)
 
     cap = cv2.VideoCapture(args.video)
     W = int(cap.get(3)); H = int(cap.get(4)); fps = cap.get(5) or 30.0; total = int(cap.get(7))
-    print(f"{W}x{H} @ {fps:.0f}fps, {total} frames | enc={args.encoder} trt={args.trt} half={args.half} gan_size={args.gan_size}")
+    print(f"{W}x{H} @ {fps:.0f}fps, {total} frames | enc={args.encoder} trt={args.trt} "
+          f"gan={args.gan_backend} compile={args.compile} half={args.half} gan_size={args.gan_size}")
 
     # ffmpeg 직결 파이프. -loglevel error/-nostats: 인코더 진행률 노이즈 억제(우리 fps만 출력).
     enc = (["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "23"] if args.encoder == "nvenc"
