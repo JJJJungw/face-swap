@@ -99,33 +99,56 @@ def color_transfer(src, ref, strength=1.0):
     matched = cv2.cvtColor(np.clip(s, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
     return matched if strength >= 1.0 else cv2.addWeighted(matched, strength, src, 1 - strength, 0)
 
-# ============ 크롭 → 스타일화 → 타원 페더 합성 (blur.py 방식) ============
-def composite(frame, boxes, stylizer, min_face, expand=0.15, color_match=0.0):
+# ============ 작은 얼굴용 블러 (face-deid blur.py 방식) ============
+def blur_crop(crop, mode="pixelate", cap=12):
+    h, w = crop.shape[:2]
+    if mode == "box":
+        return np.zeros_like(crop)
+    if mode == "gaussian":
+        f = 16
+        sw, sh = max(1, min(w // f, cap)), max(1, min(h // f, cap))
+        small = cv2.resize(crop, (sw, sh), interpolation=cv2.INTER_LINEAR)
+        return cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
+    blocks = max(1, min(min(w, h) // 10, cap))                # pixelate(기본)
+    small = cv2.resize(crop, (blocks, blocks), interpolation=cv2.INTER_LINEAR)
+    return cv2.resize(small, (w, h), interpolation=cv2.INTER_NEAREST)
+
+# ============ 크롭 → (크면 카툰 / 작으면 블러) → 타원 페더 합성 ============
+def composite(frame, boxes, stylizer, cartoon_min, blur_mode="pixelate", expand=0.15, color_match=0.0):
+    """얼굴 max변 >= cartoon_min → 카툰화, 미만 → 블러. 둘 다 타원 페더 합성."""
     H, W = frame.shape[:2]
+    nc = nb = 0
     for x1, y1, x2, y2, sc in boxes:
         bw, bh = x2-x1, y2-y1
-        if max(bw, bh) < min_face:            # 크기 임계값 이상만
-            continue
+        size = max(bw, bh)
         cx1 = int(max(0, x1-bw*expand)); cy1 = int(max(0, y1-bh*expand))
         cx2 = int(min(W, x2+bw*expand)); cy2 = int(min(H, y2+bh*expand))
         crop = frame[cy1:cy2, cx1:cx2]
         if crop.size == 0: continue
-        styl = cv2.resize(stylizer.stylize(crop), (cx2-cx1, cy2-cy1))
-        styl = color_transfer(styl, crop, color_match)   # 원본 색감에 맞춤
+        if size >= cartoon_min:                               # 큰 얼굴 → 카툰
+            proc = cv2.resize(stylizer.stylize(crop), (cx2-cx1, cy2-cy1))
+            proc = color_transfer(proc, crop, color_match)
+            nc += 1
+        else:                                                 # 작은 얼굴 → 블러
+            proc = blur_crop(crop, blur_mode)
+            nb += 1
         mask = np.zeros((cy2-cy1, cx2-cx1), dtype=np.uint8)
         ecx, ecy = (cx2-cx1)//2, (cy2-cy1)//2
         cv2.ellipse(mask, (ecx, ecy), (max(1, ecx-2), max(1, ecy-2)), 0, 0, 360, 255, -1)
         fk = min(31, max(5, (min(cx2-cx1, cy2-cy1)//8) | 1))
         m = cv2.GaussianBlur(mask, (fk, fk), 0).astype(np.float32)/255.0
-        frame[cy1:cy2, cx1:cx2] = (crop*(1-m[:, :, None]) + styl*m[:, :, None]).astype(np.uint8)
-    return frame
+        frame[cy1:cy2, cx1:cx2] = (crop*(1-m[:, :, None]) + proc*m[:, :, None]).astype(np.uint8)
+    return nc, nb
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--video", required=True)
     ap.add_argument("--model", default="models/base_v2f2_1280_fp16.onnx")
     ap.add_argument("--size", type=int, default=1280)
-    ap.add_argument("--min-face", type=int, default=60, dest="min_face", help="이 픽셀 이상 얼굴만 카툰화")
+    ap.add_argument("--cartoon-min", type=int, default=120, dest="cartoon_min",
+                    help="얼굴 max변 >= 이 픽셀 → 카툰, 미만 → 블러")
+    ap.add_argument("--blur-mode", default="pixelate", choices=["pixelate", "gaussian", "box"],
+                    dest="blur_mode", help="작은 얼굴 블러 방식")
     ap.add_argument("--color-match", type=float, default=0.0, dest="color_match",
                     help="원본 색감에 맞추기 0~1 (0=끔, 0.5=절반, 1=완전일치)")
     ap.add_argument("--out", default="out/deid_cartoon.mp4")
@@ -140,16 +163,19 @@ def main():
     print(f"{W}x{H} @ {fps:.0f}fps, {total} frames")
     tmp = "out/_frames_deid"; shutil.rmtree(tmp, ignore_errors=True); os.makedirs(tmp)
 
-    i = 0; t0 = time.perf_counter()
+    i = 0; tot_c = tot_b = 0; t0 = time.perf_counter()
     while True:
         ok, frame = cap.read()
         if not ok: break
         i += 1
         boxes = det.detect(frame, W, H)
-        composite(frame, boxes, styl, args.min_face, color_match=args.color_match)
+        nc, nb = composite(frame, boxes, styl, args.cartoon_min, args.blur_mode,
+                           color_match=args.color_match)
+        tot_c += nc; tot_b += nb
         cv2.imwrite(f"{tmp}/f_{i:05d}.png", frame)
-        if i % 10 == 0: print(f"  {i}/{total}", end="\r")
+        if i % 10 == 0: print(f"  {i}/{total}  카툰 {tot_c} / 블러 {tot_b}", end="\r")
     cap.release(); dt = time.perf_counter()-t0; print()
+    print(f"카툰 처리 {tot_c}회 / 블러 처리 {tot_b}회 (얼굴-프레임 기준)")
 
     subprocess.run(["ffmpeg", "-y", "-framerate", str(fps), "-i", f"{tmp}/f_%05d.png",
                     "-i", args.video, "-map", "0:v", "-map", "1:a?",
