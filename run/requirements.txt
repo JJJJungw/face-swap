@@ -1,0 +1,11 @@
+# deid_cartoon.py 실행 스택 — 검증된 핀 (기준 env: EC2 L4 / driver 580.159.03 / CUDA13)
+# 2026-07-21 확인: 이 조합에서 YOLOX 검출 + animegan2 카툰화 모두 정상 동작.
+# torch: linux x86_64에서 2.13.0 == 2.13.0+cu130 wheel 자동 선택(PyPI 기본).
+#        CUDA11 박스면 --index-url https://download.pytorch.org/whl/cu118 로 교체.
+# torchvision 불필요: animegan2 model.py는 순수 torch.nn (deid_cartoon.py 한정).
+torch==2.13.0
+onnxruntime-gpu==1.27.0     # CUDA13 빌드, TensorrtExecutionProvider 포함
+numpy==2.5.1
+opencv-python==5.0.0.*
+# tensorrt(--trt 가속)는 setup_venv.sh에서 CUDA13 변종으로 별도 설치:
+#   tensorrt-cu13 (meta) -> tensorrt-cu13-libs + tensorrt-cu13-bindings

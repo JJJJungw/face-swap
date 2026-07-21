@@ -21,15 +21,25 @@ def preproc(img, size, pad=114):
     return canvas.transpose(2, 0, 1)[None].astype(np.float32), r
 
 def _preload_trt_libs():
-    """tensorrt 패키지 .so를 미리 로드(LD_LIBRARY_PATH 없이도 libnvinfer 찾게)."""
-    try:
-        import tensorrt_libs, glob, ctypes
-        d = os.path.dirname(tensorrt_libs.__file__)
+    """TensorRT .so를 RTLD_GLOBAL로 미리 로드 → ORT TRT EP가 libnvinfer 찾게.
+    tensorrt_libs / tensorrt_cu13_libs 등 모듈명이 달라도 site-packages에서 검색."""
+    import glob, ctypes, site
+    dirs = []
+    for mod in ("tensorrt_libs", "tensorrt_cu13_libs", "tensorrt_cu12_libs"):
+        try:
+            m = __import__(mod); dirs.append(os.path.dirname(m.__file__)); break
+        except Exception: pass
+    if not dirs:                              # 모듈 import 실패 시 파일 검색 폴백
+        roots = list(site.getsitepackages()) + [site.getusersitepackages()]
+        for sp in roots:
+            for so in glob.glob(os.path.join(sp, "**", "libnvinfer*.so*"), recursive=True):
+                dirs.append(os.path.dirname(so)); break
+            if dirs: break
+    for d in dirs:
         for _ in range(2):
             for so in sorted(glob.glob(os.path.join(d, "*.so*"))):
                 try: ctypes.CDLL(so, mode=ctypes.RTLD_GLOBAL)
                 except OSError: pass
-    except Exception: pass
 
 def build_providers(model_path, use_trt):
     if not use_trt:
