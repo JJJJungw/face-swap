@@ -84,8 +84,23 @@ class AnimeGAN:
         out = (y.permute(1, 2, 0).cpu().numpy()*255).astype(np.uint8)
         return cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
 
+# ============ 색감 매칭 (Reinhard LAB color transfer) ============
+def color_transfer(src, ref, strength=1.0):
+    """src(스타일화 결과)의 색 통계를 ref(원본 크롭)에 맞춤 → 머리색·피부톤 정렬.
+    strength: 0=끔, 1=완전일치, 그 사이는 부분."""
+    if strength <= 0:
+        return src
+    s = cv2.cvtColor(src, cv2.COLOR_BGR2LAB).astype(np.float32)
+    r = cv2.cvtColor(ref, cv2.COLOR_BGR2LAB).astype(np.float32)
+    for i in range(3):
+        sm, ss = s[:, :, i].mean(), s[:, :, i].std() + 1e-6
+        rm, rs = r[:, :, i].mean(), r[:, :, i].std() + 1e-6
+        s[:, :, i] = (s[:, :, i] - sm) / ss * rs + rm
+    matched = cv2.cvtColor(np.clip(s, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
+    return matched if strength >= 1.0 else cv2.addWeighted(matched, strength, src, 1 - strength, 0)
+
 # ============ 크롭 → 스타일화 → 타원 페더 합성 (blur.py 방식) ============
-def composite(frame, boxes, stylizer, min_face, expand=0.15):
+def composite(frame, boxes, stylizer, min_face, expand=0.15, color_match=0.0):
     H, W = frame.shape[:2]
     for x1, y1, x2, y2, sc in boxes:
         bw, bh = x2-x1, y2-y1
@@ -96,6 +111,7 @@ def composite(frame, boxes, stylizer, min_face, expand=0.15):
         crop = frame[cy1:cy2, cx1:cx2]
         if crop.size == 0: continue
         styl = cv2.resize(stylizer.stylize(crop), (cx2-cx1, cy2-cy1))
+        styl = color_transfer(styl, crop, color_match)   # 원본 색감에 맞춤
         mask = np.zeros((cy2-cy1, cx2-cx1), dtype=np.uint8)
         ecx, ecy = (cx2-cx1)//2, (cy2-cy1)//2
         cv2.ellipse(mask, (ecx, ecy), (max(1, ecx-2), max(1, ecy-2)), 0, 0, 360, 255, -1)
@@ -110,6 +126,8 @@ def main():
     ap.add_argument("--model", default="models/base_v2f2_1280_fp16.onnx")
     ap.add_argument("--size", type=int, default=1280)
     ap.add_argument("--min-face", type=int, default=60, dest="min_face", help="이 픽셀 이상 얼굴만 카툰화")
+    ap.add_argument("--color-match", type=float, default=0.0, dest="color_match",
+                    help="원본 색감에 맞추기 0~1 (0=끔, 0.5=절반, 1=완전일치)")
     ap.add_argument("--out", default="out/deid_cartoon.mp4")
     args = ap.parse_args()
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
@@ -128,7 +146,7 @@ def main():
         if not ok: break
         i += 1
         boxes = det.detect(frame, W, H)
-        composite(frame, boxes, styl, args.min_face)
+        composite(frame, boxes, styl, args.min_face, color_match=args.color_match)
         cv2.imwrite(f"{tmp}/f_{i:05d}.png", frame)
         if i % 10 == 0: print(f"  {i}/{total}", end="\r")
     cap.release(); dt = time.perf_counter()-t0; print()
