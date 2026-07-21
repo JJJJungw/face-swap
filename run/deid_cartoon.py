@@ -135,7 +135,12 @@ def export_animegan_onnx(onnx_path, ckpt="gan_ckpt", size=512):
     m.load_state_dict(torch.load(os.path.join(ckpt, "face_paint_512_v2.pt"), map_location="cpu"))
     os.makedirs(os.path.dirname(onnx_path) or ".", exist_ok=True)
     dummy = torch.randn(1, 3, size, size)
-    torch.onnx.export(m, dummy, onnx_path, input_names=["x"], output_names=["y"], opset_version=17)
+    # torch 2.13 기본은 dynamo 익스포터(onnxscript 필요). legacy(TorchScript)가 TRT 친화적 + 의존성 없음.
+    try:
+        torch.onnx.export(m, dummy, onnx_path, input_names=["x"], output_names=["y"],
+                          opset_version=17, dynamo=False)
+    except TypeError:                       # 구버전 torch: dynamo 인자 없음
+        torch.onnx.export(m, dummy, onnx_path, input_names=["x"], output_names=["y"], opset_version=17)
     print(f"[export] {onnx_path} (size={size})")
 
 class AnimeGANONNX:
