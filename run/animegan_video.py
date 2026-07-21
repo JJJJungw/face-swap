@@ -48,8 +48,7 @@ def main():
     # 2) 모델
     ensure_ckpt(); sys.path.insert(0, CKPT_DIR)
     from model import Generator
-    torch.backends.cudnn.benchmark = True
-    dev = "cuda"; m = Generator().to(dev).eval()   # FP32 (animegan2는 fp16에서 색 깨짐)
+    dev = "cuda"; m = Generator().to(dev).eval()   # FP32, cudnn.benchmark 미사용(cu130 커널 버그 회피) (animegan2는 fp16에서 색 깨짐)
 
     im0 = Image.open(frames[0]); w, h = im0.size; sc = args.size / max(w, h)
     nw = max(64, int(round(w*sc/8))*8); nh = max(64, int(round(h*sc/8))*8)
