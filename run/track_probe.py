@@ -68,6 +68,7 @@ def main():
     ap.add_argument("--max-gap", type=int, default=5, dest="max_gap")
     ap.add_argument("--good-size", type=int, default=200, dest="good_size", help="이 이상=캐시 소스로 양호")
     ap.add_argument("--small-size", type=int, default=150, dest="small_size", help="이 미만=뭉개짐 위험")
+    ap.add_argument("--min-len", type=int, default=5, dest="min_len", help="이 프레임 미만 트랙=순간오탐으로 통계서 제외")
     ap.add_argument("--max-frames", type=int, default=0, dest="max_frames")
     ap.add_argument("--out", default="out/track_probe.mp4")
     ap.add_argument("--csv", default="out/track_probe.csv")
@@ -118,31 +119,33 @@ def main():
 
     # ── 트랙별 통계 ──
     rows = []
-    borrow = []      # 캐시 이득: 큰 프레임(>=good) 있고 작은 프레임(<small)도 있음
-    always_small = []  # 평생 작음(<small) → 샷 안에 빌려올 소스 없음 = 하드케이스
     with open(args.csv, "w") as f:
         f.write("track_id,frame,size\n")
         for tid, a in sorted(trk.arch.items()):
             sizes = [s for _, s in a["sizes"]]; span = a["last"]-a["first"]+1; n = len(sizes)
-            mx, mn = max(sizes), min(sizes)
-            rows.append((tid, n, span, mn, mx))
+            rows.append((tid, n, span, min(sizes), max(sizes)))
             for fr, s in a["sizes"]: f.write(f"{tid},{fr},{s}\n")
-            if mx >= args.good_size and mn < args.small_size: borrow.append(tid)
-            if mx < args.small_size: always_small.append(tid)
+
+    def classify(rs):   # (캐시이득 ID들, 평생작음 ID들)
+        borrow = [r[0] for r in rs if r[4] >= args.good_size and r[3] < args.small_size]
+        alws   = [r[0] for r in rs if r[4] < args.small_size]
+        return borrow, alws
+    b_all, s_all = classify(rows)
+    real = [r for r in rows if r[1] >= args.min_len]     # 순간 오탐 제거(gate.py min_len식)
+    b_real, s_real = classify(real)
 
     dur = time.perf_counter()-t0
     print(f"\n===== 트랙 프로브 요약 =====")
     print(f"프레임 {idx} | 컷 {ncut} | 다인물(≥2얼굴) 프레임 {multi_frames} ({100*multi_frames/max(idx,1):.0f}%)")
-    print(f"총 트랙 ID {len(trk.arch)}개  (컷마다 리셋되어 실제 인물보다 많을 수 있음)")
+    print(f"총 트랙 {len(rows)}개 → 실트랙(≥{args.min_len}프레임) {len(real)}개  (나머지 {len(rows)-len(real)}개=순간오탐)")
     print(f"{'ID':>4} {'출현':>5} {'구간':>5} {'최소px':>6} {'최대px':>6}")
-    for tid, n, span, mn, mx in rows[:40]:
-        flag = ""
-        if tid in borrow: flag = "  ← 캐시이득(큰↔작은)"
-        elif tid in always_small: flag = "  ← 평생작음(소스없음)"
+    for tid, n, span, mn, mx in real[:40]:
+        flag = "  ← 캐시이득(큰↔작은)" if tid in b_real else ("  ← 평생작음(소스없음)" if tid in s_real else "")
         print(f"{tid:>4} {n:>5} {span:>5} {mn:>6} {mx:>6}{flag}")
-    if len(rows) > 40: print(f"  ... 외 {len(rows)-40}개 (전체는 {args.csv})")
-    print(f"\n캐시 이득 트랙(큰≥{args.good_size} & 작은<{args.small_size}): {len(borrow)}개 {borrow[:20]}")
-    print(f"평생 작음 트랙(<{args.small_size} 내내, 빌려올 소스 없음): {len(always_small)}개")
+    if len(real) > 40: print(f"  ... 외 {len(real)-40}개 실트랙 (전체는 {args.csv})")
+    print(f"\n[전체 트랙]      캐시이득 {len(b_all)} / 평생작음 {len(s_all)}  (순간오탐 포함, 부풀려짐)")
+    print(f"[실트랙 ≥{args.min_len}f]  캐시이득 {len(b_real)} / 평생작음 {len(s_real)}  ← 이게 진짜 숫자")
+    print(f"  캐시이득 실트랙 ID: {b_real[:25]}")
     print(f"-> out: {args.out} / {args.csv}  ({dur:.1f}s)")
 
 if __name__ == "__main__":
