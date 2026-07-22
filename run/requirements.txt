@@ -4,7 +4,8 @@
 #        CUDA11 박스면 --index-url https://download.pytorch.org/whl/cu118 로 교체.
 # torchvision 불필요: animegan2 model.py는 순수 torch.nn (deid_cartoon.py 한정).
 torch==2.13.0
-onnxruntime-gpu==1.27.0     # CUDA13 빌드, TensorrtExecutionProvider 포함
+onnxruntime-gpu==1.27.0     # CUDA13 빌드, TensorrtExecutionProvider 포함(추론)
+onnx                        # GAN 제너레이터 → .onnx export(직렬화)에 필요. legacy 익스포터가 사용.
 numpy==2.5.1
 opencv-python==5.0.0.*
 # tensorrt(--trt 가속)는 setup_venv.sh에서 CUDA13 변종으로 별도 설치:
