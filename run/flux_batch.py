@@ -14,9 +14,13 @@ from diffusers import FluxImg2ImgPipeline, FluxTransformer2DModel, BitsAndBytesC
 from transformers import T5EncoderModel, BitsAndBytesConfig as HBnb
 
 REPO = "black-forest-labs/FLUX.1-schnell"
-PROMPT = ("3d pixar disney style cartoon portrait, big cute expressive glossy eyes, "
-          "smooth 3d rendered skin, stylized cartoon character, soft studio lighting, "
-          "highly detailed, keep the pose and expression, no text, no watermark")
+PROMPT = (
+    "original generic stylized 3D animated avatar face, non-photorealistic, "
+    "large expressive eyes, soft rounded cheeks, small simplified nose, "
+    "smooth clean skin, gentle toon shading, detailed stylized hair, "
+    "friendly neutral expression, face crop portrait, soft studio lighting, "
+    "high quality 3D render, no text, no watermark"
+)
 
 def prep(p, size):
     img = Image.open(p).convert("RGB"); w, h = img.size; sc = size/max(w, h)

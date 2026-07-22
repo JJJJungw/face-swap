@@ -19,9 +19,11 @@ from transformers import T5EncoderModel, BitsAndBytesConfig as HFBnb
 
 REPO = "black-forest-labs/FLUX.1-schnell"
 PROMPT = (
-    "beautiful semi-realistic 2.5d portrait, glossy detailed eyes, smooth flawless skin, "
-    "subtle illustration polish, soft cinematic lighting, highly detailed, "
-    "preserve the same face pose and expression, no text, no watermark"
+    "original generic stylized 3D animated avatar face, non-photorealistic, "
+    "large expressive eyes, soft rounded cheeks, small simplified nose, "
+    "smooth clean skin, gentle toon shading, detailed stylized hair, "
+    "friendly neutral expression, face crop portrait, soft studio lighting, "
+    "high quality 3D render, no text, no watermark"
 )
 
 def prep(img, target):

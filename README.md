@@ -106,7 +106,8 @@ bash run/run_probe.sh --video input/swap4.mp4 --trt --scene-cut 55 --min-len 5
 | `run_deid.sh` · `run_track.sh` · `run_probe.sh` | 실행 래퍼(LD_LIBRARY_PATH 자동) |
 | `setup_venv.sh` · `requirements.txt` | venv 환경 설치·핀 |
 | `animegan_stylize.py` | 이미지 1장 카툰화(animegan2) |
-| `flux_img2img_test.py` · `flux_batch.py` | Flux 2.5D 실험 · 증류용 데이터셋 생성 (오프라인) |
+| `avatar_teacher_poc.py` | **3D avatar teacher PoC** — 얼굴 crop → prompt-only teacher target dataset |
+| `flux_img2img_test.py` · `flux_batch.py` | Flux 3D avatar 실험 · 증류용 데이터셋 생성 (오프라인) |
 
 ---
 
@@ -140,4 +141,4 @@ bash run/run_probe.sh --video input/swap4.mp4 --trt --scene-cut 55 --min-len 5
 2. **검출기 정식 연동** — face-deid 멀티스케일(1280+608)·정책 파라미터 반영.
 3. **다중 얼굴 속도** — 군중 장면용 얼굴 배치 스타일화(단일 얼굴 속도 유지).
 4. (옵션) **트랙 캐싱+리인액트** — 편집물에서 작은 얼굴 표정 유지가 필요해질 때 착수(임베딩 신원 구분 포함).
-5. (옵션) **3D 픽사 화풍** — Flux 선생님 → 증류 학생모델 학습.
+5. (옵션) **3D avatar 화풍** — prompt-only Flux/SDXL teacher PoC → 선별 결과를 style reference pack으로 승격 → 증류 학생모델 학습. 실행법: [docs/avatar-teacher-poc.md](docs/avatar-teacher-poc.md)
