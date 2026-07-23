@@ -13,10 +13,10 @@ MODEL = "lodestones/Chroma1-HD"
 GGUF = "https://huggingface.co/silveroxides/Chroma1-HD-GGUF/blob/main/Chroma1-HD-Q6_K.gguf"
 
 # 핀터레스트 4장에서 뽑은 스타일 기술(저작권 무관 — 말로 옮긴 것). Disney/Pixar 명칭은 상표라 회피.
-STYLE = ("cute stylized 3D animated character portrait of a {subj}, high quality feature-animation-style "
-         "3D render, very large expressive glossy eyes with long eyelashes and bright catchlights, "
-         "small soft nose, rounded youthful face, smooth skin with subtle rosy cheeks and light freckles, "
-         "{hair} hair, gentle friendly expression, soft warm studio lighting, simple pastel solid background, "
+STYLE = ("cute stylized 3D animated character portrait of a {subj} with {skin} skin, high quality "
+         "feature-animation-style 3D render, very large expressive glossy eyes with long eyelashes and "
+         "bright catchlights, small soft nose, rounded youthful face, smooth skin with subtle rosy cheeks, "
+         "{hair} hair, {expr}, soft warm studio lighting, simple pastel solid background, "
          "head and shoulders portrait, ultra detailed 3D character design")
 NEG = ("photorealistic, real photo, realistic skin pores, harsh shadows, deformed, extra limbs, "
        "bad hands, blurry, low quality, watermark, text, logo, nsfw")
@@ -25,6 +25,9 @@ SUBJ = ["young woman", "young man", "teenage girl", "teenage boy", "little girl"
         "little boy", "middle-aged woman", "middle-aged man", "elderly woman", "elderly man"]
 HAIR = ["short curly brown", "long wavy blonde", "black top bun", "auburn bob", "messy ginger",
         "straight dark", "braided brown", "silver short", "wavy red", "black twin buns"]
+SKIN = ["fair", "light", "medium", "tan", "brown", "dark", "olive"]
+EXPR = ["gentle friendly smile", "happy laughing expression", "calm neutral expression", "cheerful grin",
+        "shy soft smile", "surprised open-mouth expression", "warm gentle smile", "playful expression"]
 
 def load_pipe(gguf):
     t = ChromaTransformer2DModel.from_single_file(
@@ -48,8 +51,9 @@ def main():
 
     pipe = load_pipe(args.gguf)
     for i in range(args.n):
-        subj = SUBJ[i % len(SUBJ)]; hair = HAIR[i % len(HAIR)]
-        prompt = STYLE.format(subj=subj, hair=hair)
+        subj = SUBJ[i % len(SUBJ)]; hair = HAIR[(i * 3) % len(HAIR)]
+        skin = SKIN[(i * 2) % len(SKIN)]; expr = EXPR[(i * 5) % len(EXPR)]   # 축마다 독립적으로 섞기
+        prompt = STYLE.format(subj=subj, hair=hair, skin=skin, expr=expr)
         gen = torch.Generator("cpu").manual_seed(args.seed + i)
         img = pipe(prompt=prompt, negative_prompt=NEG, num_inference_steps=args.steps,
                    guidance_scale=args.guidance, height=args.size, width=args.size, generator=gen).images[0]

@@ -30,10 +30,10 @@ def load_pipe(gguf_url):
     transformer = ChromaTransformer2DModel.from_single_file(
         gguf_url, quantization_config=GGUFQuantizationConfig(compute_dtype=torch.bfloat16),
         torch_dtype=torch.bfloat16)
-    # T5/VAE/scheduler는 레포에서 자동 로드(bf16). offload로 배치 관리(모델 작아 thrash 없음).
+    # T5/VAE/scheduler는 레포에서 자동 로드(bf16).
     pipe = ChromaImg2ImgPipeline.from_pretrained(MODEL, transformer=transformer, torch_dtype=torch.bfloat16)
-    pipe.enable_model_cpu_offload()
-    pipe.enable_vae_tiling()
+    pipe.to("cuda")            # 전부 GPU 상주(T5 9.5G + GGUF 7G + VAE ≈17G<24G) → CPU RAM OOM 회피
+    pipe.vae.enable_tiling()   # 구 enable_vae_tiling deprecated
     return pipe
 
 def main():
