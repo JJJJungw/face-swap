@@ -15,7 +15,7 @@ from diffusers import BitsAndBytesConfig as DiffusersBnb
 from transformers import T5EncoderModel, BitsAndBytesConfig as HFBnb
 
 MODEL = "lodestones/Chroma1-HD"
-CKPT = "https://huggingface.co/lodestones/Chroma1-HD/resolve/main/Chroma1-HD.safetensors"
+CKPT = "https://huggingface.co/lodestones/Chroma1-HD/blob/main/Chroma1-HD.safetensors"
 PROMPT = ("cute stylized 3D animated character render of this face, smooth stylized skin, "
           "large expressive eyes, soft studio lighting, clean polished non-photorealistic 3D look, "
           "friendly, keep the same pose and expression, plain background")
