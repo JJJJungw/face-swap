@@ -12,14 +12,17 @@ from diffusers import ChromaPipeline, ChromaTransformer2DModel, GGUFQuantization
 MODEL = "lodestones/Chroma1-HD"
 GGUF = "https://huggingface.co/silveroxides/Chroma1-HD-GGUF/blob/main/Chroma1-HD-Q6_K.gguf"
 
-# 핀터레스트 4장에서 뽑은 스타일 기술(저작권 무관 — 말로 옮긴 것). Disney/Pixar 명칭은 상표라 회피.
-STYLE = ("cute stylized 3D animated character portrait of a {subj} with {skin} skin, high quality "
-         "feature-animation-style 3D render, very large expressive glossy eyes with long eyelashes and "
-         "bright catchlights, small soft nose, rounded youthful face, smooth skin with subtle rosy cheeks, "
-         "{hair} hair, {expr}, soft warm studio lighting, simple pastel solid background, "
-         "head and shoulders portrait, ultra detailed 3D character design")
-NEG = ("photorealistic, real photo, realistic skin pores, harsh shadows, deformed, extra limbs, "
-       "bad hands, blurry, low quality, watermark, text, logo, nsfw")
+# 레퍼런스 화풍을 '말로' 기술(이미지 복사 아님 = 클린). 픽사 시그니처(대형 글로시 눈·feature-animation
+# 렌더·무비스틸)는 의도적으로 제거 → 매트 피부·적당한 눈·플랫 파스텔의 중립 3D 아바타로 유도.
+STYLE = ("cute stylized 3D character portrait of a {subj} with {skin} skin, clean modern 3D avatar look, "
+         "smooth soft matte skin with clear rosy blushed cheeks, large friendly rounded eyes with warm "
+         "irises and soft catchlights, delicate eyelashes, small soft rounded nose, gentle closed-mouth "
+         "smile, rounded youthful face, {hair} hair, {expr}, soft even almost shadowless studio lighting, "
+         "simple flat pastel solid background, head and shoulders portrait, polished stylized 3D avatar "
+         "character design, high detail")
+NEG = ("photorealistic, real photo, realistic skin pores, plastic glossy skin, harsh shadows, "
+       "cinematic film still, movie poster, deformed, extra limbs, bad hands, blurry, low quality, "
+       "watermark, text, logo, nsfw")
 
 SUBJ = ["young woman", "young man", "teenage girl", "teenage boy", "little girl",
         "little boy", "middle-aged woman", "middle-aged man", "elderly woman", "elderly man"]
