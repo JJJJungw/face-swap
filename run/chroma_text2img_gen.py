@@ -12,19 +12,21 @@ from diffusers import ChromaPipeline, ChromaTransformer2DModel, GGUFQuantization
 MODEL = "lodestones/Chroma1-HD"
 GGUF = "https://huggingface.co/silveroxides/Chroma1-HD-GGUF/blob/main/Chroma1-HD-Q6_K.gguf"
 
-# [화풍 타깃] 2.5D 반실사 애니(원래 기획안). 3D 렌더 계열을 아예 배제해 픽사/디즈니색을 근본적으로 차단.
-# 핵심: 3D가 아니라 '반실사 애니 일러스트' + 자연스러운 비율 + 아몬드형 눈(초대형 X) + 소프트 페인터리 셰이딩.
-STYLE = ("semi-realistic 2.5D anime portrait of a {subj} with {skin} skin, modern high-quality anime "
-         "illustration, natural stylized facial proportions, expressive almond-shaped anime eyes with "
-         "detailed irises and soft catchlights, refined realistic nose and lips, smooth skin with soft "
-         "painterly anime shading and subtle natural blush, {hair} hair, {expr}, wearing a plain "
-         "crew-neck t-shirt, {angle}, soft natural lighting, simple flat pastel background, head and "
-         "shoulders portrait, detailed semi-realistic anime key-visual rendering with gentle depth")
-# 3D/픽사/디즈니 계열을 네거티브로 강하게 배제 + chibi·초대형눈(픽사눈) 차단 + 노출 방지.
-NEG = ("3D render, 3D model, CGI, octane render, blender render, Pixar style, Disney style, claymation, "
-       "video game character, plastic glossy skin, photorealistic, real photo, realistic skin pores, "
-       "chibi, oversized round eyes, harsh shadows, cinematic film still, deformed, extra limbs, bad "
-       "hands, blurry, low quality, watermark, text, logo, nsfw, bare shoulders, nude, shirtless")
+# [화풍 타깃] 2.5D 반실사 애니 — 평면 2D와 3D-픽사 '사이'. 입체 음영(volumetric)으로 깊이를 주되
+# CGI/플라스틱 렌더는 배제. 진자가 플랫2D로 튀어서, 긍정어에 입체감 강화 + 네거티브에 'flat 2D' 추가.
+STYLE = ("semi-realistic anime portrait of a {subj} with {skin} skin, painterly 2.5D illustration with "
+         "strong volumetric shading and three-dimensional form, realistic proportions and facial depth, "
+         "expressive detailed almond-shaped eyes with realistic irises and catchlights, refined realistic "
+         "nose and lips, soft skin with rich dimensional shading and gentle rim light, subtle natural "
+         "blush, {hair} hair with volume, {expr}, wearing a plain crew-neck t-shirt, {angle}, soft "
+         "realistic lighting, simple pastel background, head and shoulders portrait, detailed "
+         "semi-realistic anime painting rendered with depth and form")
+# 지금의 '너무 평면' 을 밀어냄(flat 2D/cel/lineart) + Pixar/plastic은 남겨 3D-CGI 회귀 방지 + 노출 방지.
+# (generic '3D render'는 NEG에서 뺌 — 그게 입체감까지 눌러 평면화의 원인이었음.)
+NEG = ("flat 2D, flat shading, cel shaded, flat colors, lineart only, sticker, minimalist, Pixar style, "
+       "Disney style, plastic glossy skin, claymation, video game character, photorealistic, real photo, "
+       "chibi, oversized round eyes, harsh shadows, deformed, extra limbs, bad hands, blurry, low "
+       "quality, watermark, text, logo, nsfw, bare shoulders, nude, shirtless")
 
 SUBJ = ["young woman", "young man", "teenage girl", "teenage boy", "little girl",
         "little boy", "middle-aged woman", "middle-aged man", "elderly woman", "elderly man"]
