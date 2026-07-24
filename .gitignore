@@ -19,3 +19,7 @@ input/
 *.mov
 _ref_facedeid/
 _ref_facedeid/
+
+# LoRA 학습(ai-toolkit clone·데이터셋)
+ai-toolkit/
+train/dataset/

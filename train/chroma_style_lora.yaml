@@ -1,0 +1,65 @@
+---
+# ② 스타일 LoRA — Chroma1-HD 에 2.5D 반실사 애니 화풍 고정.
+# 실행: cd ai-toolkit && source venv/bin/activate && python run.py ../train/chroma_style_lora.yaml
+# 기반: ai-toolkit 공식 config/examples/train_lora_chroma_24gb.yaml 을 스타일 LoRA용으로 조정.
+job: extension
+config:
+  name: "chroma_style_lora"
+  process:
+    - type: 'sd_trainer'
+      training_folder: "output"
+      device: cuda:0
+      trigger_word: "s2anime"          # 이 토큰으로 화풍 호출. caption.py 가 캡션에 심음.
+      network:
+        type: "lora"
+        linear: 32                      # 스타일 LoRA rank(16=가벼움/32=여유). 과적합 시 ↓
+        linear_alpha: 32
+      save:
+        dtype: float16
+        save_every: 250
+        max_step_saves_to_keep: 4
+        push_to_hub: false
+      datasets:
+        # ai-toolkit(=cwd) 기준 상대경로. curate.py 로 모은 keeper 폴더.
+        - folder_path: "../train/dataset"
+          caption_ext: "txt"
+          caption_dropout_rate: 0.05
+          shuffle_tokens: false
+          cache_latents_to_disk: true
+          resolution: [ 512, 768 ]      # 씨앗 이미지가 768 → 512/768만(1024 업스케일 학습 회피)
+      train:
+        batch_size: 1
+        steps: 2500                     # keeper ~100장 기준. 부족하면 ↑, 과적합이면 ↓
+        gradient_accumulation: 1
+        train_unet: true
+        train_text_encoder: false
+        gradient_checkpointing: true
+        noise_scheduler: "flowmatch"
+        optimizer: "adamw8bit"
+        lr: 1e-4
+        ema_config:
+          use_ema: true
+          ema_decay: 0.99
+        dtype: bf16
+      model:
+        name_or_path: "lodestones/Chroma1-HD"   # 우리가 씨앗 뽑은 그 모델. 로더가 HD 거부 시 "lodestones/Chroma"(base)로.
+        arch: "chroma"
+        quantize: true                  # L4 24GB 상주(양자화 학습)
+      sample:
+        sampler: "flowmatch"
+        sample_every: 250               # 학습 중 화풍 진행 눈으로 확인
+        width: 768
+        height: 768
+        prompts:
+          - "s2anime, semi-realistic 2.5D anime portrait of a young woman with short curly brown hair, gentle smile, front view, plain pastel background"
+          - "s2anime, semi-realistic 2.5D anime portrait of a young man with black hair, calm expression, three-quarter view, plain background"
+          - "s2anime, semi-realistic 2.5D anime portrait of an elderly woman with red wavy hair, warm smile, plain background"
+          - "s2anime, semi-realistic 2.5D anime portrait of a teenage girl with black twin buns, cheerful expression, plain background"
+        neg: "3D render, Pixar style, Disney style, photorealistic, flat 2D, chibi, deformed"
+        seed: 42
+        walk_seed: true
+        guidance_scale: 4
+        sample_steps: 25
+meta:
+  name: "chroma_style_lora"
+  version: '1.0'
