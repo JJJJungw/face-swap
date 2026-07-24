@@ -1,24 +1,46 @@
 [project]
 name = "face-swap"
 version = "0.1.0"
-description = "Face cartoonization pipeline (photo/video -> semi-realistic anime). Apache/MIT stack."
+description = "Face de-identification via cartoonization (photo/video -> semi-realistic anime). Apache/MIT stack."
 requires-python = ">=3.10"
+
+# ── 런타임 추론 스택 (deid_cartoon.py) : 검증된 핀 (기준 env: EC2 L4 / driver 580 / CUDA13) ──
+# torch 2.13.0: linux x86_64 PyPI 기본 wheel이 +cu130(최신 드라이버용) 자동 선택.
+#   CUDA11 박스면 setup 에서 --index-url https://download.pytorch.org/whl/cu118 로 교체.
+# torchvision 불필요: deid_cartoon.py의 animegan2 model.py는 순수 torch.nn.
 dependencies = [
-    "torch",
-    "torchvision",
-    "diffusers>=0.30",
-    "transformers",
+    "torch==2.13.0",
+    "onnxruntime-gpu==1.27.0",   # CUDA13 빌드, TensorrtExecutionProvider 포함(추론)
+    "onnx",                       # GAN 제너레이터 → .onnx export 직렬화(legacy 익스포터가 사용)
+    "numpy==2.5.1",
+    "opencv-python==5.0.0.*",
+    "pillow",
+]
+
+[project.optional-dependencies]
+# TensorRT 가속(--trt). ★반드시 10.x — ORT 1.27 TRT EP는 libnvinfer.so.10 요구.
+#   11.x(=libnvinfer.so.11)는 SONAME 불일치로 TRT EP 로드 실패 → CUDA 폴백됨.
+trt = ["tensorrt-cu13==10.16.1.11"]
+# 데이터 생성/선생님 스택 (Chroma text2img·img2img, 스타일 LoRA). 모두 Apache/MIT.
+teacher = [
+    "diffusers>=0.36",
+    "transformers>=4.45",
     "accelerate",
     "safetensors",
     "sentencepiece",
     "protobuf",
     "peft",
-    "bitsandbytes",
-    "opencv-python",
-    "pillow",
-    "numpy",
+    "gguf",
 ]
 
-# 애플리케이션(라이브러리 아님) — 프로젝트 자체 빌드는 하지 않음
 [tool.uv]
-package = false
+package = false          # 라이브러리 아님(애플리케이션) — 프로젝트 자체는 설치하지 않음
+
+# tensorrt-cu13 은 NVIDIA 전용 인덱스에서만 가져옴(일반 해상도엔 안 씀 = explicit).
+[[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com"
+explicit = true
+
+[tool.uv.sources]
+tensorrt-cu13 = { index = "nvidia" }
