@@ -21,17 +21,27 @@ git submodule update --init --recursive || true
 git rev-parse HEAD > ../train/ai-toolkit.lock
 echo "  ai-toolkit @ $(cat ../train/ai-toolkit.lock)"
 
-echo "== 2) 격리 venv + torch 핀(cu128) =="
-python3 -m venv venv
+echo "== 2) uv 설치(없으면) =="
+if ! command -v uv >/dev/null 2>&1; then
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  export PATH="$HOME/.local/bin:$PATH"
+fi
+
+echo "== 3) 격리 venv + torch 핀(cu128) — uv로 =="
+uv venv --python 3.12 venv
 # shellcheck disable=SC1091
 source venv/bin/activate
-python -m pip install -U pip
 # README 지정 핀 — L4/driver580(CUDA13)에서 cu128 wheel 하위호환 동작
-pip install --no-cache-dir torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 \
+uv pip install torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 \
   --index-url https://download.pytorch.org/whl/cu128
-pip install --no-cache-dir -r requirements.txt
+uv pip install -r requirements.txt
 
-echo "== 3) 검증 =="
+echo "== 4) 전체 의존성 freeze lock (재현용) =="
+# 전이 의존성까지 정확 버전 고정 → 재현: uv pip install -r train/ai-toolkit.requirements.lock
+uv pip freeze > ../train/ai-toolkit.requirements.lock
+echo "  -> train/ai-toolkit.requirements.lock ($(wc -l < ../train/ai-toolkit.requirements.lock) pkgs)"
+
+echo "== 5) 검증 =="
 python - <<'PY'
 import torch
 print("torch", torch.__version__, "| cuda", torch.cuda.is_available(),

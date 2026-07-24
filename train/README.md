@@ -16,11 +16,13 @@ LoRA 학습은 **ai-toolkit 자체 venv**를 쓴다 — **런타임(face-swap) v
 ## 버전 핀 (검증 기준)
 | 항목 | 버전/출처 |
 |---|---|
-| Python | 3.10+ (3.12 권장) |
+| Python | 3.12 (uv가 격리 설치) |
 | torch / torchvision / torchaudio | 2.9.1 / 0.24.1 / 2.9.1 (`--index-url .../whl/cu128`) |
-| ai-toolkit | `setup_lora.sh` 가 clone 후 **커밋 해시를 `ai-toolkit.lock`에 기록**(재현용) |
-| 나머지 | ai-toolkit `requirements.txt` (diffusers/transformers 등, 자체 venv 내부) |
+| ai-toolkit 코드 | `setup_lora.sh` 가 clone 후 **커밋 해시를 `train/ai-toolkit.lock`에 기록** |
+| 전이 의존성 전체 | 설치 후 **`uv pip freeze` → `train/ai-toolkit.requirements.lock`** 로 정확 버전 고정(재현용) |
 | 베이스 모델 | `lodestones/Chroma1-HD` (Apache, HF에서 자동 다운로드 ~17GB) |
+
+> **재현성:** 설치는 uv로 하고, `ai-toolkit.lock`(코드 커밋) + `ai-toolkit.requirements.lock`(전 패키지 정확버전) 두 파일을 커밋해두면 동일 환경 복원 가능 — `uv pip install -r train/ai-toolkit.requirements.lock`. (두 lock은 setup_lora.sh 첫 실행 후 생성되므로 그때 커밋)
 
 ## 절차
 
