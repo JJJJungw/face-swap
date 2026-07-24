@@ -12,20 +12,19 @@ from diffusers import ChromaPipeline, ChromaTransformer2DModel, GGUFQuantization
 MODEL = "lodestones/Chroma1-HD"
 GGUF = "https://huggingface.co/silveroxides/Chroma1-HD-GGUF/blob/main/Chroma1-HD-Q6_K.gguf"
 
-# 레퍼런스 화풍을 '말로' 기술(이미지 복사 아님 = 클린). 픽사 시그니처(대형 글로시 눈·feature-animation
-# 렌더·무비스틸)는 의도적으로 제거 → 매트 피부·적당한 눈·플랫 파스텔의 중립 3D 아바타로 유도.
-STYLE = ("cute stylized 3D character portrait of a {subj} with {skin} skin, clean modern 3D avatar look, "
-         "smooth soft matte skin with clear rosy blushed cheeks, large friendly rounded eyes with warm "
-         "irises and soft catchlights, delicate eyelashes, small soft rounded nose, {expr}, rounded "
-         "youthful face, {hair} hair, wearing a plain crew-neck t-shirt, {angle}, soft even almost "
-         "shadowless studio lighting, simple flat pastel solid background, head and shoulders portrait, "
-         "polished stylized 3D avatar character design, high detail")
-# Disney/Pixar를 '네거티브'로 강하게 밀어냄(브랜드 사용 아님 — 생성을 그 화풍에서 멀어지게 조종).
-# bare shoulders/nude도 네거티브로 → 001처럼 옷 안 생기는 것 방지.
-NEG = ("photorealistic, real photo, realistic skin pores, plastic glossy skin, harsh shadows, "
-       "cinematic film still, movie poster, Disney style, Pixar style, feature-film 3D animation character, "
-       "deformed, extra limbs, bad hands, blurry, low quality, watermark, text, logo, nsfw, "
-       "bare shoulders, nude, shirtless")
+# [화풍 타깃] 2.5D 반실사 애니(원래 기획안). 3D 렌더 계열을 아예 배제해 픽사/디즈니색을 근본적으로 차단.
+# 핵심: 3D가 아니라 '반실사 애니 일러스트' + 자연스러운 비율 + 아몬드형 눈(초대형 X) + 소프트 페인터리 셰이딩.
+STYLE = ("semi-realistic 2.5D anime portrait of a {subj} with {skin} skin, modern high-quality anime "
+         "illustration, natural stylized facial proportions, expressive almond-shaped anime eyes with "
+         "detailed irises and soft catchlights, refined realistic nose and lips, smooth skin with soft "
+         "painterly anime shading and subtle natural blush, {hair} hair, {expr}, wearing a plain "
+         "crew-neck t-shirt, {angle}, soft natural lighting, simple flat pastel background, head and "
+         "shoulders portrait, detailed semi-realistic anime key-visual rendering with gentle depth")
+# 3D/픽사/디즈니 계열을 네거티브로 강하게 배제 + chibi·초대형눈(픽사눈) 차단 + 노출 방지.
+NEG = ("3D render, 3D model, CGI, octane render, blender render, Pixar style, Disney style, claymation, "
+       "video game character, plastic glossy skin, photorealistic, real photo, realistic skin pores, "
+       "chibi, oversized round eyes, harsh shadows, cinematic film still, deformed, extra limbs, bad "
+       "hands, blurry, low quality, watermark, text, logo, nsfw, bare shoulders, nude, shirtless")
 
 SUBJ = ["young woman", "young man", "teenage girl", "teenage boy", "little girl",
         "little boy", "middle-aged woman", "middle-aged man", "elderly woman", "elderly man"]
