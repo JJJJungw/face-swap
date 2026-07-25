@@ -30,14 +30,15 @@ def prep(img, target):
     nw = max(256, int(round(w * s / 16)) * 16); nh = max(256, int(round(h * s / 16)) * 16)
     return img.resize((nw, nh), Image.LANCZOS)
 
-def load_pipe(gguf, lora):
+def load_pipe(gguf, lora, lora_scale):
     t = ChromaTransformer2DModel.from_single_file(
         gguf, quantization_config=GGUFQuantizationConfig(compute_dtype=torch.bfloat16),
         torch_dtype=torch.bfloat16)
     pipe = ChromaImg2ImgPipeline.from_pretrained(MODEL, transformer=t, torch_dtype=torch.bfloat16)
     pipe.to("cuda"); pipe.vae.enable_tiling()
-    pipe.load_lora_weights(lora)          # ② 스타일 LoRA 적용 (키 불일치로 실패하면 풀 모델 필요)
-    print("LoRA 적용 완료:", os.path.basename(lora))
+    pipe.load_lora_weights(lora, adapter_name="style")          # ② 스타일 LoRA
+    pipe.set_adapters(["style"], adapter_weights=[lora_scale])  # LoRA 세기(>1 = base 눌러 화풍 강화)
+    print(f"LoRA 적용: {os.path.basename(lora)} (scale={lora_scale})")
     return pipe
 
 def main():
@@ -46,7 +47,9 @@ def main():
     ap.add_argument("--lora", required=True, help="chroma_style_lora.safetensors 경로")
     ap.add_argument("--out", default="out/pairs")
     ap.add_argument("--n", type=int, default=0, help="처리 장수(0=전부)")
-    ap.add_argument("--strength", type=float, default=0.6, help="변환 강도(↑=스타일강/원본약)")
+    ap.add_argument("--strength", type=float, default=0.7, help="변환 강도(↑=스타일강/원본약, 과하면 환각)")
+    ap.add_argument("--lora-scale", type=float, default=1.2, dest="lora_scale",
+                    help="LoRA 세기(>1 = 학습화풍 강화, base 눌러줌)")
     ap.add_argument("--steps", type=int, default=28)
     ap.add_argument("--guidance", type=float, default=4.0)
     ap.add_argument("--size", type=int, default=512)
@@ -60,7 +63,7 @@ def main():
 
     din = os.path.join(args.out, "input"); dtg = os.path.join(args.out, "target")
     os.makedirs(din, exist_ok=True); os.makedirs(dtg, exist_ok=True)
-    pipe = load_pipe(args.gguf, args.lora)
+    pipe = load_pipe(args.gguf, args.lora, args.lora_scale)
     man = open(os.path.join(args.out, "manifest.jsonl"), "w")
 
     for i, p in enumerate(imgs):
