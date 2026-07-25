@@ -36,7 +36,8 @@ def load_pipe(gguf, lora, lora_scale):
         torch_dtype=torch.bfloat16)
     pipe = ChromaImg2ImgPipeline.from_pretrained(MODEL, transformer=t, torch_dtype=torch.bfloat16)
     pipe.to("cuda"); pipe.vae.enable_tiling()
-    pipe.load_lora_weights(lora, adapter_name="style")          # ② 스타일 LoRA
+    # ai-toolkit LoRA는 'transformer' prefix가 아니라 → prefix=None 으로 키 전체 매칭
+    pipe.load_lora_weights(lora, adapter_name="style", prefix=None)
     pipe.set_adapters(["style"], adapter_weights=[lora_scale])  # LoRA 세기(>1 = base 눌러 화풍 강화)
     print(f"LoRA 적용: {os.path.basename(lora)} (scale={lora_scale})")
     return pipe
