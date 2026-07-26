@@ -18,10 +18,11 @@ MODEL = "lodestones/Chroma1-HD"
 GGUF = "https://huggingface.co/silveroxides/Chroma1-HD-GGUF/blob/main/Chroma1-HD-Q6_K.gguf"
 HID = 3072   # Chroma hidden dim (qkv lora_B=9216=3*3072 로 확인)
 
-PROMPT = ("s2anime, semi-realistic 2.5D anime portrait, soft painterly anime shading, "
-          "keep the same pose and facial expression, plain simple background")
+PROMPT = ("s2anime, semi-realistic 2.5D anime portrait, single person close-up face, "
+          "soft painterly anime shading, keep the same pose and facial expression, plain simple background")
 NEG = ("3D render, Pixar style, Disney style, photorealistic, real photo, flat 2D, chibi, "
-       "deformed, extra fingers, bad hands, blurry, low quality, watermark, text")
+       "multiple people, two people, extra person, full body, duplicate face, merged faces, "
+       "deformed, disfigured, melted, smeared, extra fingers, bad hands, blurry, low quality, watermark, text")
 EXTS = (".png", ".jpg", ".jpeg", ".webp")
 
 
