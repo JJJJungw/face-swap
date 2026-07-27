@@ -9,13 +9,17 @@
     화풍         = GAN(adv) + grayscale gram style + color 복원
     신원 제거     = identity-suppression (얼굴 임베딩 코사인 억제, 옵션)
 
-⚠️ 안정화 노트(2026-07-27 개정):
-  이전 런(adv=300 풀블라스트)은 판별자가 얼굴 구조를 밀어버려 색 덩어리로 뭉갬.
-  얼굴은 풍경과 달리 구조가 깨지면 끝이라, 아래 4가지로 안정화:
-    (1) adv 목표를 15로 낮추고 0→목표로 램프(--adv-ramp)  → 구조 먼저 잠그고 화풍을 살살 얹음
-    (2) content 앵커 강화(w-con 3.0)                      → 얼굴이 안 무너지게
-    (3) D 학습률 = G 학습률(2e-5)                          → D 붕괴/발산 방지
-    (4) 고정 평가셋 4장으로 매 샘플 + 워밍업 끝 샘플         → 진행을 눈으로 추적
+⚠️ 근거 기반 개정(2026-07-27):
+  진짜 뿌리 = "워밍업이 회색 상수로 붕괴"였다. VGG conv4_4 단독 content는 픽셀 재현 신호가
+  약해서, 우리 제너레이터(animegan2, 64x64 병목)가 실제 얼굴 대신 평균색 하나로 도망감.
+  그 위에서 adv를 돌리니 D가 "회색 vs 진짜애니"를 너무 쉽게 이겨(D→0.04, GAN 수렴실패의 전형)
+  색 덩어리만 얹혔다. 즉 adv 300이 얼굴을 민 게 아니라, 얼굴이 처음부터 없었다.
+  근거: ptran1203/pytorch-animeGAN(최다사용 구현), TachibanaYoshino/AnimeGAN, ML-Mastery GAN 실패모드.
+  → 수정:
+    (1) 워밍업을 픽셀 L1 + VGG 재현으로  → 얼굴을 실제로 그리게(붕괴 원천 차단) ★핵심
+    (2) 검증된 레시피값 그대로: adv 300(램프로 부드럽게 진입) / con 1.5 / gram 3 / color 30 / lr 2e-5·4e-5
+    (3) 고정 평가셋 4장 매 샘플 + 워밍업 끝 샘플            → s000000이 얼굴이면 토대 정상
+    (4) --w-con-px : 재붕괴 대비 픽셀 앵커(기본 0, 만약 재붕괴 보이면 켬)
 
 라이선스 메모(중요):
 - 본 파일 = 우리 소유. Generator 구조는 bryandlee/animegan2-pytorch(MIT) 재구현·귀속.
@@ -242,15 +246,16 @@ def main():
     ap.add_argument("--size", type=int, default=256)
     ap.add_argument("--batch", type=int, default=4)
     ap.add_argument("--lr-g", type=float, default=2e-5, dest="lr_g", help="G lr")
-    ap.add_argument("--lr-d", type=float, default=2e-5, dest="lr_d", help="D lr (=G, D붕괴 방지)")
+    ap.add_argument("--lr-d", type=float, default=4e-5, dest="lr_d", help="D lr (레시피값, G의 2배)")
     ap.add_argument("--init-lr", type=float, default=1e-4, dest="init_lr", help="워밍업 lr")
     ap.add_argument("--init-steps", type=int, default=3000, dest="init_steps", help="content-only 워밍업")
     ap.add_argument("--steps", type=int, default=40000)
-    ap.add_argument("--w-adv", type=float, default=15.0, dest="w_adv", help="adv 목표(얼굴용, 램프됨)")
-    ap.add_argument("--adv-ramp", type=int, default=3000, dest="adv_ramp", help="adv 0→목표 램프 스텝수")
-    ap.add_argument("--w-con", type=float, default=3.0, dest="w_con", help="구조 앵커(얼굴은 강하게)")
-    ap.add_argument("--w-sty", type=float, default=3.0, dest="w_sty")
-    ap.add_argument("--w-col", type=float, default=10.0, dest="w_col")
+    ap.add_argument("--w-adv", type=float, default=300.0, dest="w_adv", help="adv 목표(AnimeGAN 레시피 300, 램프됨)")
+    ap.add_argument("--adv-ramp", type=int, default=3000, dest="adv_ramp", help="adv 0→목표 램프 스텝수(부드러운 진입)")
+    ap.add_argument("--w-con", type=float, default=1.5, dest="w_con", help="VGG conv4_4 content(레시피 1.5)")
+    ap.add_argument("--w-con-px", type=float, default=0.0, dest="w_con_px", help="픽셀 L1 앵커(재붕괴 대비, 기본 off)")
+    ap.add_argument("--w-sty", type=float, default=3.0, dest="w_sty", help="gram style(레시피 3)")
+    ap.add_argument("--w-col", type=float, default=30.0, dest="w_col", help="color 복원(레시피 30, 색 고정)")
     ap.add_argument("--w-tv", type=float, default=1.0, dest="w_tv")
     ap.add_argument("--id-loss", type=float, default=0.0, dest="id_loss", help="신원억제 가중(0=off)")
     ap.add_argument("--id-margin", type=float, default=0.3, dest="id_margin", help="이 코사인 이상만 벌점")
@@ -271,18 +276,20 @@ def main():
         fake = G(p)
         dfake = D(fake)
         adv = F.mse_loss(dfake, torch.ones_like(dfake))
-        con = F.l1_loss(vgg(fake), vgg(p))                   # conv4_4 content(구조·표정 보존)
+        con = F.l1_loss(vgg(fake), vgg(p))                   # conv4_4 content(의미적 구조)
+        con_px = F.l1_loss(fake, p)                          # 픽셀 L1(기하 앵커, 상수/덩어리 붕괴 방지)
         gs = gram(vgg(gray3(s)))                             # 회색 gram(conv4_4)
         sty = F.l1_loss(gram(vgg(gray3(fake))), gs) / (gs.abs().mean() + 1e-8)  # 상대오차, O(1)
         col = color_loss(fake, p)
         tv = tv_loss(fake)
-        g = w_adv_eff * adv + args.w_con * con + args.w_sty * sty + args.w_col * col + args.w_tv * tv
+        g = (w_adv_eff * adv + args.w_con * con + args.w_con_px * con_px
+             + args.w_sty * sty + args.w_col * col + args.w_tv * tv)
         idl = torch.tensor(0.0, device=dev)
         if idm is not None:
             cos = (id_embed(idm, p) * id_embed(idm, fake)).sum(1)
             idl = F.relu(cos - args.id_margin).mean()
             g = g + args.id_loss * idl
-        return fake, g, dict(adv=adv.item(), con=con.item(), sty=sty.detach().item(),
+        return fake, g, dict(adv=adv.item(), con=con.item(), con_px=con_px.item(), sty=sty.detach().item(),
                              col=col.item(), tv=tv.item(), idl=float(idl))
 
     def d_loss(p, s):
@@ -329,15 +336,17 @@ def main():
         save_image(grid, os.path.join(args.out, "samples", f"s{step:06d}.png"), nrow=n_eval)
         G.train()
 
-    # 워밍업: content-only (G가 입력 구조를 재현하도록) — lr 높게(1e-4)
+    # 워밍업: 재현(reconstruction) — 픽셀 L1 주도 + VGG 보조. G가 입력 얼굴을 실제로 그리게.
+    #  (VGG conv4_4 단독은 신호가 약해 평균색으로 붕괴함 → 픽셀 L1로 강제 재현)
     for grp in optG.param_groups:
         grp["lr"] = args.init_lr
     for step in range(1, args.init_steps + 1):
         p = next(photo).to(dev)
-        con = F.l1_loss(vgg(G(p)), vgg(p))
-        optG.zero_grad(); (args.w_con * con).backward(); optG.step()
+        out = G(p)
+        recon = F.l1_loss(out, p) + 0.5 * F.l1_loss(vgg(out), vgg(p))
+        optG.zero_grad(); recon.backward(); optG.step()
         if step % 200 == 0:
-            print(f"[init {step}/{args.init_steps}] con={con.item():.3f}")
+            print(f"[init {step}/{args.init_steps}] recon={recon.item():.3f} (px+vgg, 내려가야 정상)")
     for grp in optG.param_groups:                # 본 학습 lr로 복귀
         grp["lr"] = args.lr_g
     save_eval(0)                                  # 워밍업 끝 샘플(구조 재현 확인 = s000000.png)
@@ -351,8 +360,8 @@ def main():
         fake, gl, parts = g_losses(p, s, w_adv_eff); optG.zero_grad(); gl.backward(); optG.step()
         if step % 100 == 0:
             print(f"[{step}/{args.steps}] wadv={w_adv_eff:.1f} D={dl.item():.3f} G={gl.item():.3f} "
-                  f"adv={parts['adv']:.2f} con={parts['con']:.2f} sty={parts['sty']:.3f} "
-                  f"col={parts['col']:.2f} id={parts['idl']:.3f}")
+                  f"adv={parts['adv']:.2f} con={parts['con']:.2f} cpx={parts['con_px']:.3f} "
+                  f"sty={parts['sty']:.3f} col={parts['col']:.2f} id={parts['idl']:.3f}")
         if step % args.sample_every == 0:
             save_eval(step)
         if step % args.ckpt_every == 0:
