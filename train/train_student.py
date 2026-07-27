@@ -122,14 +122,13 @@ class VGG(nn.Module):
         except Exception as e:
             print(f"[vgg] 사전학습 가중치 다운로드 실패 → 랜덤init(스모크용): {e}")
             v = models.vgg19(weights=None)
-        v = v.features[:27].eval()
-        for p in v.parameters():
+        self.v = v.features[:27].eval()          # conv4_4 (AnimeGAN 정석 — content·gram 공용)
+        for p in self.v.parameters():
             p.requires_grad_(False)
-        self.v = v
         self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
         self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
-    def forward(self, x):          # x in [-1,1]
+    def forward(self, x):          # x in [-1,1] → conv4_4 특징
         x = (x * 0.5 + 0.5 - self.mean) / self.std
         return self.v(x)
 
@@ -163,6 +162,20 @@ def color_loss(a, b):              # 입력 색감 보존(Y 강, UV 약)
 def tv_loss(x):
     return (x[:, :, 1:, :] - x[:, :, :-1, :]).abs().mean() + \
            (x[:, :, :, 1:] - x[:, :, :, :-1]).abs().mean()
+
+
+def edge_smooth(x):
+    """엣지 부위만 블러 처리한 버전 → D에 '가짜'로 넣어 생성자가 선명한 윤곽을 그리게 강제(AnimeGAN 엣지촉진)."""
+    dev = x.device
+    kx = torch.tensor([[-1., 0, 1], [-2, 0, 2], [-1, 0, 1]], device=dev).view(1, 1, 3, 3)
+    ky = kx.transpose(2, 3)
+    g = 0.299 * x[:, 0:1] + 0.587 * x[:, 1:2] + 0.114 * x[:, 2:3]
+    ex = F.conv2d(g, kx, padding=1); ey = F.conv2d(g, ky, padding=1)
+    mag = torch.sqrt(ex * ex + ey * ey + 1e-8)
+    m = (mag > mag.mean() * 1.5).float()          # 엣지 마스크
+    m = F.max_pool2d(m, 3, 1, 1)                   # 엣지 팽창
+    blur = F.avg_pool2d(x, 5, 1, 2)                # 박스 블러
+    return x * (1 - m) + blur * m
 
 
 def load_id(device):
@@ -223,14 +236,16 @@ def main():
     ap.add_argument("--out", default="train/student_out")
     ap.add_argument("--size", type=int, default=256)
     ap.add_argument("--batch", type=int, default=4)
-    ap.add_argument("--lr", type=float, default=2e-4)
-    ap.add_argument("--init-steps", type=int, default=2000, dest="init_steps", help="content-only 워밍업")
-    ap.add_argument("--steps", type=int, default=60000)
-    ap.add_argument("--w-adv", type=float, default=2.0, dest="w_adv")
+    ap.add_argument("--lr-g", type=float, default=2e-5, dest="lr_g", help="G lr (AnimeGAN 2e-5)")
+    ap.add_argument("--lr-d", type=float, default=4e-5, dest="lr_d", help="D lr (G의 2배)")
+    ap.add_argument("--init-lr", type=float, default=1e-4, dest="init_lr", help="워밍업 lr")
+    ap.add_argument("--init-steps", type=int, default=3000, dest="init_steps", help="content-only 워밍업(~10ep)")
+    ap.add_argument("--steps", type=int, default=40000)
+    ap.add_argument("--w-adv", type=float, default=300.0, dest="w_adv", help="AnimeGAN 정석 300")
     ap.add_argument("--w-con", type=float, default=1.5, dest="w_con")
-    ap.add_argument("--w-sty", type=float, default=2.5, dest="w_sty")
-    ap.add_argument("--w-col", type=float, default=1.0, dest="w_col")
-    ap.add_argument("--w-tv", type=float, default=0.5, dest="w_tv")
+    ap.add_argument("--w-sty", type=float, default=3.0, dest="w_sty")
+    ap.add_argument("--w-col", type=float, default=10.0, dest="w_col")
+    ap.add_argument("--w-tv", type=float, default=1.0, dest="w_tv")
     ap.add_argument("--id-loss", type=float, default=0.3, dest="id_loss", help="신원억제 가중(0=off)")
     ap.add_argument("--id-margin", type=float, default=0.3, dest="id_margin", help="이 코사인 이상만 벌점")
     ap.add_argument("--aug", action="store_true", help="입력 도메인 랜덤화 on")
@@ -243,15 +258,16 @@ def main():
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     G, D, vgg = Generator().to(dev), Discriminator().to(dev), VGG().to(dev)
     idm = load_id(dev) if args.id_loss > 0 else None
-    optG = Adam(G.parameters(), args.lr, betas=(0.5, 0.999))
-    optD = Adam(D.parameters(), args.lr, betas=(0.5, 0.999))
+    optG = Adam(G.parameters(), args.lr_g, betas=(0.5, 0.999))
+    optD = Adam(D.parameters(), args.lr_d, betas=(0.5, 0.999))
 
     def g_losses(p, s):
         fake = G(p)
-        adv = F.mse_loss(D(fake), torch.ones_like(D(fake)))
-        con = F.l1_loss(vgg(fake), vgg(p))
-        gs = gram(vgg(gray3(s)))                             # 스타일 코퍼스 gram(회색)
-        sty = F.l1_loss(gram(vgg(gray3(fake))), gs) / (gs.abs().mean() + 1e-8)  # 상대오차→스케일 무관, O(1)
+        dfake = D(fake)
+        adv = F.mse_loss(dfake, torch.ones_like(dfake))
+        con = F.l1_loss(vgg(fake), vgg(p))                   # conv4_4 content(구조·표정 보존)
+        gs = gram(vgg(gray3(s)))                             # 회색 gram(conv4_4)
+        sty = F.l1_loss(gram(vgg(gray3(fake))), gs) / (gs.abs().mean() + 1e-8)  # 상대오차, O(1)
         col = color_loss(fake, p)
         tv = tv_loss(fake)
         g = args.w_adv * adv + args.w_con * con + args.w_sty * sty + args.w_col * col + args.w_tv * tv
@@ -260,13 +276,19 @@ def main():
             cos = (id_embed(idm, p) * id_embed(idm, fake)).sum(1)
             idl = F.relu(cos - args.id_margin).mean()
             g = g + args.id_loss * idl
-        return fake, g, dict(adv=adv.item(), con=con.item(), sty=sty.item(),
+        return fake, g, dict(adv=adv.item(), con=con.item(), sty=sty.detach().item(),
                              col=col.item(), tv=tv.item(), idl=float(idl))
 
     def d_loss(p, s):
         fake = G(p).detach()
-        dr, df = D(s), D(fake)
-        return 0.5 * (F.mse_loss(dr, torch.ones_like(dr)) + F.mse_loss(df, torch.zeros_like(df)))
+        dr = D(s)                                  # 진짜 애니(컬러) → 1
+        df = D(fake)                               # 생성물 → 0
+        dg = D(gray3(s))                           # 회색 애니 → 0 (색 입히도록 강제)
+        de = D(edge_smooth(gray3(s)))              # 엣지뭉갠 회색 → 0 (선명하게 강제)
+        return (F.mse_loss(dr, torch.ones_like(dr))
+                + F.mse_loss(df, torch.zeros_like(df))
+                + F.mse_loss(dg, torch.zeros_like(dg))
+                + 0.1 * F.mse_loss(de, torch.zeros_like(de)))
 
     if args.smoke:
         print(f"[smoke] dev={dev} size={args.size}")
@@ -288,13 +310,17 @@ def main():
                              shuffle=True, num_workers=args.workers, drop_last=True))
     print(f"[data] photo={len(Imgs(args.photo, args.size).paths)}  style={len(Imgs(args.style, args.size).paths)}")
 
-    # 워밍업: content-only (G가 입력 구조를 재현하도록)
+    # 워밍업: content-only (G가 입력 구조를 재현하도록) — lr 높게(1e-4)
+    for grp in optG.param_groups:
+        grp["lr"] = args.init_lr
     for step in range(1, args.init_steps + 1):
         p = next(photo).to(dev)
         con = F.l1_loss(vgg(G(p)), vgg(p))
         optG.zero_grad(); (args.w_con * con).backward(); optG.step()
         if step % 200 == 0:
             print(f"[init {step}/{args.init_steps}] con={con.item():.3f}")
+    for grp in optG.param_groups:                # 본 학습 lr로 복귀(2e-5)
+        grp["lr"] = args.lr_g
 
     # 본 학습
     for step in range(1, args.steps + 1):
