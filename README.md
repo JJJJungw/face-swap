@@ -136,6 +136,14 @@ python run/chroma_text2img_gen.py --n 10 --out out/style_25d    # 2.5D 애니 �
 
 ---
 
+## ④ 학생 학습 — 실험 로그 (unpaired → paired 전환)
+
+경량 학생 GAN을 **unpaired AnimeGAN**으로 학습하려 다섯 번(v5~v9) 시도했으나, 얼굴에서 **화풍이 안 입혀지는 under-fit**에 반복적으로 부딪힘. 과정에서 진짜 버그 둘(워밍업이 평균색으로 붕괴 → 픽셀 L1로 해결, 판별자 수렴 실패)을 잡아 **구조·색 보존까지는 도달**했지만, `gram` 13배·판별자 강화라는 **서로 다른 두 큰 레버로도 스타일 지표(`sty`)가 0.8에서 안 내려감** → **unpaired feed-forward는 이 얼굴+화풍 조합에서 천장을 친다**를 실험으로 확정. 커뮤니티/논문(Diffusion2GAN · pix2pix-turbo · Parsing-Conditioned Anime)의 시니어 정석과 일치하는 결론이라, **구조조건 정렬 페어 + 지도회귀(pix2pix 증류, `train/train_student_paired.py`)** 로 전환함. 경량 학생 아키텍처(런타임 호환)는 그대로 유지.
+
+> 전체 경위 · 버전별 결과 · 근거 · 다음 단계: **[docs/student-distillation-log.md](docs/student-distillation-log.md)**
+
+---
+
 ## 문서 (`docs/`)
 
 | 문서 | 내용 |
@@ -145,6 +153,7 @@ python run/chroma_text2img_gen.py --n 10 --out out/style_25d    # 2.5D 애니 �
 | [pipeline-architecture.md](docs/pipeline-architecture.md) | 파이프라인 단계·라이브러리·핸드오프 |
 | [pipeline-flow.mermaid](docs/pipeline-flow.mermaid) | 파이프라인 흐름도 |
 | [research-report.md](docs/research-report.md) | 딥리서치(라이선스 검증·비식별 발견·아키텍처 추천) |
+| [student-distillation-log.md](docs/student-distillation-log.md) | ④ 학생 학습 실험 로그(unpaired 5회→paired 전환·근거) |
 | [test-roadmap.md](docs/test-roadmap.md) · [research-prompt.md](docs/research-prompt.md) | 테스트 로드맵 · 리서치 프롬프트 |
 
 ---
@@ -154,7 +163,7 @@ python run/chroma_text2img_gen.py --n 10 --out out/style_25d    # 2.5D 애니 �
 1. **① 스타일 씨앗 큐레이션** — Chroma 2.5D 대량 생성분에서 온-스타일만 선별(~100장).
 2. **② 스타일 LoRA 학습** — ai-toolkit(MIT)으로 Chroma에 화풍 고정.
 3. **③ 페어 데이터 생성** — LoRA-Chroma img2img로 SFHQ-T2I(MIT) 실사 얼굴을 변환 → (실사→애니) 수천 쌍.
-4. **④ 학생 학습** — 페어로 경량 GAN 지도학습 **+ 신원 억제 손실**(비식별 보장). AnimeGANv2 아키텍처 기본, **최신 아키텍처 딥리서치 결과 반영**해 확정.
+4. **④ 학생 학습** — unpaired AnimeGAN이 under-fit 천장을 침(→ [학생 학습 로그](docs/student-distillation-log.md)) → **정렬 페어 지도학습(`train_student_paired.py`) + 신원 억제 손실**(비식별 보장)로 전환. 경량 학생 아키텍처(런타임 호환) 유지.
 5. **⑤ 런타임 교체 + 속도 재검증** — 학생 가중치를 런타임 셸에 삽입, L4 ≤2× 재확인.
 
 **런타임 셸 잔여(병렬):** 경계 튐 정식 흡수 · face-deid 멀티스케일 검출기 정식 연동 · 다중 얼굴 배치 스타일화.
