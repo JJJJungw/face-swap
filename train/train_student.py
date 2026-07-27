@@ -26,6 +26,11 @@
     원인 = gram 손실의 커스텀 정규화가 스타일 그래디언트를 눌러 adv 대비 30배+ 약했음.
     → gram 가중 3→40(정규화 보상) / 엣지촉진 0.1→0.5(안개→선명) / color UV 강화(노란캐스트 억제).
 
+  v9 판별자 강화(2026-07-27):
+    v8에서도 under-fit 지속 — D(0.5)가 "부드러운 사진"에 속아 진짜 애니를 강제 못함.
+    → D 용량↑(ch 32→48, 깊이 3→4) + D를 G 1스텝당 여러 번 학습(--d-steps 2)해서
+      D가 사진/애니를 확실히 구분 → G가 진짜 애니를 그려야만 이기게 강제. (재생성 없이 기존 뱅크 사용)
+
 라이선스 메모(중요):
 - 본 파일 = 우리 소유. Generator 구조는 bryandlee/animegan2-pytorch(MIT) 재구현·귀속.
 - VGG19(perceptual) : torchvision ImageNet 가중치 — **학습 전용, 런타임 미포함**.
@@ -262,6 +267,9 @@ def main():
     ap.add_argument("--w-sty", type=float, default=40.0, dest="w_sty", help="gram style(정규화 그래디언트 보상 위해 상향)")
     ap.add_argument("--w-col", type=float, default=30.0, dest="w_col", help="color 복원(레시피 30, 색 고정)")
     ap.add_argument("--w-tv", type=float, default=1.0, dest="w_tv")
+    ap.add_argument("--d-ch", type=int, default=48, dest="d_ch", help="판별자 채널(강화 48)")
+    ap.add_argument("--d-n", type=int, default=4, dest="d_n", help="판별자 깊이(강화 4)")
+    ap.add_argument("--d-steps", type=int, default=2, dest="d_steps", help="G 1스텝당 D 학습 횟수(D 강화)")
     ap.add_argument("--id-loss", type=float, default=0.0, dest="id_loss", help="신원억제 가중(0=off)")
     ap.add_argument("--id-margin", type=float, default=0.3, dest="id_margin", help="이 코사인 이상만 벌점")
     ap.add_argument("--aug", action="store_true", help="입력 도메인 랜덤화 on")
@@ -272,7 +280,8 @@ def main():
     args = ap.parse_args()
 
     dev = "cuda" if torch.cuda.is_available() else "cpu"
-    G, D, vgg = Generator().to(dev), Discriminator().to(dev), VGG().to(dev)
+    G, D, vgg = Generator().to(dev), Discriminator(args.d_ch, args.d_n).to(dev), VGG().to(dev)
+    print(f"[D] 강화 판별자 ch={args.d_ch} n={args.d_n} d_steps={args.d_steps}")
     idm = load_id(dev) if args.id_loss > 0 else None
     optG = Adam(G.parameters(), args.lr_g, betas=(0.5, 0.999))
     optD = Adam(D.parameters(), args.lr_d, betas=(0.5, 0.999))
@@ -357,11 +366,13 @@ def main():
     save_eval(0)                                  # 워밍업 끝 샘플(구조 재현 확인 = s000000.png)
     print("[init] 워밍업 끝 → samples/s000000.png 로 구조 재현 확인 가능")
 
-    # 본 학습 (adv 램프: 0 → w_adv 목표)
+    # 본 학습 (adv 램프: 0 → w_adv 목표, D를 d_steps번 강하게 학습)
     for step in range(1, args.steps + 1):
         w_adv_eff = args.w_adv * min(1.0, step / max(1, args.adv_ramp))
+        for _ in range(args.d_steps):                        # D 강화: 매 스텝 D를 여러 번
+            pd, sd = next(photo).to(dev), next(style).to(dev)
+            dl = d_loss(pd, sd); optD.zero_grad(); dl.backward(); optD.step()
         p, s = next(photo).to(dev), next(style).to(dev)
-        dl = d_loss(p, s); optD.zero_grad(); dl.backward(); optD.step()
         fake, gl, parts = g_losses(p, s, w_adv_eff); optG.zero_grad(); gl.backward(); optG.step()
         if step % 100 == 0:
             print(f"[{step}/{args.steps}] wadv={w_adv_eff:.1f} D={dl.item():.3f} G={gl.item():.3f} "
