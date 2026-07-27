@@ -108,24 +108,32 @@ class Discriminator(nn.Module):
         return self.net(x)
 
 
-# ============ VGG19 perceptual (conv4_4) ============
+# ============ VGG19 다층 perceptual (relu1_2·2_2·3_4·4_4 = 선명도 위해 가는 층 포함) ============
 class VGG(nn.Module):
     def __init__(self):
         super().__init__()
         try:
-            v = models.vgg19(weights=models.VGG19_Weights.IMAGENET1K_V1)
+            feats = models.vgg19(weights=models.VGG19_Weights.IMAGENET1K_V1).features
         except Exception as e:
             print(f"[vgg] 가중치 다운로드 실패 → 랜덤init(스모크용): {e}")
-            v = models.vgg19(weights=None)
-        self.v = v.features[:27].eval()
-        for p in self.v.parameters():
+            feats = models.vgg19(weights=None).features
+        # 얕은 층(relu1_2,2_2)=엣지·디테일 / 깊은 층(3_4,4_4)=구조. 다층이라야 선명하게 매칭됨.
+        self.slices = nn.ModuleList([feats[:4], feats[4:9], feats[9:18], feats[18:27]]).eval()
+        for p in self.parameters():
             p.requires_grad_(False)
         self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
         self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
-    def forward(self, x):
+    def forward(self, x):                       # → 4개 층 특징 리스트
         x = (x * 0.5 + 0.5 - self.mean) / self.std
-        return self.v(x)
+        out = []
+        for s in self.slices:
+            x = s(x); out.append(x)
+        return out
+
+
+def perc_l1(fa, fb):                            # 다층 perceptual L1(층 평균)
+    return sum(F.l1_loss(a, b) for a, b in zip(fa, fb)) / len(fa)
 
 
 def load_id(device):
@@ -205,7 +213,7 @@ def main():
     def g_losses(inp, tgt, use_gan):
         fake = G(inp)
         l1 = F.l1_loss(fake, tgt)                        # 타깃 애니에 픽셀 근사
-        perc = F.l1_loss(vgg(fake), vgg(tgt))            # 타깃 애니에 특징 근사
+        perc = perc_l1(vgg(fake), vgg(tgt))              # 다층 perceptual(선명도) — 타깃 특징 근사
         g = args.w_l1 * l1 + args.w_perc * perc
         adv = torch.tensor(0.0, device=dev)
         if use_gan:
@@ -217,7 +225,7 @@ def main():
             cos = (id_embed(idm, inp) * id_embed(idm, fake)).sum(1)
             idl = F.relu(cos - args.id_margin).mean()
             g = g + args.id_loss * idl
-        return fake, g, dict(l1=l1.item(), perc=perc.item(), adv=float(adv), idl=float(idl))
+        return fake, g, dict(l1=l1.item(), perc=perc.item(), adv=adv.item(), idl=idl.item())
 
     def d_loss(inp, tgt):
         fake = G(inp).detach()
