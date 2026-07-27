@@ -17,9 +17,14 @@
   근거: ptran1203/pytorch-animeGAN(최다사용 구현), TachibanaYoshino/AnimeGAN, ML-Mastery GAN 실패모드.
   → 수정:
     (1) 워밍업을 픽셀 L1 + VGG 재현으로  → 얼굴을 실제로 그리게(붕괴 원천 차단) ★핵심
-    (2) 검증된 레시피값 그대로: adv 300(램프로 부드럽게 진입) / con 1.5 / gram 3 / color 30 / lr 2e-5·4e-5
+    (2) 검증된 레시피값: adv 300(램프로 부드럽게 진입) / con 1.5 / color 30 / lr 2e-5·4e-5
     (3) 고정 평가셋 4장 매 샘플 + 워밍업 끝 샘플            → s000000이 얼굴이면 토대 정상
     (4) --w-con-px : 재붕괴 대비 픽셀 앵커(기본 0, 만약 재붕괴 보이면 켬)
+
+  v8 스타일 강화(2026-07-27, under-fit 대응):
+    구조는 잡혔으나(cpx 낮음, D안정) 스타일이 안 입혀짐 — 출력=사진+노란안개, sty가 0.85에서 안 내려감.
+    원인 = gram 손실의 커스텀 정규화가 스타일 그래디언트를 눌러 adv 대비 30배+ 약했음.
+    → gram 가중 3→40(정규화 보상) / 엣지촉진 0.1→0.5(안개→선명) / color UV 강화(노란캐스트 억제).
 
 라이선스 메모(중요):
 - 본 파일 = 우리 소유. Generator 구조는 bryandlee/animegan2-pytorch(MIT) 재구현·귀속.
@@ -163,9 +168,9 @@ def rgb2yuv(x):                    # [-1,1] -> [0,1] -> YUV
     return y, u, v
 
 
-def color_loss(a, b):              # 입력 색감 보존(Y 강, UV 약)
+def color_loss(a, b):              # 입력 색감 보존(Y=밝기, UV=색차). UV 강화로 전역 색캐스트(노란기) 억제
     ya, ua, va = rgb2yuv(a); yb, ub, vb = rgb2yuv(b)
-    return F.l1_loss(ya, yb) + F.smooth_l1_loss(ua, ub) + F.smooth_l1_loss(va, vb)
+    return F.l1_loss(ya, yb) + 2.0 * F.l1_loss(ua, ub) + 2.0 * F.l1_loss(va, vb)
 
 
 def tv_loss(x):
@@ -254,7 +259,7 @@ def main():
     ap.add_argument("--adv-ramp", type=int, default=3000, dest="adv_ramp", help="adv 0→목표 램프 스텝수(부드러운 진입)")
     ap.add_argument("--w-con", type=float, default=1.5, dest="w_con", help="VGG conv4_4 content(레시피 1.5)")
     ap.add_argument("--w-con-px", type=float, default=0.0, dest="w_con_px", help="픽셀 L1 앵커(재붕괴 대비, 기본 off)")
-    ap.add_argument("--w-sty", type=float, default=3.0, dest="w_sty", help="gram style(레시피 3)")
+    ap.add_argument("--w-sty", type=float, default=40.0, dest="w_sty", help="gram style(정규화 그래디언트 보상 위해 상향)")
     ap.add_argument("--w-col", type=float, default=30.0, dest="w_col", help="color 복원(레시피 30, 색 고정)")
     ap.add_argument("--w-tv", type=float, default=1.0, dest="w_tv")
     ap.add_argument("--id-loss", type=float, default=0.0, dest="id_loss", help="신원억제 가중(0=off)")
@@ -301,7 +306,7 @@ def main():
         return (F.mse_loss(dr, torch.ones_like(dr))
                 + F.mse_loss(df, torch.zeros_like(df))
                 + F.mse_loss(dg, torch.zeros_like(dg))
-                + 0.1 * F.mse_loss(de, torch.zeros_like(de)))
+                + 0.5 * F.mse_loss(de, torch.zeros_like(de)))   # 엣지촉진 강화(안개→선명)
 
     if args.smoke:
         print(f"[smoke] dev={dev} size={args.size}")
