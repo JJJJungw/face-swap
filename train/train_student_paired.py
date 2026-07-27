@@ -190,11 +190,11 @@ def main():
     ap.add_argument("--size", type=int, default=256)
     ap.add_argument("--batch", type=int, default=4)
     ap.add_argument("--lr-g", type=float, default=2e-4, dest="lr_g")
-    ap.add_argument("--lr-d", type=float, default=2e-4, dest="lr_d")
+    ap.add_argument("--lr-d", type=float, default=1e-4, dest="lr_d", help="D 붕괴 방지 위해 G보다 낮게")
     ap.add_argument("--steps", type=int, default=40000)
-    ap.add_argument("--w-l1", type=float, default=4.0, dest="w_l1", help="타깃 픽셀 L1(드리프트 내성 위해 낮춤. 완전정렬이면 ↑)")
-    ap.add_argument("--w-perc", type=float, default=10.0, dest="w_perc", help="VGG perceptual(구조·질감, 공간 드리프트에 관대 = 주력)")
-    ap.add_argument("--w-adv", type=float, default=1.5, dest="w_adv", help="GAN(애니 선명도, 정렬 무관하게 화풍 밀기)")
+    ap.add_argument("--w-l1", type=float, default=2.0, dest="w_l1", help="타깃 픽셀 L1(realistic 앵커 줄임 → 카툰化 허용)")
+    ap.add_argument("--w-perc", type=float, default=5.0, dest="w_perc", help="VGG perceptual(구조 유지, 과하면 사진에 붙음)")
+    ap.add_argument("--w-adv", type=float, default=4.0, dest="w_adv", help="GAN(카툰 화풍 주력 — 정렬 무관하게 스타일 밀기)")
     ap.add_argument("--gan-start", type=int, default=1000, dest="gan_start", help="이 스텝부터 GAN 켬(먼저 L1로 타깃 근사)")
     ap.add_argument("--id-loss", type=float, default=0.0, dest="id_loss", help="신원억제(0=off)")
     ap.add_argument("--id-margin", type=float, default=0.3, dest="id_margin")
@@ -230,7 +230,8 @@ def main():
     def d_loss(inp, tgt):
         fake = G(inp).detach()
         dr = D(tgt); df = D(fake)
-        return F.mse_loss(dr, torch.ones_like(dr)) + F.mse_loss(df, torch.zeros_like(df))
+        # 라벨 스무딩(real=0.9): D 과신·붕괴(D→0) 방지
+        return F.mse_loss(dr, torch.full_like(dr, 0.9)) + F.mse_loss(df, torch.zeros_like(df))
 
     if args.smoke:
         print(f"[smoke] dev={dev} size={args.size}")
