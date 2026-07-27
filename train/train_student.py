@@ -138,7 +138,7 @@ class VGG(nn.Module):
 def gram(f):
     b, c, h, w = f.shape
     f = f.view(b, c, h * w)
-    return f.bmm(f.transpose(1, 2)) / (c * h * w)
+    return f.bmm(f.transpose(1, 2)) / (h * w)   # /(h*w) — Gatys 표준 스케일
 
 
 def gray3(x):                      # RGB[-1,1] -> luminance, 3채널 복제
@@ -226,11 +226,11 @@ def main():
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--init-steps", type=int, default=2000, dest="init_steps", help="content-only 워밍업")
     ap.add_argument("--steps", type=int, default=60000)
-    ap.add_argument("--w-adv", type=float, default=1.0, dest="w_adv")
+    ap.add_argument("--w-adv", type=float, default=2.0, dest="w_adv")
     ap.add_argument("--w-con", type=float, default=1.5, dest="w_con")
     ap.add_argument("--w-sty", type=float, default=2.5, dest="w_sty")
-    ap.add_argument("--w-col", type=float, default=10.0, dest="w_col")
-    ap.add_argument("--w-tv", type=float, default=1.0, dest="w_tv")
+    ap.add_argument("--w-col", type=float, default=1.0, dest="w_col")
+    ap.add_argument("--w-tv", type=float, default=0.5, dest="w_tv")
     ap.add_argument("--id-loss", type=float, default=0.3, dest="id_loss", help="신원억제 가중(0=off)")
     ap.add_argument("--id-margin", type=float, default=0.3, dest="id_margin", help="이 코사인 이상만 벌점")
     ap.add_argument("--aug", action="store_true", help="입력 도메인 랜덤화 on")
@@ -250,7 +250,8 @@ def main():
         fake = G(p)
         adv = F.mse_loss(D(fake), torch.ones_like(D(fake)))
         con = F.l1_loss(vgg(fake), vgg(p))
-        sty = F.l1_loss(gram(vgg(gray3(fake))), gram(vgg(gray3(s))))
+        gs = gram(vgg(gray3(s)))                             # 스타일 코퍼스 gram(회색)
+        sty = F.l1_loss(gram(vgg(gray3(fake))), gs) / (gs.abs().mean() + 1e-8)  # 상대오차→스케일 무관, O(1)
         col = color_loss(fake, p)
         tv = tv_loss(fake)
         g = args.w_adv * adv + args.w_con * con + args.w_sty * sty + args.w_col * col + args.w_tv * tv
