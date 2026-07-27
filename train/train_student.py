@@ -1,31 +1,36 @@
 #!/usr/bin/env python3
 """
-④ 학생 학습 — AnimeGANv2 (unpaired) + 신원 억제(identity-suppression) 손실.
+④ 학생 학습 — AnimeGANv2 (unpaired) 화풍 학습 + (옵션) 신원 억제.
 
 증류 파이프라인 ④단계 (B: 엔드투엔드 노선).
 - 정렬 페어 X.  photo 코퍼스(SFHQ 실사) + style 코퍼스(LoRA-Chroma로 뽑은 2.5D 애니) unpaired.
 - 역할 분담:
-    구조·표정 보존 = content loss (VGG19 conv4_4)   ← 학생이 담당(선생님 드리프트 무관)
+    구조·표정 보존 = content loss (VGG19 conv4_4)   ← 얼굴 구조 앵커
     화풍         = GAN(adv) + grayscale gram style + color 복원
-    신원 제거     = identity-suppression (얼굴 임베딩 코사인 억제)
+    신원 제거     = identity-suppression (얼굴 임베딩 코사인 억제, 옵션)
+
+⚠️ 안정화 노트(2026-07-27 개정):
+  이전 런(adv=300 풀블라스트)은 판별자가 얼굴 구조를 밀어버려 색 덩어리로 뭉갬.
+  얼굴은 풍경과 달리 구조가 깨지면 끝이라, 아래 4가지로 안정화:
+    (1) adv 목표를 15로 낮추고 0→목표로 램프(--adv-ramp)  → 구조 먼저 잠그고 화풍을 살살 얹음
+    (2) content 앵커 강화(w-con 3.0)                      → 얼굴이 안 무너지게
+    (3) D 학습률 = G 학습률(2e-5)                          → D 붕괴/발산 방지
+    (4) 고정 평가셋 4장으로 매 샘플 + 워밍업 끝 샘플         → 진행을 눈으로 추적
 
 라이선스 메모(중요):
 - 본 파일 = 우리 소유. Generator 구조는 bryandlee/animegan2-pytorch(MIT) 재구현·귀속.
 - VGG19(perceptual) : torchvision ImageNet 가중치 — **학습 전용, 런타임 미포함**.
-- 신원 임베더(--id-backbone facenet) : **학습 전용, 런타임 미포함**. facenet(VGGFace2 학습) 가중치는
-  라이선스가 애매하니 상용 배포 전 반드시 확인. 완전 클린을 원하면 `--id-loss 0` 으로 끄고
-  별도 재식별 검증(후처리)으로 대체 가능. 신원 억제는 학생 가중치에 '효과'로만 남고 임베더 자체는 안 나감.
+- 신원 임베더(facenet) : **학습 전용, 런타임 미포함**. --id-loss 0 이면 끔.
 
 사용:
-  # (A) 스모크 — 랜덤텐서 1스텝, 아키텍처/손실 배선 확인 (모델 없이 즉시)
+  # (A) 스모크 — 랜덤텐서 1스텝, 아키텍처/손실 배선 확인
   python train/train_student.py --smoke
-  # (B) 실제 학습
+  # (B) 실제 학습 (화풍 학습, 신원손실 끔)
   python train/train_student.py \
     --photo input/sfhq_t2i/a_small_sample_new \
     --style out/pairs_dataset/target \
-    --out train/student_out --size 256 --batch 4 \
-    --init-steps 2000 --steps 60000 --id-loss 0.3
-  # 도메인 갭 보정(입력 augmentation) 켜기:  --aug
+    --out train/student_v6 --size 256 --batch 4 \
+    --steps 40000 --init-steps 3000 --id-loss 0
 """
 import os, argparse, glob
 import torch
@@ -236,20 +241,21 @@ def main():
     ap.add_argument("--out", default="train/student_out")
     ap.add_argument("--size", type=int, default=256)
     ap.add_argument("--batch", type=int, default=4)
-    ap.add_argument("--lr-g", type=float, default=2e-5, dest="lr_g", help="G lr (AnimeGAN 2e-5)")
-    ap.add_argument("--lr-d", type=float, default=4e-5, dest="lr_d", help="D lr (G의 2배)")
+    ap.add_argument("--lr-g", type=float, default=2e-5, dest="lr_g", help="G lr")
+    ap.add_argument("--lr-d", type=float, default=2e-5, dest="lr_d", help="D lr (=G, D붕괴 방지)")
     ap.add_argument("--init-lr", type=float, default=1e-4, dest="init_lr", help="워밍업 lr")
-    ap.add_argument("--init-steps", type=int, default=3000, dest="init_steps", help="content-only 워밍업(~10ep)")
+    ap.add_argument("--init-steps", type=int, default=3000, dest="init_steps", help="content-only 워밍업")
     ap.add_argument("--steps", type=int, default=40000)
-    ap.add_argument("--w-adv", type=float, default=300.0, dest="w_adv", help="AnimeGAN 정석 300")
-    ap.add_argument("--w-con", type=float, default=1.5, dest="w_con")
+    ap.add_argument("--w-adv", type=float, default=15.0, dest="w_adv", help="adv 목표(얼굴용, 램프됨)")
+    ap.add_argument("--adv-ramp", type=int, default=3000, dest="adv_ramp", help="adv 0→목표 램프 스텝수")
+    ap.add_argument("--w-con", type=float, default=3.0, dest="w_con", help="구조 앵커(얼굴은 강하게)")
     ap.add_argument("--w-sty", type=float, default=3.0, dest="w_sty")
     ap.add_argument("--w-col", type=float, default=10.0, dest="w_col")
     ap.add_argument("--w-tv", type=float, default=1.0, dest="w_tv")
-    ap.add_argument("--id-loss", type=float, default=0.3, dest="id_loss", help="신원억제 가중(0=off)")
+    ap.add_argument("--id-loss", type=float, default=0.0, dest="id_loss", help="신원억제 가중(0=off)")
     ap.add_argument("--id-margin", type=float, default=0.3, dest="id_margin", help="이 코사인 이상만 벌점")
     ap.add_argument("--aug", action="store_true", help="입력 도메인 랜덤화 on")
-    ap.add_argument("--sample-every", type=int, default=1000, dest="sample_every")
+    ap.add_argument("--sample-every", type=int, default=500, dest="sample_every")
     ap.add_argument("--ckpt-every", type=int, default=5000, dest="ckpt_every")
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--smoke", action="store_true", help="랜덤텐서 1스텝 검증")
@@ -261,7 +267,7 @@ def main():
     optG = Adam(G.parameters(), args.lr_g, betas=(0.5, 0.999))
     optD = Adam(D.parameters(), args.lr_d, betas=(0.5, 0.999))
 
-    def g_losses(p, s):
+    def g_losses(p, s, w_adv_eff):
         fake = G(p)
         dfake = D(fake)
         adv = F.mse_loss(dfake, torch.ones_like(dfake))
@@ -270,7 +276,7 @@ def main():
         sty = F.l1_loss(gram(vgg(gray3(fake))), gs) / (gs.abs().mean() + 1e-8)  # 상대오차, O(1)
         col = color_loss(fake, p)
         tv = tv_loss(fake)
-        g = args.w_adv * adv + args.w_con * con + args.w_sty * sty + args.w_col * col + args.w_tv * tv
+        g = w_adv_eff * adv + args.w_con * con + args.w_sty * sty + args.w_col * col + args.w_tv * tv
         idl = torch.tensor(0.0, device=dev)
         if idm is not None:
             cos = (id_embed(idm, p) * id_embed(idm, fake)).sum(1)
@@ -295,7 +301,7 @@ def main():
         p = torch.rand(2, 3, args.size, args.size, device=dev) * 2 - 1
         s = torch.rand(2, 3, args.size, args.size, device=dev) * 2 - 1
         dl = d_loss(p, s); optD.zero_grad(); dl.backward(); optD.step()
-        fake, gl, parts = g_losses(p, s); optG.zero_grad(); gl.backward(); optG.step()
+        fake, gl, parts = g_losses(p, s, args.w_adv); optG.zero_grad(); gl.backward(); optG.step()
         print(f"[smoke] out={tuple(fake.shape)}  D_patch={tuple(D(p).shape)}")
         print(f"[smoke] d_loss={dl.item():.3f}  g_loss={gl.item():.3f}  {parts}")
         ng = sum(x.numel() for x in G.parameters())
@@ -304,11 +310,24 @@ def main():
 
     os.makedirs(args.out, exist_ok=True)
     os.makedirs(os.path.join(args.out, "samples"), exist_ok=True)
-    photo = cycle(DataLoader(Imgs(args.photo, args.size, args.aug), args.batch,
-                             shuffle=True, num_workers=args.workers, drop_last=True))
-    style = cycle(DataLoader(Imgs(args.style, args.size), args.batch,
-                             shuffle=True, num_workers=args.workers, drop_last=True))
-    print(f"[data] photo={len(Imgs(args.photo, args.size).paths)}  style={len(Imgs(args.style, args.size).paths)}")
+    photo_ds = Imgs(args.photo, args.size, args.aug)
+    style_ds = Imgs(args.style, args.size)
+    photo = cycle(DataLoader(photo_ds, args.batch, shuffle=True, num_workers=args.workers, drop_last=True))
+    style = cycle(DataLoader(style_ds, args.batch, shuffle=True, num_workers=args.workers, drop_last=True))
+    print(f"[data] photo={len(photo_ds.paths)}  style={len(style_ds.paths)}")
+
+    # 고정 평가셋 — 매번 같은 얼굴 4장으로 샘플(진행 추적용)
+    eval_ds = Imgs(args.photo, args.size)
+    n_eval = min(4, len(eval_ds))
+    eval_p = torch.stack([eval_ds[i] for i in range(n_eval)]).to(dev)
+
+    def save_eval(step):
+        G.eval()
+        with torch.no_grad():
+            fake = G(eval_p).clamp(-1, 1)
+        grid = torch.cat([eval_p, fake], 0) * 0.5 + 0.5
+        save_image(grid, os.path.join(args.out, "samples", f"s{step:06d}.png"), nrow=n_eval)
+        G.train()
 
     # 워밍업: content-only (G가 입력 구조를 재현하도록) — lr 높게(1e-4)
     for grp in optG.param_groups:
@@ -319,21 +338,23 @@ def main():
         optG.zero_grad(); (args.w_con * con).backward(); optG.step()
         if step % 200 == 0:
             print(f"[init {step}/{args.init_steps}] con={con.item():.3f}")
-    for grp in optG.param_groups:                # 본 학습 lr로 복귀(2e-5)
+    for grp in optG.param_groups:                # 본 학습 lr로 복귀
         grp["lr"] = args.lr_g
+    save_eval(0)                                  # 워밍업 끝 샘플(구조 재현 확인 = s000000.png)
+    print("[init] 워밍업 끝 → samples/s000000.png 로 구조 재현 확인 가능")
 
-    # 본 학습
+    # 본 학습 (adv 램프: 0 → w_adv 목표)
     for step in range(1, args.steps + 1):
+        w_adv_eff = args.w_adv * min(1.0, step / max(1, args.adv_ramp))
         p, s = next(photo).to(dev), next(style).to(dev)
         dl = d_loss(p, s); optD.zero_grad(); dl.backward(); optD.step()
-        fake, gl, parts = g_losses(p, s); optG.zero_grad(); gl.backward(); optG.step()
+        fake, gl, parts = g_losses(p, s, w_adv_eff); optG.zero_grad(); gl.backward(); optG.step()
         if step % 100 == 0:
-            print(f"[{step}/{args.steps}] D={dl.item():.3f} G={gl.item():.3f} "
+            print(f"[{step}/{args.steps}] wadv={w_adv_eff:.1f} D={dl.item():.3f} G={gl.item():.3f} "
                   f"adv={parts['adv']:.2f} con={parts['con']:.2f} sty={parts['sty']:.3f} "
                   f"col={parts['col']:.2f} id={parts['idl']:.3f}")
         if step % args.sample_every == 0:
-            grid = torch.cat([p[:4], fake[:4].clamp(-1, 1)], 0) * 0.5 + 0.5
-            save_image(grid, os.path.join(args.out, "samples", f"s{step:06d}.png"), nrow=4)
+            save_eval(step)
         if step % args.ckpt_every == 0:
             torch.save({"G": G.state_dict(), "step": step},
                        os.path.join(args.out, f"student_{step:06d}.pt"))
