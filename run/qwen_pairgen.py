@@ -18,10 +18,16 @@ import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import argparse, glob, json, torch
 from PIL import Image
-from diffusers import QwenImageEditPlusPipeline
+from diffusers import QwenImageEditPlusPipeline, GGUFQuantizationConfig
+try:
+    from diffusers import QwenImageTransformer2DModel
+except ImportError:
+    QwenImageTransformer2DModel = None
 
 MODEL = "Qwen/Qwen-Image-Edit-2509"
 LORA = "autoweeb/Qwen-Image-Edit-2509-Photo-to-Anime"
+# GGUF 양자화 transformer(~12GB) — VRAM 직접 로드(offload 불필요, RAM 스왑 없음).
+GGUF = "https://huggingface.co/QuantStack/Qwen-Image-Edit-2509-GGUF/blob/main/Qwen-Image-Edit-2509-Q4_K_M.gguf"
 PROMPT = ("transform this portrait into a 2D cartoon anime illustration, cel shaded, "
           "clean bold outlines, flat colors, keep the exact same face pose, gaze and expression, "
           "same framing and composition")
@@ -49,7 +55,8 @@ def main():
     ap.add_argument("--lora-weight", default=None, dest="lora_weight", help="LoRA safetensors 파일명(필요시)")
     ap.add_argument("--prompt", default=PROMPT)
     ap.add_argument("--neg", default=NEG)
-    ap.add_argument("--offload", action="store_true", help="CPU offload(46GB 빠듯하면 권장)")
+    ap.add_argument("--gguf", default=GGUF, help="GGUF 양자화 transformer URL(offload 없이 VRAM 직접). 빈문자열이면 bf16")
+    ap.add_argument("--offload", action="store_true", help="CPU offload(★비권장 — 32GB RAM이면 스왑 폭주로 먹통)")
     args = ap.parse_args()
 
     imgs = sorted(p for p in glob.glob(os.path.join(args.input, "*")) if p.lower().endswith(EXTS))
@@ -61,8 +68,17 @@ def main():
     din = os.path.join(args.out, "input"); dtg = os.path.join(args.out, "target")
     os.makedirs(din, exist_ok=True); os.makedirs(dtg, exist_ok=True)
 
-    print(f"[load] {MODEL} (bf16) — 첫 실행 시 ~40GB 다운로드")
-    pipe = QwenImageEditPlusPipeline.from_pretrained(MODEL, torch_dtype=torch.bfloat16)
+    if args.gguf:
+        if QwenImageTransformer2DModel is None:
+            raise SystemExit("QwenImageTransformer2DModel 없음 → diffusers 업글 필요: pip install -U diffusers")
+        print(f"[load] GGUF transformer: {args.gguf}")
+        t = QwenImageTransformer2DModel.from_single_file(
+            args.gguf, quantization_config=GGUFQuantizationConfig(compute_dtype=torch.bfloat16),
+            torch_dtype=torch.bfloat16)
+        pipe = QwenImageEditPlusPipeline.from_pretrained(MODEL, transformer=t, torch_dtype=torch.bfloat16)
+    else:
+        print(f"[load] {MODEL} (bf16)")
+        pipe = QwenImageEditPlusPipeline.from_pretrained(MODEL, torch_dtype=torch.bfloat16)
     try:
         if args.lora_weight:
             pipe.load_lora_weights(args.lora, weight_name=args.lora_weight)
@@ -72,10 +88,9 @@ def main():
     except Exception as e:
         print(f"[경고] LoRA 로드 실패({e}) → 베이스만으로 진행(프롬프트로 카툰 유도)")
     if args.offload:
-        pipe.enable_model_cpu_offload()
-        print("[mem] CPU offload 활성")
+        pipe.enable_model_cpu_offload(); print("[mem] CPU offload 활성(비권장)")
     else:
-        pipe.to("cuda")
+        pipe.to("cuda"); print("[mem] GPU 직접(offload 없음)")
     try:
         pipe.vae.enable_tiling()
     except Exception:
