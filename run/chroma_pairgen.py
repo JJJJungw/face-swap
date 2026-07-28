@@ -18,13 +18,11 @@ MODEL = "lodestones/Chroma1-HD"
 GGUF = "https://huggingface.co/silveroxides/Chroma1-HD-GGUF/blob/main/Chroma1-HD-Q6_K.gguf"
 HID = 3072   # Chroma hidden dim (qkv lora_B=9216=3*3072 로 확인)
 
-PROMPT = ("s2anime, flat 2D anime screenshot, cel shaded anime portrait, single person close-up face, "
-          "clean bold outlines, flat solid colors, minimal gradient, "
-          "keep the same pose and facial expression, plain simple background")
-NEG = ("oil painting, painterly, soft gradient shading, realistic shading, semi-realistic, "
-       "3D render, Pixar style, Disney style, photorealistic, real photo, detailed skin texture, chibi, "
+PROMPT = ("s2anime, semi-realistic 2.5D anime portrait, single person close-up face, "
+          "soft painterly anime shading, keep the same pose and facial expression, plain simple background")
+NEG = ("3D render, Pixar style, Disney style, photorealistic, real photo, flat 2D, chibi, "
        "multiple people, two people, extra person, full body, duplicate face, merged faces, "
-       "deformed, disfigured, melted, smeared, blurry, low quality, watermark, text")
+       "deformed, disfigured, melted, smeared, extra fingers, bad hands, blurry, low quality, watermark, text")
 EXTS = (".png", ".jpg", ".jpeg", ".webp")
 
 
@@ -100,6 +98,8 @@ def main():
     ap.add_argument("--size", type=int, default=512)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--gguf", default=GGUF)
+    ap.add_argument("--prompt", default=PROMPT, help="화풍 프롬프트(카툰 테스트용 오버라이드)")
+    ap.add_argument("--neg", default=NEG, help="네거티브 프롬프트 오버라이드")
     args = ap.parse_args()
 
     imgs = sorted(p for p in glob.glob(os.path.join(args.input, "*")) if p.lower().endswith(EXTS))
@@ -114,7 +114,7 @@ def main():
     for i, p in enumerate(imgs):
         init = prep(Image.open(p), args.size)
         gen = torch.Generator("cpu").manual_seed(args.seed + i)
-        out = pipe(prompt=PROMPT, negative_prompt=NEG, image=init, strength=args.strength,
+        out = pipe(prompt=args.prompt, negative_prompt=args.neg, image=init, strength=args.strength,
                    guidance_scale=args.guidance, num_inference_steps=args.steps, generator=gen).images[0]
         name = f"pair_{i:05d}.png"
         init.save(os.path.join(din, name)); out.save(os.path.join(dtg, name))
