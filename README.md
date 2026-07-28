@@ -144,6 +144,27 @@ python run/chroma_text2img_gen.py --n 10 --out out/style_25d    # 2.5D 애니 �
 
 ---
 
+## ⚠️ 현재 벽 (미해결) — 원하는 화풍(큰 눈 애니)의 근본 한계
+
+> 2026-07-28. 학생 학습을 여러 접근으로 시도했으나 **목표 화풍(painterly 2.5D 애니 + 큰 눈)에 도달하지 못함.** 원인이 파라미터가 아니라 **구조적 제약**임을 확인. 상세: [docs/student-distillation-log.md](docs/student-distillation-log.md)
+
+**시도 요약**
+- **unpaired AnimeGAN(v5~v9):** under-fit → 유화(painterly)에서 멈춤
+- **paired 지도학습:** 512·다층 perceptual·GAN 강화(adv 4)·라벨스무딩까지 → 여전히 유화
+- **White-box 방식(surface/structure/texture 평면화 손실 자체 재구현):** painterly 뱅크가 평면화와 충돌 + CPU superpixel 느림 → 중단
+
+**근본 원인 3겹**
+1. **학생이 geometry-preserving** — 입력 픽셀 위치를 유지하며 색·질감만 바꿈. 그래서 **큰 눈·비율 변형(카툰 기하)을 원리적으로 못 함.** 이 성질은 영상 표정·포즈 보존을 위해 일부러 고른 것 → **표정 보존 ↔ 큰 눈 애니가 상충.** 큰 눈이 빠지면 painterly 질감만 남아 유화로 읽힘.
+2. **큰 눈 가능한 빠른 모델 = 전부 StyleGAN2(NVIDIA 비상업)** — Toonify·VToonify·DualStyleGAN·BlazeStyleGAN(MediaPipe)·DCT-Net(학습 파이프라인)까지. **라이선스 벽**으로 상용 불가. (딥리서치 확인: 2026년 현재 큰 눈 + 클린 + 실시간 + 표정보존 동시 만족 모델 없음)
+3. **타깃 뱅크가 painterly** — 경량 학생이 이걸 증류하면 자연히 유화로 수렴. flat 카툰을 원하면 뱅크도 flat이어야 함.
+
+**선택지 (미결정)**
+- **(A) 큰 눈 포기, flat 셀셰이딩 카툰으로** — 뱅크를 flat 카툰으로 재생성 + White-box 평면화 손실. realistic 비율이지만 유화 탈출·카툰/웹툰으로 읽힘. 비식별에도 유리. **[유력]**
+- **(B) 큰 눈 고수** — 실시간 또는 라이선스 중 하나 포기 필요(StyleGAN 툰화를 오프라인 선생님으로만, 또는 상업성 재검토). 큰 공사·리스크.
+
+**결론:** 방법(증류)이 틀린 게 아니라, **제약(클린+실시간+표정보존) 안에서 큰 눈 애니는 불가능.** 다음은 (A) flat 방향 확정 또는 (B) 재검토.
+
+---
 ## 문서 (`docs/`)
 
 | 문서 | 내용 |
