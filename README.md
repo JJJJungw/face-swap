@@ -89,6 +89,23 @@
 - 카툰 필터(색양자화+엣지) → 일관되나 **"포스터 사진필터"** 수준(그림 아님).
 - **채택: Qwen-Image-Edit-2509 + photo-to-anime LoRA (베이스 Apache 2.0 + LoRA MIT).** photo→anime 전용이라 **균일한 진짜 카툰** 생성 → 페어 코퍼스 재생성 → 학생(AnimeGANv2, paired L1+perceptual+adv) 재학습.
 
+### 시행착오 타임라인 (2.5D → flat 카툰)
+
+1. **초기 — painterly 반실사 2.5D (Chroma teacher).** (실사→2.5D) 페어 생성. 타겟 자체는 양호.
+2. **학생 학습 시행착오(unpaired AnimeGAN):** color 가중 과대 → 사진같음 · adv 과강 → GAN 붕괴/뭉갬 · gram 스타일손실 정규화 버그로 신호 죽음(수정) · **진짜 뿌리 = 워밍업이 VGG-only라 평균색으로 붕괴** → 픽셀 L1 워밍업으로 수정(핵심). 결과: 카툰화는 되나 **유화(painterly)**.
+3. **paired(pix2pix) 전환** — L1+perceptual로 target 직접 재현 → 더 깔끔하나 **여전히 소프트/유화** (L1 blur + 256 해상도).
+4. **진단 — 알고리즘이 아니라 용량+해상도.** 새 gen(U-Net skip + PixelShuffle) @512 → 개선되나 클로즈업선 여전히 소프트.
+5. **화풍 재정의("유화 말고 카툰"):** flat 애니(Chroma) → **왕눈이·기하변형**(표정 깨짐) · 카툰 프롬프트(lora↓) → **제각각+환각** · 카툰 필터 → **포스터 사진필터**(그림 아님) · 매끈 2.5D 렌더 레퍼 → **실시간 2M 학생 재현 불가 확정**.
+6. **결론(불가피) — flat 카툰.** 실시간 학생이 크리스프하게 뽑는 유일한 화풍 + 비식별 강. teacher = Qwen photo-to-anime(클린).
+
+### 왜 불가피했나 (한 줄)
+실시간(≤2×)이 학생을 ~2M로 묶고 → 2M CNN은 diffusion급 매끈·디테일을 재현 못 함(**용량의 벽**) → 고주파 적은 **flat 카툰**만이 크리스프+실시간을 동시 만족. **화풍 취향이 아니라 물리적 귀결.**
+
+### 라이선스 리서치 — semi-realistic teacher (2026-07)
+- 전용 semi-realistic/2.5D 초상 파인튠은 대부분 **Flux.1-dev(비상업)** 또는 **SDXL/Illustrious(Fair AI/OpenRAIL)** 기반 → **탈락.** (예: `glif/semi-realistic-anime-portrait` = LoRA는 CC0지만 베이스 Flux-dev 비상업.)
+- **클린한 semi-realistic teacher = Apache 베이스뿐:** Chroma1-HD, Qwen-Image-Edit-2509, FLUX.1-schnell.
+- **단, 라이선스가 뚫려도 실시간 학생 용량의 벽은 그대로** → semi-realistic 자체가 실시간 목표와 상충. flat 카툰 결론 유지.
+
 ---
 
 ## 아키텍처
