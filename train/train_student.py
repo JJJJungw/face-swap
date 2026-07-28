@@ -65,26 +65,48 @@ class InvertedResidual(nn.Module):
         return y + x if self.res else y
 
 
-class Generator(nn.Module):
-    def __init__(self):
+class UpPixelShuffle(nn.Module):
+    """2x 업샘플: conv → PixelShuffle (bilinear보다 선명, 학습형 업샘플 → 유화 원인 제거)."""
+    def __init__(self, i, o):
         super().__init__()
-        self.a = nn.Sequential(ConvNormLReLU(3, 32, k=7, p=3), ConvNormLReLU(32, 64, s=2), ConvNormLReLU(64, 64))
-        self.b = nn.Sequential(ConvNormLReLU(64, 128, s=2), ConvNormLReLU(128, 128))
-        self.c = nn.Sequential(ConvNormLReLU(128, 128), InvertedResidual(128, 256),
-                               InvertedResidual(256, 256), InvertedResidual(256, 256),
-                               InvertedResidual(256, 256), ConvNormLReLU(256, 128))
-        self.d = nn.Sequential(ConvNormLReLU(128, 128), ConvNormLReLU(128, 128))
-        self.e = nn.Sequential(ConvNormLReLU(128, 64), ConvNormLReLU(64, 64), ConvNormLReLU(64, 32, k=7, p=3))
-        self.out = nn.Sequential(nn.Conv2d(32, 3, 1, 1, 0, bias=False), nn.Tanh())
+        self.conv = nn.Conv2d(i, o * 4, 3, 1, 1, bias=False)
+        self.ps = nn.PixelShuffle(2)
+        self.norm = nn.GroupNorm(1, o, affine=True)
+        self.act = nn.LeakyReLU(0.2, inplace=True)
 
     def forward(self, x):
-        h = self.a(x); s1 = h.shape[-2:]
-        h = self.b(h)
-        h = self.c(h)
-        h = F.interpolate(h, s1, mode="bilinear", align_corners=False)
-        h = self.d(h)
-        h = F.interpolate(h, x.shape[-2:], mode="bilinear", align_corners=False)
-        h = self.e(h)
+        return self.act(self.norm(self.ps(self.conv(x))))
+
+
+class Generator(nn.Module):
+    """animegan2 인코더-디코더 + U-Net skip + PixelShuffle 업샘플.
+    skip이 인코더의 고해상도 선/경계를 디코더로 넘겨 '부드럽지만 깔끔한' 2.5D 유지(유화 방지).
+    입력 크기는 4의 배수(256/512 OK). ONNX/런타임 슬롯 시그니처(x[-1,1]→y[-1,1]) 동일."""
+    def __init__(self, ch=32):
+        super().__init__()
+        c1, c2, c3 = ch, ch * 2, ch * 4                     # 32,64,128
+        self.in_conv = ConvNormLReLU(3, c1, k=7, p=3)       # /1, c1   → skip1
+        self.down1 = nn.Sequential(ConvNormLReLU(c1, c2, s=2), ConvNormLReLU(c2, c2))   # /2, c2 → skip2
+        self.down2 = nn.Sequential(ConvNormLReLU(c2, c3, s=2), ConvNormLReLU(c3, c3))   # /4, c3
+        self.mid = nn.Sequential(ConvNormLReLU(c3, c3),
+                                 InvertedResidual(c3, c3), InvertedResidual(c3, c3),
+                                 InvertedResidual(c3, c3), InvertedResidual(c3, c3),
+                                 ConvNormLReLU(c3, c3))      # /4, c3 (병목)
+        self.up1 = UpPixelShuffle(c3, c2)                   # /4→/2, c2
+        self.dec1 = nn.Sequential(ConvNormLReLU(c2 * 2, c2), ConvNormLReLU(c2, c2))     # +skip2
+        self.up2 = UpPixelShuffle(c2, c1)                   # /2→/1, c1
+        self.dec2 = nn.Sequential(ConvNormLReLU(c1 * 2, c1), ConvNormLReLU(c1, c1))     # +skip1
+        self.out = nn.Sequential(nn.Conv2d(c1, 3, 1, 1, 0, bias=False), nn.Tanh())
+
+    def forward(self, x):
+        s1 = self.in_conv(x)                                # /1
+        s2 = self.down1(s1)                                 # /2
+        h = self.down2(s2)                                  # /4
+        h = self.mid(h)
+        h = self.up1(h)                                     # /2
+        h = self.dec1(torch.cat([h, s2], 1))               # skip2
+        h = self.up2(h)                                     # /1
+        h = self.dec2(torch.cat([h, s1], 1))               # skip1
         return self.out(h)
 
 
@@ -205,6 +227,7 @@ def main():
     ap.add_argument("--w-tv", type=float, default=0.0, dest="w_tv")
     ap.add_argument("--id-loss", type=float, default=0.0, dest="id_loss", help="신원억제(0=off). input 신원에서 멀어지게")
     ap.add_argument("--id-margin", type=float, default=0.3, dest="id_margin")
+    ap.add_argument("--gen-ch", type=int, default=32, dest="gen_ch", help="제너레이터 기본채널(용량↑=32→48→64, 속도↓)")
     ap.add_argument("--d-ch", type=int, default=48, dest="d_ch")
     ap.add_argument("--d-n", type=int, default=3, dest="d_n")
     ap.add_argument("--aug", action="store_true", help="input 광학 aug(도메인 랜덤화)")
@@ -215,7 +238,7 @@ def main():
     args = ap.parse_args()
 
     dev = "cuda" if torch.cuda.is_available() else "cpu"
-    G = Generator().to(dev)
+    G = Generator(args.gen_ch).to(dev)
     D = Discriminator(args.d_ch, args.d_n).to(dev)
     vgg = VGGPerceptual().to(dev)
     idm = load_id(dev) if args.id_loss > 0 else None
