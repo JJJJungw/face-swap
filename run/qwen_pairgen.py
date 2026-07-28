@@ -73,7 +73,8 @@ def main():
             raise SystemExit("QwenImageTransformer2DModel 없음 → diffusers 업글 필요: pip install -U diffusers")
         print(f"[load] GGUF transformer: {args.gguf}")
         t = QwenImageTransformer2DModel.from_single_file(
-            args.gguf, quantization_config=GGUFQuantizationConfig(compute_dtype=torch.bfloat16),
+            args.gguf, config=MODEL, subfolder="transformer",   # GGUF엔 config 없음 → 원본 Qwen transformer config 지정
+            quantization_config=GGUFQuantizationConfig(compute_dtype=torch.bfloat16),
             torch_dtype=torch.bfloat16)
         pipe = QwenImageEditPlusPipeline.from_pretrained(MODEL, transformer=t, torch_dtype=torch.bfloat16)
     else:
