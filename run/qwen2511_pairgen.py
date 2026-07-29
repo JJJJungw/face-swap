@@ -136,6 +136,10 @@ def main():
     ap.add_argument("--input", required=True)
     ap.add_argument("--out", default="out/pairs_2511")
     ap.add_argument("--n", type=int, default=0, help="처리 장수(0=전부)")
+    ap.add_argument("--every", type=int, default=1, metavar="K",
+                    help="입력 목록에서 K장마다 1장만 사용(--n 적용 전). 12만 장 데이터셋에서 "
+                         "앞부분 N장만 쓰면 생성 순서(프롬프트 배치 등)에 편향될 수 있으므로 "
+                         "전체에 걸쳐 균등 표본을 뽑는다. 예: 122726장에서 10000장 → --every 12")
     ap.add_argument("--size", type=int, default=768)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--prompt", default=PROMPT)
@@ -167,11 +171,13 @@ def main():
                          "빈 문자열이면 bf16 풀 로드(VRAM 초과 주의)")
     args = ap.parse_args()
 
-    imgs = sorted(p for p in glob.glob(os.path.join(args.input, "*")) if p.lower().endswith(EXTS))
+    allimgs = sorted(p for p in glob.glob(os.path.join(args.input, "*")) if p.lower().endswith(EXTS))
+    imgs = allimgs[::args.every] if args.every > 1 else allimgs
     if args.n > 0:
         imgs = imgs[:args.n]
     if not imgs:
         raise SystemExit(f"입력 없음: {args.input}")
+    print(f"[data] 전체 {len(allimgs)}장 → every={args.every} → 대상 {len(imgs)}장")
 
     # 프롬프트 변형 목록 → [(태그, 프롬프트, 출력디렉터리)]
     if args.variant:
