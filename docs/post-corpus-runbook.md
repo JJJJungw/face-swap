@@ -52,7 +52,11 @@ python3 run/pair_curate.py --dir out/pairs_2511 --reject <출력된문자열> --
 target의 값에서 출발한다. 즉 여기서 나온 값이 **id-loss가 해야 할 일의 양**이다.
 
 ```bash
-pip install facenet-pytorch          # 없으면
+# ★ 반드시 --no-deps. 그냥 설치하면 torch 를 2.2.2+cu121 로 끌어내려
+#   onnxruntime(CUDA13 빌드)이 libcudart.so.13 를 못 찾아 죽는다. (2026-07-29 실제 발생)
+pip install --no-deps facenet-pytorch && pip install requests tqdm
+python3 -c "import torch; print(torch.__version__)"   # 2.13.0+cu130 유지 확인
+
 python3 run/measure_id.py --dir out/pairs_2511 --dir out/pairs_fp3 --n 100
 ```
 

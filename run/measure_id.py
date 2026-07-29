@@ -21,6 +21,17 @@
   따라서 이 수치는 teacher 탈락 기준이 아니라 **id-loss를 얼마나 세게 걸어야 하는지**의 지표다.
   단, id-loss는 content-loss와 싸우므로 시작점이 높을수록 표정·구조가 깨질 위험이 커진다.
 
+설치 (★ 반드시 --no-deps):
+  pip install --no-deps facenet-pytorch
+  pip install requests tqdm            # --no-deps 로 빠지는 것만 수동 보충
+
+  ⚠️ `pip install facenet-pytorch` (--no-deps 없이) 는 런타임을 파괴한다.
+     선언 핀이 torch<2.3.0 / numpy<2.0.0 / Pillow<10.3.0 이라, pip 이 이를 지키려고
+     torch 2.13.0+cu130 → 2.2.2+cu121 로 끌어내린다. 그러면 onnxruntime(CUDA13 빌드)이
+     `ImportError: libcudart.so.13` 로 import 조차 안 된다. (2026-07-29 실제 발생)
+     선언 핀은 낡은 상한일 뿐이고 최신 torch/numpy 에서 정상 동작한다.
+     자세한 내용: run/requirements-train.txt
+
 사용:
   python3 run/measure_id.py --dir out/pairs_2511
   # 여러 코퍼스 비교
