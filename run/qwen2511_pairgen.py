@@ -145,6 +145,10 @@ def main():
     ap.add_argument("--prompt", default=PROMPT)
     ap.add_argument("--neg", default=NEG)
     ap.add_argument("--resume", action="store_true", help="target/에 이미 있는 페어는 건너뜀")
+    ap.add_argument("--exclude", action="append", default=None, metavar="MANIFEST",
+                    help="다른 코퍼스의 manifest.jsonl 경로. 거기 쓰인 원본은 제외한다(반복 지정 가능). "
+                         "출력 폴더 자신의 manifest는 항상 자동 제외되므로, 같은 --out 에 이어서 "
+                         "뽑으면 중복 없이 누적된다.")
     ap.add_argument("--variant", action="append", default=None, metavar="TAG::PROMPT",
                     help="여러 프롬프트를 '모델 1회 로드'로 처리. 출력은 <out>_<TAG>/ 로 분리. "
                          "반복 지정 가능. 예: --variant flat::'Transform into anime. Flat...' "
@@ -171,14 +175,6 @@ def main():
                          "빈 문자열이면 bf16 풀 로드(VRAM 초과 주의)")
     args = ap.parse_args()
 
-    allimgs = sorted(p for p in glob.glob(os.path.join(args.input, "*")) if p.lower().endswith(EXTS))
-    imgs = allimgs[::args.every] if args.every > 1 else allimgs
-    if args.n > 0:
-        imgs = imgs[:args.n]
-    if not imgs:
-        raise SystemExit(f"입력 없음: {args.input}")
-    print(f"[data] 전체 {len(allimgs)}장 → every={args.every} → 대상 {len(imgs)}장")
-
     # 프롬프트 변형 목록 → [(태그, 프롬프트, 출력디렉터리)]
     if args.variant:
         jobs = []
@@ -193,6 +189,45 @@ def main():
     for _, _, d in jobs:
         os.makedirs(os.path.join(d, "input"), exist_ok=True)
         os.makedirs(os.path.join(d, "target"), exist_ok=True)
+
+    # ── 중복 방지 ────────────────────────────────────────────────────────────
+    # 출력이 pair_00000.png 같은 '순번'이라 그냥 이어 뽑으면 2차 생성의 pair_00000 이
+    # 1차와 다른 원본인데 같은 이름이 된다 → --resume 이 파일명만 보고 조용히 건너뛴다.
+    # 그래서 manifest 의 src(원본 파일명)를 진짜 키로 쓴다:
+    #   ① 이미 쓴 원본은 후보에서 제외  ② 새 페어의 번호는 기존 최대 번호 다음부터
+    # 결과적으로 같은 --out 에 --every 를 바꿔가며 몇 번이든 이어 뽑아도 중복이 없다.
+    own_manifest = os.path.join(jobs[0][2], "manifest.jsonl")
+    used, next_idx = set(), 0
+    for mp in (args.exclude or []) + [own_manifest]:
+        if not os.path.exists(mp):
+            continue
+        n_read = 0
+        for line in open(mp):
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            if d.get("src"):
+                used.add(d["src"]); n_read += 1
+            if mp == own_manifest and d.get("name"):     # 번호는 자기 폴더 것만 이어받음
+                try:
+                    next_idx = max(next_idx, int(os.path.splitext(d["name"])[0].split("_")[-1]) + 1)
+                except ValueError:
+                    pass
+        print(f"[dedup] {mp}: 원본 {n_read}개 제외 목록에 추가")
+
+    allimgs = sorted(p for p in glob.glob(os.path.join(args.input, "*")) if p.lower().endswith(EXTS))
+    cand = allimgs[::args.every] if args.every > 1 else allimgs
+    imgs = [p for p in cand if os.path.basename(p) not in used] if used else cand
+    n_skip = len(cand) - len(imgs)
+    if args.n > 0:
+        imgs = imgs[:args.n]
+    if not imgs:
+        raise SystemExit(f"새로 뽑을 원본 없음 (전체 {len(allimgs)} / every 후 {len(cand)} / "
+                         f"이미 사용 {n_skip}). --every 를 줄이거나 --input 을 바꿀 것.")
+    print(f"[data] 전체 {len(allimgs)}장 → every={args.every} → 후보 {len(cand)}장 "
+          f"→ 중복 제외 {n_skip}장 → 대상 {len(imgs)}장")
+    print(f"[data] 새 페어 번호는 pair_{next_idx:05d} 부터 시작")
 
     pipe = build_pipe(args)
     fast = load_loras(pipe, args)
@@ -224,7 +259,7 @@ def main():
             print(f"\n─── [{tag}] {outdir}\n    \"{prompt}\"")
 
         for i, p in enumerate(imgs):
-            name = f"pair_{i:05d}.png"
+            name = f"pair_{next_idx + i:05d}.png"     # 기존 코퍼스 번호 뒤에 이어붙임
             k += 1
             if args.resume and os.path.exists(os.path.join(dtg, name)) \
                            and os.path.exists(os.path.join(din, name)):
@@ -235,7 +270,7 @@ def main():
             init = prep(Image.open(p), args.size)
             # 시드는 (조건, 이미지)가 아니라 이미지에만 의존시킨다 →
             # 조건 간 차이가 '프롬프트 때문'인지 '시드 운' 때문인지 섞이지 않는다.
-            gen = torch.Generator("cpu").manual_seed(args.seed + i)
+            gen = torch.Generator("cpu").manual_seed(args.seed + next_idx + i)
             out = pipe(image=[init], prompt=prompt, negative_prompt=args.neg,
                        true_cfg_scale=cfg, num_inference_steps=steps, generator=gen).images[0]
 
