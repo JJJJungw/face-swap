@@ -141,6 +141,10 @@ def main():
     ap.add_argument("--prompt", default=PROMPT)
     ap.add_argument("--neg", default=NEG)
     ap.add_argument("--resume", action="store_true", help="target/에 이미 있는 페어는 건너뜀")
+    ap.add_argument("--variant", action="append", default=None, metavar="TAG::PROMPT",
+                    help="여러 프롬프트를 '모델 1회 로드'로 처리. 출력은 <out>_<TAG>/ 로 분리. "
+                         "반복 지정 가능. 예: --variant flat::'Transform into anime. Flat...' "
+                         "(GGUF 21.8GB 재로딩을 조건 수만큼 피할 수 있음)")
 
     ap.add_argument("--steps", type=int, default=None, help="미지정 시 fast=4 / non-fast=28")
     ap.add_argument("--cfg", type=float, default=None, help="true_cfg_scale. 미지정 시 fast=1.0 / non-fast=4.0")
@@ -169,10 +173,20 @@ def main():
     if not imgs:
         raise SystemExit(f"입력 없음: {args.input}")
 
-    din = os.path.join(args.out, "input")
-    dtg = os.path.join(args.out, "target")
-    os.makedirs(din, exist_ok=True)
-    os.makedirs(dtg, exist_ok=True)
+    # 프롬프트 변형 목록 → [(태그, 프롬프트, 출력디렉터리)]
+    if args.variant:
+        jobs = []
+        for v in args.variant:
+            if "::" not in v:
+                raise SystemExit(f"--variant 형식 오류(TAG::PROMPT 이어야 함): {v}")
+            tag, prm = v.split("::", 1)
+            jobs.append((tag, prm, f"{args.out.rstrip('/')}_{tag}"))
+    else:
+        jobs = [("", args.prompt, args.out)]
+
+    for _, _, d in jobs:
+        os.makedirs(os.path.join(d, "input"), exist_ok=True)
+        os.makedirs(os.path.join(d, "target"), exist_ok=True)
 
     pipe = build_pipe(args)
     fast = load_loras(pipe, args)
@@ -188,38 +202,52 @@ def main():
     except Exception:
         pass
 
-    # 2509 스크립트의 버그 수정: "w"(버퍼링) → "a"+flush. 중단해도 manifest 꼬리가 안 잘림.
-    man = open(os.path.join(args.out, "manifest.jsonl"), "a", buffering=1)
-    print(f"\n[run] steps={steps} cfg={cfg} size={args.size} fast={fast} n={len(imgs)}\n")
+    print(f"\n[run] steps={steps} cfg={cfg} size={args.size} fast={fast} "
+          f"n={len(imgs)} 조건={len(jobs)}개  (모델은 1회만 로드됨)\n")
 
-    done = skipped = 0
     t_all = time.time()
-    for i, p in enumerate(imgs):
-        name = f"pair_{i:05d}.png"
-        if args.resume and os.path.exists(os.path.join(dtg, name)) \
-                       and os.path.exists(os.path.join(din, name)):
-            skipped += 1
-            continue
+    total = len(imgs) * len(jobs)
+    k = 0
+    for tag, prompt, outdir in jobs:
+        din = os.path.join(outdir, "input")
+        dtg = os.path.join(outdir, "target")
+        # 2509 스크립트의 버그 수정: "w"(버퍼링) → "a"+flush. 중단해도 manifest 꼬리가 안 잘림.
+        man = open(os.path.join(outdir, "manifest.jsonl"), "a", buffering=1)
+        done = skipped = 0
+        if tag:
+            print(f"\n─── [{tag}] {outdir}\n    \"{prompt}\"")
 
-        t0 = time.time()
-        init = prep(Image.open(p), args.size)
-        gen = torch.Generator("cpu").manual_seed(args.seed + i)
-        out = pipe(image=[init], prompt=args.prompt, negative_prompt=args.neg,
-                   true_cfg_scale=cfg, num_inference_steps=steps, generator=gen).images[0]
+        for i, p in enumerate(imgs):
+            name = f"pair_{i:05d}.png"
+            k += 1
+            if args.resume and os.path.exists(os.path.join(dtg, name)) \
+                           and os.path.exists(os.path.join(din, name)):
+                skipped += 1
+                continue
 
-        # target 먼저 쓰면 중단 시 input 없는 고아가 생김 → input 먼저, target 나중.
-        init.save(os.path.join(din, name))
-        out.save(os.path.join(dtg, name))
-        man.write(json.dumps({"name": name, "src": os.path.basename(p),
-                              "steps": steps, "cfg": cfg}) + "\n")
-        done += 1
-        dt = time.time() - t0
-        eta = (len(imgs) - i - 1) * dt / 60
-        print(f"[{i+1}/{len(imgs)}] {name}  {dt:.1f}s  (ETA {eta:.0f}분)")
+            t0 = time.time()
+            init = prep(Image.open(p), args.size)
+            # 시드는 (조건, 이미지)가 아니라 이미지에만 의존시킨다 →
+            # 조건 간 차이가 '프롬프트 때문'인지 '시드 운' 때문인지 섞이지 않는다.
+            gen = torch.Generator("cpu").manual_seed(args.seed + i)
+            out = pipe(image=[init], prompt=prompt, negative_prompt=args.neg,
+                       true_cfg_scale=cfg, num_inference_steps=steps, generator=gen).images[0]
 
-    man.close()
-    print(f"\n완료 → {args.out}   생성 {done}장 / 건너뜀 {skipped}장 / "
-          f"총 {(time.time()-t_all)/60:.1f}분")
+            # target 먼저 쓰면 중단 시 input 없는 고아가 생김 → input 먼저, target 나중.
+            init.save(os.path.join(din, name))
+            out.save(os.path.join(dtg, name))
+            man.write(json.dumps({"name": name, "src": os.path.basename(p),
+                                  "tag": tag, "prompt": prompt,
+                                  "steps": steps, "cfg": cfg}) + "\n")
+            done += 1
+            dt = time.time() - t0
+            eta = (total - k) * dt / 60
+            print(f"[{tag or 'run'} {i+1}/{len(imgs)}] {name}  {dt:.1f}s  (전체 ETA {eta:.0f}분)")
+
+        man.close()
+        print(f"  → {outdir}  생성 {done} / 건너뜀 {skipped}")
+
+    print(f"\n완료. 총 {(time.time()-t_all)/60:.1f}분 / {len(jobs)}개 조건 × {len(imgs)}장")
     print("  input/=실사, target/=카툰  →  다음: run/compare_grid.py 로 육안 확인")
 
 
