@@ -21,6 +21,8 @@
     --size 256 --batch 8 --init-steps 1500 --steps 40000 --id-loss 0
 """
 import os, argparse, glob
+import cv2
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -178,29 +180,128 @@ def id_embed(m, x):
     return F.normalize(m(x), dim=1)
 
 
+# ============ 도메인 갭 증강 (인공 열화) ============
+# 학습 코퍼스(SFHQ-T2I)는 Flux 생성 인물 = 깨끗하고 크고 대체로 정면.
+# 런타임 입력은 deid_cartoon.py 가 영상에서 잘라낸 얼굴이다:
+#   YOLOX 박스 → expand 0.15 크롭 → 종횡비 무시하고 (512,512) INTER_AREA → GAN
+# 즉 작은 얼굴일수록 크게 확대돼 들어온다.
+#
+# ★ 설계 의도 (2026-07-29 변경)
+#   기존 cartoon_min=150 은 사전학습 face_paint_512_v2 가 작은 얼굴에서 무너져서
+#   막아둔 **우회책**이었다. 자체 학생을 학습하는 지금은 목표가 다르다 —
+#   **작은 얼굴도 잘 카툰화하도록 명시적으로 가르친다.**
+#   따라서 저해상도를 "가끔 주는 노이즈"가 아니라 **주력 학습 케이스**로 넣는다.
+#   (log-uniform 샘플링으로 작은 쪽에 표본을 몰아준다)
+#   성공하면 cartoon_min 을 크게 낮출 수 있고, 블러↔카툰 경계 튐 문제도 함께 줄어든다.
+#
+# 저작권상 실제 영상 크롭을 코퍼스에 섞을 수 없으므로 Real-ESRGAN/BSRGAN 계열의
+# 인공 열화로 대체한다. 원칙:
+#   - 기하 변환(반전/크롭/종횡비)은 input·target **양쪽에** → 페어 정합 유지
+#   - 열화(블러·축소·노이즈·JPEG·색)는 **input에만** → target은 정답이라 깨끗해야 한다.
+#     그래야 "작고 더러운 사진 → 크고 깨끗한 카툰" 매핑을 배운다(복원+스타일화 동시).
+def _degrade(img, level, rng, size):
+    """input 전용 열화. 실제 촬영 체인 순서: 블러 → 축소 → 노이즈 → 압축 → 재확대."""
+    h, w = img.shape[:2]
+
+    # ① 블러 (초점/모션) — 광학 단계라 축소보다 먼저
+    if rng.random() < (0.35 if level < 3 else 0.5):
+        if level >= 3 and rng.random() < 0.4:                      # 모션 블러(방향성)
+            k = int(rng.integers(5, 16)) | 1
+            ker = np.zeros((k, k), np.float32)
+            ang, c = rng.uniform(0, np.pi), k // 2
+            for t in np.linspace(-c, c, k * 2):
+                x, y = int(round(c + t * np.cos(ang))), int(round(c + t * np.sin(ang)))
+                if 0 <= x < k and 0 <= y < k:
+                    ker[y, x] = 1
+            if ker.sum() > 0:
+                img = cv2.filter2D(img, -1, ker / ker.sum())
+        else:                                                       # 초점 흐림
+            img = cv2.GaussianBlur(img, (0, 0), rng.uniform(0.3, 1.5 if level < 3 else 2.5))
+
+    # ② 축소 → 재확대 ★ 핵심. 작은 얼굴을 주력으로 학습시킨다.
+    #    log-uniform 이라 작은 쪽에 표본이 몰린다(중앙값 ≈ sqrt(lo)).
+    #    level 2: 0.30~1.0 → 154~512px   (중앙값 ≈ 280px)
+    #    level 3: 0.12~1.0 → 61~512px    (중앙값 ≈ 177px, 절반이 그 아래)
+    lo = {1: 0.60, 2: 0.30}.get(level, 0.12)
+    if rng.random() < (0.5 if level == 1 else 0.9):
+        sc = float(np.exp(rng.uniform(np.log(lo), 0.0)))
+        sw, sh = max(12, int(w * sc)), max(12, int(h * sc))
+        img = cv2.resize(img, (sw, sh), interpolation=cv2.INTER_AREA)
+
+        # ③ 노이즈 — 저해상도 단계에서 얹어야 확대 시 실제처럼 번진다
+        if level >= 3 and rng.random() < 0.4:
+            img = np.clip(img.astype(np.float32)
+                          + rng.normal(0, rng.uniform(1, 8), img.shape), 0, 255).astype(np.uint8)
+
+        # ④ JPEG/H.264 압축 아티팩트 — 압축도 저해상도 단계
+        if rng.random() < 0.7:
+            q = int(rng.integers(30 if level >= 3 else 50, 92))
+            ok, enc = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), q])
+            if ok:
+                img = cv2.imdecode(enc, cv2.IMREAD_COLOR)
+
+        # ⑤ 런타임과 동일하게 되돌림 (deid_cartoon.py 는 INTER_AREA 사용)
+        img = cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA)
+
+    # ⑥ 노출·대비·감마·색온도 (역광, 실내조명, 화이트밸런스)
+    if rng.random() < 0.6:
+        f = img.astype(np.float32) / 255.
+        f = np.clip(f ** rng.uniform(0.7, 1.4), 0, 1)
+        f = np.clip((f - 0.5) * rng.uniform(0.8, 1.25) + 0.5 + rng.uniform(-0.08, 0.08), 0, 1)
+        if level >= 2:
+            f = np.clip(f * rng.uniform(0.9, 1.1, size=(1, 1, 3)), 0, 1)     # 채널별 = 색온도
+        img = (f * 255).astype(np.uint8)
+
+    return img
+
+
 # ============ 데이터 (PAIRED: input↔target 같은 파일명) ============
 class PairImgs(Dataset):
-    def __init__(self, root, size, aug=False):
+    def __init__(self, root, size, aug=False, aug_level=0):
         din, dtg = os.path.join(root, "input"), os.path.join(root, "target")
         namesin = {os.path.basename(p) for p in glob.glob(os.path.join(din, "*")) if p.lower().endswith(EXTS)}
         namestg = {os.path.basename(p) for p in glob.glob(os.path.join(dtg, "*")) if p.lower().endswith(EXTS)}
         self.names = sorted(namesin & namestg)          # 공통(정렬된) 페어만
         if not self.names:
             raise SystemExit(f"페어 없음: {din} ∩ {dtg}")
-        self.din, self.dtg, self.size, self.aug = din, dtg, size, aug
-        self.jit = transforms.ColorJitter(0.15, 0.15, 0.15, 0.02)
+        self.din, self.dtg, self.size = din, dtg, size
+        # 구 --aug 플래그 호환: 켜져 있고 --aug-level 미지정이면 1
+        self.level = aug_level if aug_level > 0 else (1 if aug else 0)
+        self.rng = np.random.default_rng()
 
     def __len__(self):
         return len(self.names)
 
     def __getitem__(self, i):
         n = self.names[i]
-        a = Image.open(os.path.join(self.din, n)).convert("RGB").resize((self.size, self.size), Image.LANCZOS)
-        b = Image.open(os.path.join(self.dtg, n)).convert("RGB").resize((self.size, self.size), Image.LANCZOS)
-        if self.aug:                                     # 광학적 aug은 input에만(정렬 유지)
-            a = self.jit(a)
-        ta = transforms.functional.to_tensor(a) * 2 - 1
-        tb = transforms.functional.to_tensor(b) * 2 - 1
+        a = cv2.cvtColor(np.array(Image.open(os.path.join(self.din, n)).convert("RGB")), cv2.COLOR_RGB2BGR)
+        b = cv2.cvtColor(np.array(Image.open(os.path.join(self.dtg, n)).convert("RGB")), cv2.COLOR_RGB2BGR)
+        if a.shape[:2] != b.shape[:2]:                   # teacher 출력이 더 큰 경우 정렬
+            b = cv2.resize(b, (a.shape[1], a.shape[0]), interpolation=cv2.INTER_AREA)
+
+        rng = self.rng
+        if self.level >= 1:
+            # ── 기하: input·target 동일 적용 (정합 유지) ────────────────
+            if rng.random() < 0.5:
+                a, b = a[:, ::-1], b[:, ::-1]
+            if self.level >= 2 and rng.random() < 0.7:
+                # 런타임은 expand 0.15 박스를 종횡비 무시하고 정사각으로 눌러 넣는다.
+                # → 타이트 크롭 + 종횡비 왜곡 재현. 반드시 양쪽에 같이.
+                H, W = a.shape[:2]
+                ch = rng.uniform(0.72, 1.0)
+                cw = min(ch * rng.uniform(0.85, 1.18), 1.0)
+                th, tw = int(H * ch), int(W * cw)
+                y0 = int(rng.integers(0, H - th + 1)); x0 = int(rng.integers(0, W - tw + 1))
+                a = a[y0:y0 + th, x0:x0 + tw]; b = b[y0:y0 + th, x0:x0 + tw]
+
+        a = cv2.resize(np.ascontiguousarray(a), (self.size, self.size), interpolation=cv2.INTER_AREA)
+        b = cv2.resize(np.ascontiguousarray(b), (self.size, self.size), interpolation=cv2.INTER_AREA)
+
+        if self.level >= 1:
+            a = _degrade(a, self.level, rng, self.size)             # ★ input에만
+
+        ta = torch.from_numpy(cv2.cvtColor(a, cv2.COLOR_BGR2RGB).copy()).permute(2, 0, 1).float() / 127.5 - 1
+        tb = torch.from_numpy(cv2.cvtColor(b, cv2.COLOR_BGR2RGB).copy()).permute(2, 0, 1).float() / 127.5 - 1
         return ta, tb
 
 
@@ -230,7 +331,12 @@ def main():
     ap.add_argument("--gen-ch", type=int, default=32, dest="gen_ch", help="제너레이터 기본채널(용량↑=32→48→64, 속도↓)")
     ap.add_argument("--d-ch", type=int, default=48, dest="d_ch")
     ap.add_argument("--d-n", type=int, default=3, dest="d_n")
-    ap.add_argument("--aug", action="store_true", help="input 광학 aug(도메인 랜덤화)")
+    ap.add_argument("--aug", action="store_true", help="(구) 약한 색 aug. --aug-level 1과 동등")
+    ap.add_argument("--aug-level", type=int, default=0, dest="aug_level", choices=[0, 1, 2, 3],
+                    help="도메인 갭 인공 열화 강도 (input에만 적용). "
+                         "0=없음 / 1=색·압축·약블러 / 2=+저해상도(154~512px)·타이트크롭 / "
+                         "3=+모션블러·노이즈·강한 저해상도(61~512px). "
+                         "★ 작은 얼굴까지 카툰화하려면 2 이상 권장")
     ap.add_argument("--sample-every", type=int, default=500, dest="sample_every")
     ap.add_argument("--ckpt-every", type=int, default=5000, dest="ckpt_every")
     ap.add_argument("--workers", type=int, default=4)
@@ -281,7 +387,7 @@ def main():
         return
 
     os.makedirs(os.path.join(args.out, "samples"), exist_ok=True)
-    ds = PairImgs(args.data, args.size, args.aug)
+    ds = PairImgs(args.data, args.size, args.aug, args.aug_level)
     loader = cycle(DataLoader(ds, args.batch, shuffle=True, num_workers=args.workers, drop_last=True))
     print(f"[data] 페어 {len(ds)}쌍  (input↔target 정렬)")
 
