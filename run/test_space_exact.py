@@ -10,6 +10,7 @@ from pathlib import Path
 import shutil
 import sys
 import time
+import re
 
 import torch
 from huggingface_hub import snapshot_download
@@ -70,6 +71,20 @@ def main():
     parser.add_argument("--input", default="official_sample.jpeg")
     parser.add_argument("--out", default="out/space_exact/official_sample_anime_v2.png")
     parser.add_argument("--prompt", default="Transform into anime.")
+    parser.add_argument(
+        "--variant",
+        action="append",
+        default=None,
+        metavar="TAG::PROMPT",
+        help=(
+            "Run multiple prompts after one model load. Directory inputs only; outputs are "
+            "written under <out>/<tag>/target. Repeat for each prompt."
+        ),
+    )
+    parser.add_argument(
+        "--include-file",
+        help="Optional text file containing one input basename per line (directory inputs only).",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--steps", type=int, default=4)
     parser.add_argument("--cfg", type=float, default=1.0)
@@ -111,14 +126,55 @@ def main():
 
     input_path = Path(args.input)
     batch_mode = input_path.is_dir()
+    if args.variant and not batch_mode:
+        parser.error("--variant requires --input to be a directory")
+    if args.include_file and not batch_mode:
+        parser.error("--include-file requires --input to be a directory")
+
+    variants = []
+    if args.variant:
+        seen_tags = set()
+        for value in args.variant:
+            if "::" not in value:
+                parser.error(f"--variant must use TAG::PROMPT: {value}")
+            tag, prompt = value.split("::", 1)
+            if not re.fullmatch(r"[A-Za-z0-9._-]+", tag):
+                parser.error(f"--variant tag must be filesystem-safe: {tag}")
+            if tag in seen_tags:
+                parser.error(f"duplicate --variant tag: {tag}")
+            if not prompt.strip():
+                parser.error(f"empty prompt for --variant tag: {tag}")
+            seen_tags.add(tag)
+            variants.append((tag, prompt.strip()))
+    else:
+        variants = [(None, args.prompt)]
+
     if batch_mode:
         sources = sorted(
             path for path in input_path.iterdir() if path.suffix.lower() in IMAGE_EXTENSIONS
         )
         source_count = len(sources)
-        if 0 < args.n < source_count:
+        if args.include_file:
+            include_path = Path(args.include_file)
+            requested = [
+                line.strip()
+                for line in include_path.read_text(encoding="utf-8").splitlines()
+                if line.strip() and not line.lstrip().startswith("#")
+            ]
+            by_name = {path.name: path for path in sources}
+            missing = [name for name in requested if name not in by_name]
+            if missing:
+                parser.error(
+                    f"--include-file entries not found in {input_path}: {', '.join(missing)}"
+                )
+            sources = [by_name[name] for name in requested]
+        selected_count = len(sources)
+        if 0 < args.n < selected_count:
             if args.sample_mode == "uniform" and args.n > 1:
-                indices = [round(index * (source_count - 1) / (args.n - 1)) for index in range(args.n)]
+                indices = [
+                    round(index * (selected_count - 1) / (args.n - 1))
+                    for index in range(args.n)
+                ]
                 sources = [sources[index] for index in indices]
             else:
                 sources = sources[: args.n]
@@ -128,18 +184,23 @@ def main():
         if output_root.suffix:
             parser.error("--out must be a directory when --input is a directory")
         input_output_dir = output_root / "input"
-        target_output_dir = output_root / "target"
         input_output_dir.mkdir(parents=True, exist_ok=True)
-        target_output_dir.mkdir(parents=True, exist_ok=True)
-        jobs = [(source, target_output_dir / f"{source.stem}.png") for source in sources]
+        variant_outputs = []
+        for tag, prompt in variants:
+            variant_root = output_root if tag is None else output_root / tag
+            target_output_dir = variant_root / "target"
+            target_output_dir.mkdir(parents=True, exist_ok=True)
+            variant_outputs.append((tag, prompt, variant_root, target_output_dir))
         print(
-            f"[batch] input={input_path} candidates={source_count} images={len(jobs)} "
-            f"sample_mode={args.sample_mode} seed_mode={args.seed_mode} output={output_root}"
+            f"[batch] input={input_path} candidates={source_count} images={len(sources)} "
+            f"variants={len(variants)} sample_mode={args.sample_mode} "
+            f"seed_mode={args.seed_mode} output={output_root}"
         )
     else:
         if not input_path.is_file():
             raise SystemExit(f"Input does not exist: {input_path}")
-        jobs = [(input_path, Path(args.out))]
+        sources = [input_path]
+        variant_outputs = [(None, args.prompt, None, None)]
 
     # The Space carries patched Qwen pipeline modules outside the pip package.
     space_dir = snapshot_download(
@@ -218,75 +279,92 @@ def main():
         memory_snapshot("pipeline-cuda")
         print("[memory] full pipeline resident on CUDA")
 
-    records = []
+    records_by_variant = {tag: [] for tag, _, _, _ in variant_outputs}
     total_started = time.time()
-    for index, (source, output) in enumerate(jobs):
-        image = ImageOps.exif_transpose(Image.open(source)).convert("RGB")
-        width, height = space_size(image)
-        seed = args.seed if args.seed_mode == "fixed" else args.seed + index
-        generator = torch.Generator(device=device).manual_seed(seed)
-        print(
-            f"[run {index + 1}/{len(jobs)}] input={source} output_size={width}x{height} "
-            f"seed={seed} steps={args.steps} cfg={args.cfg} prompt={args.prompt!r}"
-        )
+    total_jobs = len(sources) * len(variant_outputs)
+    completed_jobs = 0
+    for tag, prompt, variant_root, target_output_dir in variant_outputs:
+        if tag is not None:
+            print(f"[variant] tag={tag} prompt={prompt!r}")
+        for index, source in enumerate(sources):
+            if batch_mode:
+                output = target_output_dir / f"{source.stem}.png"
+            else:
+                output = Path(args.out)
+            image = ImageOps.exif_transpose(Image.open(source)).convert("RGB")
+            width, height = space_size(image)
+            seed = args.seed if args.seed_mode == "fixed" else args.seed + index
+            generator = torch.Generator(device=device).manual_seed(seed)
+            completed_jobs += 1
+            print(
+                f"[run {completed_jobs}/{total_jobs}] input={source} output_size={width}x{height} "
+                f"seed={seed} steps={args.steps} cfg={args.cfg} prompt={prompt!r}"
+            )
 
-        started = time.time()
-        result = pipe(
-            image=[image],
-            prompt=args.prompt,
-            negative_prompt=NEGATIVE_PROMPT,
-            height=height,
-            width=width,
-            num_inference_steps=args.steps,
-            generator=generator,
-            true_cfg_scale=args.cfg,
-        ).images[0]
+            started = time.time()
+            result = pipe(
+                image=[image],
+                prompt=prompt,
+                negative_prompt=NEGATIVE_PROMPT,
+                height=height,
+                width=width,
+                num_inference_steps=args.steps,
+                generator=generator,
+                true_cfg_scale=args.cfg,
+            ).images[0]
 
-        output.parent.mkdir(parents=True, exist_ok=True)
-        result.save(output)
-        if batch_mode:
-            shutil.copy2(source, input_output_dir / source.name)
-        with output.open("rb") as output_file:
-            digest = hashlib.sha256(output_file.read()).hexdigest()
-        metadata = {
-            "input": str(source),
-            "output": str(output),
-            "prompt": args.prompt,
-            "negative_prompt": NEGATIVE_PROMPT,
-            "seed": seed,
-            "seed_mode": args.seed_mode,
-            "steps": args.steps,
-            "true_cfg_scale": args.cfg,
-            "size": [width, height],
-            "space_repo": SPACE_REPO,
-            "space_revision": args.space_revision,
-            "space_commit": os.path.basename(space_dir),
-            "base_model": BASE_MODEL,
-            "transformer": RAPID_MODEL,
-            "adapter": f"{ANIME_REPO}/{ANIME_FILE}",
-            "attention": attention,
-            "cpu_offload": args.cpu_offload,
-            "int8_transformer": args.int8_transformer,
-            "seconds": round(time.time() - started, 3),
-            "sha256": digest,
-        }
-        meta_path = output.with_suffix(".json")
-        with meta_path.open("w", encoding="utf-8") as handle:
-            json.dump(metadata, handle, ensure_ascii=True, indent=2)
-        records.append(metadata)
-        print(f"[done {index + 1}/{len(jobs)}] {output} ({metadata['seconds']:.1f}s) sha256={digest}")
+            output.parent.mkdir(parents=True, exist_ok=True)
+            result.save(output)
+            if batch_mode and not (input_output_dir / source.name).exists():
+                shutil.copy2(source, input_output_dir / source.name)
+            with output.open("rb") as output_file:
+                digest = hashlib.sha256(output_file.read()).hexdigest()
+            metadata = {
+                "input": str(source),
+                "output": str(output),
+                "variant": tag,
+                "prompt": prompt,
+                "negative_prompt": NEGATIVE_PROMPT,
+                "seed": seed,
+                "seed_mode": args.seed_mode,
+                "steps": args.steps,
+                "true_cfg_scale": args.cfg,
+                "size": [width, height],
+                "space_repo": SPACE_REPO,
+                "space_revision": args.space_revision,
+                "space_commit": os.path.basename(space_dir),
+                "base_model": BASE_MODEL,
+                "transformer": RAPID_MODEL,
+                "adapter": f"{ANIME_REPO}/{ANIME_FILE}",
+                "attention": attention,
+                "cpu_offload": args.cpu_offload,
+                "int8_transformer": args.int8_transformer,
+                "seconds": round(time.time() - started, 3),
+                "sha256": digest,
+            }
+            meta_path = output.with_suffix(".json")
+            with meta_path.open("w", encoding="utf-8") as handle:
+                json.dump(metadata, handle, ensure_ascii=True, indent=2)
+            records_by_variant[tag].append(metadata)
+            print(
+                f"[done {completed_jobs}/{total_jobs}] {output} "
+                f"({metadata['seconds']:.1f}s) sha256={digest}"
+            )
 
     if batch_mode:
-        manifest_path = output_root / "manifest.jsonl"
-        with manifest_path.open("w", encoding="utf-8") as handle:
-            for record in records:
-                handle.write(json.dumps(record, ensure_ascii=True) + "\n")
+        for tag, _, variant_root, _ in variant_outputs:
+            manifest_path = variant_root / "manifest.jsonl"
+            with manifest_path.open("w", encoding="utf-8") as handle:
+                for record in records_by_variant[tag]:
+                    handle.write(json.dumps(record, ensure_ascii=True) + "\n")
+            print(f"[manifest] tag={tag or 'default'} path={manifest_path}")
         print(
-            f"[batch-done] images={len(records)} seconds={time.time() - total_started:.1f} "
-            f"manifest={manifest_path}"
+            f"[batch-done] images={len(sources)} variants={len(variant_outputs)} "
+            f"runs={total_jobs} seconds={time.time() - total_started:.1f}"
         )
     else:
-        print(f"[meta] {Path(records[0]['output']).with_suffix('.json')}")
+        record = records_by_variant[None][0]
+        print(f"[meta] {Path(record['output']).with_suffix('.json')}")
 
 
 if __name__ == "__main__":
