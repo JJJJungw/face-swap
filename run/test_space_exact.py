@@ -3,6 +3,7 @@
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import sys
@@ -35,6 +36,32 @@ def space_size(image):
     return (out_width // 8) * 8, (out_height // 8) * 8
 
 
+def memory_snapshot(label):
+    meminfo = {}
+    with open("/proc/meminfo", encoding="ascii") as handle:
+        for line in handle:
+            key, value = line.split(":", 1)
+            meminfo[key] = int(value.strip().split()[0]) * 1024
+    rss = 0
+    with open("/proc/self/status", encoding="ascii") as handle:
+        for line in handle:
+            if line.startswith("VmRSS:"):
+                rss = int(line.split()[1]) * 1024
+                break
+    gpu_free, gpu_total = torch.cuda.mem_get_info()
+    gib = 1024**3
+    print(
+        f"[memory:{label}] "
+        f"gpu_alloc={torch.cuda.memory_allocated() / gib:.2f}GiB "
+        f"gpu_reserved={torch.cuda.memory_reserved() / gib:.2f}GiB "
+        f"gpu_free={gpu_free / gib:.2f}/{gpu_total / gib:.2f}GiB "
+        f"rss={rss / gib:.2f}GiB "
+        f"ram_available={meminfo.get('MemAvailable', 0) / gib:.2f}GiB "
+        f"swap_free={meminfo.get('SwapFree', 0) / gib:.2f}GiB",
+        flush=True,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", default="official_sample.jpeg")
@@ -49,11 +76,19 @@ def main():
         help="Keep inactive pipeline modules in system RAM for GPUs below 48 GiB.",
     )
     parser.add_argument(
+        "--fp8-transformer",
+        action="store_true",
+        help="Fuse Anime-V2 and quantize only the Rapid transformer to FP8 weight-only.",
+    )
+    parser.add_argument(
         "--space-revision",
         default="main",
         help="Space git revision. Use a commit hash to freeze an exact version.",
     )
     args = parser.parse_args()
+
+    if args.cpu_offload and args.fp8_transformer:
+        parser.error("--cpu-offload and --fp8-transformer are mutually exclusive")
 
     if not torch.cuda.is_available():
         raise SystemExit("CUDA GPU is required")
@@ -82,35 +117,60 @@ def main():
     dtype = torch.bfloat16
     print(f"[env] torch={torch.__version__} cuda={torch.version.cuda} gpu={torch.cuda.get_device_name(0)}")
     print(f"[space] repo={SPACE_REPO} revision={args.space_revision} snapshot={space_dir}")
+    memory_snapshot("start")
 
     transformer_kwargs = {"torch_dtype": dtype}
     if not args.cpu_offload:
         transformer_kwargs["device_map"] = "cuda"
     transformer = QwenImageTransformer2DModel.from_pretrained(RAPID_MODEL, **transformer_kwargs)
+    memory_snapshot("transformer-loaded")
     pipe = QwenImageEditPlusPipeline.from_pretrained(
         BASE_MODEL,
         transformer=transformer,
         torch_dtype=dtype,
     )
-    if not args.cpu_offload:
-        pipe = pipe.to(device)
+    memory_snapshot("pipeline-loaded")
 
     if QwenDoubleStreamAttnProcessorFA3 is None:
         attention = f"SDPA fallback (FA3 import failed: {fa3_import_error})"
     else:
         try:
             pipe.transformer.set_attn_processor(QwenDoubleStreamAttnProcessorFA3())
-            attention = "FA3"
+            if importlib.util.find_spec("kernels") is None:
+                attention = "SDPA fallback (kernels package unavailable)"
+            else:
+                attention = "FA3"
         except Exception as exc:
             attention = f"SDPA fallback ({exc})"
     print(f"[attention] {attention}")
 
     pipe.load_lora_weights(ANIME_REPO, weight_name=ANIME_FILE, adapter_name="anime-v2")
     pipe.set_adapters(["anime-v2"], adapter_weights=[1.0])
+    memory_snapshot("lora-loaded")
     if args.cpu_offload:
         pipe.enable_model_cpu_offload(gpu_id=0)
         print("[memory] model CPU offload enabled")
+    elif args.fp8_transformer:
+        try:
+            from torchao.quantization import Float8WeightOnlyConfig, quantize_
+        except ImportError as exc:
+            raise SystemExit(
+                "--fp8-transformer requires torchao. Install it with: pip install torchao"
+            ) from exc
+        print("[quantize] fusing Anime-V2 LoRA into the Rapid transformer")
+        pipe.fuse_lora(adapter_names=["anime-v2"], lora_scale=1.0)
+        pipe.unload_lora_weights()
+        memory_snapshot("lora-fused")
+        print("[quantize] applying FP8 weight-only quantization to the transformer")
+        quantize_(pipe.transformer, Float8WeightOnlyConfig())
+        torch.cuda.empty_cache()
+        memory_snapshot("transformer-fp8")
+        pipe = pipe.to(device)
+        memory_snapshot("pipeline-cuda")
+        print("[memory] FP8 transformer pipeline resident on CUDA")
     else:
+        pipe = pipe.to(device)
+        memory_snapshot("pipeline-cuda")
         print("[memory] full pipeline resident on CUDA")
 
     image = ImageOps.exif_transpose(Image.open(args.input)).convert("RGB")
@@ -154,6 +214,7 @@ def main():
         "adapter": f"{ANIME_REPO}/{ANIME_FILE}",
         "attention": attention,
         "cpu_offload": args.cpu_offload,
+        "fp8_transformer": args.fp8_transformer,
         "seconds": round(time.time() - started, 3),
         "sha256": digest,
     }
