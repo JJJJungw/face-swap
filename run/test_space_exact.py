@@ -6,6 +6,8 @@ import hashlib
 import importlib.util
 import json
 import os
+from pathlib import Path
+import shutil
 import sys
 import time
 
@@ -19,6 +21,7 @@ BASE_MODEL = "Qwen/Qwen-Image-Edit-2511"
 RAPID_MODEL = "prithivMLmods/Qwen-Image-Edit-Rapid-AIO-V19"
 ANIME_REPO = "prithivMLmods/Qwen-Image-Edit-2511-Anime"
 ANIME_FILE = "Qwen-Image-Edit-2511-Anime-2000.safetensors"
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 NEGATIVE_PROMPT = (
     "worst quality, low quality, bad anatomy, bad hands, text, error, missing fingers, "
     "extra digit, fewer digits, cropped, jpeg artifacts, signature, watermark, username, blurry"
@@ -70,6 +73,7 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--steps", type=int, default=4)
     parser.add_argument("--cfg", type=float, default=1.0)
+    parser.add_argument("--n", type=int, default=0, help="Directory mode image limit (0=all).")
     parser.add_argument(
         "--cpu-offload",
         action="store_true",
@@ -92,6 +96,30 @@ def main():
 
     if not torch.cuda.is_available():
         raise SystemExit("CUDA GPU is required")
+
+    input_path = Path(args.input)
+    batch_mode = input_path.is_dir()
+    if batch_mode:
+        sources = sorted(
+            path for path in input_path.iterdir() if path.suffix.lower() in IMAGE_EXTENSIONS
+        )
+        if args.n > 0:
+            sources = sources[: args.n]
+        if not sources:
+            raise SystemExit(f"No supported images found in {input_path}")
+        output_root = Path(args.out)
+        if output_root.suffix:
+            parser.error("--out must be a directory when --input is a directory")
+        input_output_dir = output_root / "input"
+        target_output_dir = output_root / "target"
+        input_output_dir.mkdir(parents=True, exist_ok=True)
+        target_output_dir.mkdir(parents=True, exist_ok=True)
+        jobs = [(source, target_output_dir / f"{source.stem}.png") for source in sources]
+        print(f"[batch] input={input_path} images={len(jobs)} output={output_root}")
+    else:
+        if not input_path.is_file():
+            raise SystemExit(f"Input does not exist: {input_path}")
+        jobs = [(input_path, Path(args.out))]
 
     # The Space carries patched Qwen pipeline modules outside the pip package.
     space_dir = snapshot_download(
@@ -170,56 +198,74 @@ def main():
         memory_snapshot("pipeline-cuda")
         print("[memory] full pipeline resident on CUDA")
 
-    image = ImageOps.exif_transpose(Image.open(args.input)).convert("RGB")
-    width, height = space_size(image)
-    generator = torch.Generator(device=device).manual_seed(args.seed)
-    print(
-        f"[run] input={args.input} output_size={width}x{height} seed={args.seed} "
-        f"steps={args.steps} cfg={args.cfg} prompt={args.prompt!r}"
-    )
+    records = []
+    total_started = time.time()
+    for index, (source, output) in enumerate(jobs):
+        image = ImageOps.exif_transpose(Image.open(source)).convert("RGB")
+        width, height = space_size(image)
+        seed = args.seed + index
+        generator = torch.Generator(device=device).manual_seed(seed)
+        print(
+            f"[run {index + 1}/{len(jobs)}] input={source} output_size={width}x{height} "
+            f"seed={seed} steps={args.steps} cfg={args.cfg} prompt={args.prompt!r}"
+        )
 
-    started = time.time()
-    result = pipe(
-        image=[image],
-        prompt=args.prompt,
-        negative_prompt=NEGATIVE_PROMPT,
-        height=height,
-        width=width,
-        num_inference_steps=args.steps,
-        generator=generator,
-        true_cfg_scale=args.cfg,
-    ).images[0]
+        started = time.time()
+        result = pipe(
+            image=[image],
+            prompt=args.prompt,
+            negative_prompt=NEGATIVE_PROMPT,
+            height=height,
+            width=width,
+            num_inference_steps=args.steps,
+            generator=generator,
+            true_cfg_scale=args.cfg,
+        ).images[0]
 
-    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-    result.save(args.out)
-    with open(args.out, "rb") as output_file:
-        digest = hashlib.sha256(output_file.read()).hexdigest()
-    metadata = {
-        "input": args.input,
-        "output": args.out,
-        "prompt": args.prompt,
-        "negative_prompt": NEGATIVE_PROMPT,
-        "seed": args.seed,
-        "steps": args.steps,
-        "true_cfg_scale": args.cfg,
-        "size": [width, height],
-        "space_repo": SPACE_REPO,
-        "space_revision": args.space_revision,
-        "space_commit": os.path.basename(space_dir),
-        "base_model": BASE_MODEL,
-        "transformer": RAPID_MODEL,
-        "adapter": f"{ANIME_REPO}/{ANIME_FILE}",
-        "attention": attention,
-        "cpu_offload": args.cpu_offload,
-        "int8_transformer": args.int8_transformer,
-        "seconds": round(time.time() - started, 3),
-        "sha256": digest,
-    }
-    meta_path = os.path.splitext(args.out)[0] + ".json"
-    with open(meta_path, "w", encoding="utf-8") as handle:
-        json.dump(metadata, handle, ensure_ascii=True, indent=2)
-    print(f"[done] {args.out} ({metadata['seconds']:.1f}s) sha256={digest}")
-    print(f"[meta] {meta_path}")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        result.save(output)
+        if batch_mode:
+            shutil.copy2(source, input_output_dir / source.name)
+        with output.open("rb") as output_file:
+            digest = hashlib.sha256(output_file.read()).hexdigest()
+        metadata = {
+            "input": str(source),
+            "output": str(output),
+            "prompt": args.prompt,
+            "negative_prompt": NEGATIVE_PROMPT,
+            "seed": seed,
+            "steps": args.steps,
+            "true_cfg_scale": args.cfg,
+            "size": [width, height],
+            "space_repo": SPACE_REPO,
+            "space_revision": args.space_revision,
+            "space_commit": os.path.basename(space_dir),
+            "base_model": BASE_MODEL,
+            "transformer": RAPID_MODEL,
+            "adapter": f"{ANIME_REPO}/{ANIME_FILE}",
+            "attention": attention,
+            "cpu_offload": args.cpu_offload,
+            "int8_transformer": args.int8_transformer,
+            "seconds": round(time.time() - started, 3),
+            "sha256": digest,
+        }
+        meta_path = output.with_suffix(".json")
+        with meta_path.open("w", encoding="utf-8") as handle:
+            json.dump(metadata, handle, ensure_ascii=True, indent=2)
+        records.append(metadata)
+        print(f"[done {index + 1}/{len(jobs)}] {output} ({metadata['seconds']:.1f}s) sha256={digest}")
+
+    if batch_mode:
+        manifest_path = output_root / "manifest.jsonl"
+        with manifest_path.open("w", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record, ensure_ascii=True) + "\n")
+        print(
+            f"[batch-done] images={len(records)} seconds={time.time() - total_started:.1f} "
+            f"manifest={manifest_path}"
+        )
+    else:
+        print(f"[meta] {Path(records[0]['output']).with_suffix('.json')}")
 
 
 if __name__ == "__main__":
