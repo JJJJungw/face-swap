@@ -98,6 +98,12 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--steps", type=int, default=4)
     parser.add_argument("--cfg", type=float, default=1.0)
+    parser.add_argument(
+        "--style-scale",
+        type=float,
+        default=1.0,
+        help="Anime LoRA scale for a single batch run.",
+    )
     parser.add_argument("--n", type=int, default=0, help="Directory mode image limit (0=all).")
     parser.add_argument(
         "--sample-mode",
@@ -126,12 +132,21 @@ def main():
         default="main",
         help="Space git revision. Use a commit hash to freeze an exact version.",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip batch outputs that already have both PNG and JSON metadata.",
+    )
     args = parser.parse_args()
 
     if args.cpu_offload and args.int8_transformer:
         parser.error("--cpu-offload and --int8-transformer are mutually exclusive")
     if args.variant and args.style_variant:
         parser.error("--variant and --style-variant cannot be combined")
+    if args.style_scale <= 0:
+        parser.error("--style-scale must be positive")
+    if (args.variant or args.style_variant) and args.style_scale != 1.0:
+        parser.error("--style-scale cannot be combined with --variant/--style-variant")
 
     if not torch.cuda.is_available():
         raise SystemExit("CUDA GPU is required")
@@ -177,7 +192,7 @@ def main():
             seen_tags.add(tag)
             variants.append((tag, args.prompt, style_scale))
     else:
-        variants = [(None, args.prompt, 1.0)]
+        variants = [(None, args.prompt, args.style_scale)]
 
     if batch_mode:
         sources = sorted(
@@ -232,7 +247,7 @@ def main():
         if not input_path.is_file():
             raise SystemExit(f"Input does not exist: {input_path}")
         sources = [input_path]
-        variant_outputs = [(None, args.prompt, 1.0, None, None)]
+        variant_outputs = [(None, args.prompt, args.style_scale, None, None)]
 
     # The Space carries patched Qwen pipeline modules outside the pip package.
     space_dir = snapshot_download(
@@ -326,6 +341,20 @@ def main():
                 output = target_output_dir / f"{source.stem}.png"
             else:
                 output = Path(args.out)
+            meta_path = output.with_suffix(".json")
+            if batch_mode and args.resume and output.is_file() and meta_path.is_file():
+                if not (input_output_dir / source.name).exists():
+                    shutil.copy2(source, input_output_dir / source.name)
+                try:
+                    with meta_path.open(encoding="utf-8") as handle:
+                        metadata = json.load(handle)
+                except (OSError, json.JSONDecodeError):
+                    print(f"[resume-invalid] regenerating {output}")
+                else:
+                    completed_jobs += 1
+                    records_by_variant[tag].append(metadata)
+                    print(f"[resume {completed_jobs}/{total_jobs}] {output}")
+                    continue
             image = ImageOps.exif_transpose(Image.open(source)).convert("RGB")
             width, height = space_size(image)
             seed = args.seed if args.seed_mode == "fixed" else args.seed + index
@@ -378,7 +407,6 @@ def main():
                 "seconds": round(time.time() - started, 3),
                 "sha256": digest,
             }
-            meta_path = output.with_suffix(".json")
             with meta_path.open("w", encoding="utf-8") as handle:
                 json.dump(metadata, handle, ensure_ascii=True, indent=2)
             records_by_variant[tag].append(metadata)
