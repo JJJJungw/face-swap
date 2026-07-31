@@ -1,0 +1,23 @@
+# High-detail elderly cases
+pair_00000.png
+pair_00222.png
+pair_00445.png
+pair_00779.png
+pair_01779.png
+pair_02222.png
+pair_02777.png
+pair_03111.png
+pair_04001.png
+pair_04556.png
+pair_05998.png
+pair_07110.png
+pair_07444.png
+pair_08000.png
+pair_08555.png
+
+# Young adult controls
+pair_00556.png
+pair_01112.png
+pair_01446.png
+pair_02444.png
+pair_03557.png

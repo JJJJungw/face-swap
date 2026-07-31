@@ -82,6 +82,16 @@ def main():
         ),
     )
     parser.add_argument(
+        "--style-variant",
+        action="append",
+        default=None,
+        metavar="TAG::SCALE",
+        help=(
+            "Run multiple Anime LoRA scales after one model load. Directory inputs only; "
+            "repeat for each scale."
+        ),
+    )
+    parser.add_argument(
         "--include-file",
         help="Optional text file containing one input basename per line (directory inputs only).",
     )
@@ -120,14 +130,16 @@ def main():
 
     if args.cpu_offload and args.int8_transformer:
         parser.error("--cpu-offload and --int8-transformer are mutually exclusive")
+    if args.variant and args.style_variant:
+        parser.error("--variant and --style-variant cannot be combined")
 
     if not torch.cuda.is_available():
         raise SystemExit("CUDA GPU is required")
 
     input_path = Path(args.input)
     batch_mode = input_path.is_dir()
-    if args.variant and not batch_mode:
-        parser.error("--variant requires --input to be a directory")
+    if (args.variant or args.style_variant) and not batch_mode:
+        parser.error("--variant/--style-variant requires --input to be a directory")
     if args.include_file and not batch_mode:
         parser.error("--include-file requires --input to be a directory")
 
@@ -145,9 +157,27 @@ def main():
             if not prompt.strip():
                 parser.error(f"empty prompt for --variant tag: {tag}")
             seen_tags.add(tag)
-            variants.append((tag, prompt.strip()))
+            variants.append((tag, prompt.strip(), 1.0))
+    elif args.style_variant:
+        seen_tags = set()
+        for value in args.style_variant:
+            if "::" not in value:
+                parser.error(f"--style-variant must use TAG::SCALE: {value}")
+            tag, scale_text = value.split("::", 1)
+            if not re.fullmatch(r"[A-Za-z0-9._-]+", tag):
+                parser.error(f"--style-variant tag must be filesystem-safe: {tag}")
+            if tag in seen_tags:
+                parser.error(f"duplicate --style-variant tag: {tag}")
+            try:
+                style_scale = float(scale_text)
+            except ValueError:
+                parser.error(f"invalid --style-variant scale: {scale_text}")
+            if style_scale <= 0:
+                parser.error(f"--style-variant scale must be positive: {style_scale}")
+            seen_tags.add(tag)
+            variants.append((tag, args.prompt, style_scale))
     else:
-        variants = [(None, args.prompt)]
+        variants = [(None, args.prompt, 1.0)]
 
     if batch_mode:
         sources = sorted(
@@ -186,11 +216,13 @@ def main():
         input_output_dir = output_root / "input"
         input_output_dir.mkdir(parents=True, exist_ok=True)
         variant_outputs = []
-        for tag, prompt in variants:
+        for tag, prompt, style_scale in variants:
             variant_root = output_root if tag is None else output_root / tag
             target_output_dir = variant_root / "target"
             target_output_dir.mkdir(parents=True, exist_ok=True)
-            variant_outputs.append((tag, prompt, variant_root, target_output_dir))
+            variant_outputs.append(
+                (tag, prompt, style_scale, variant_root, target_output_dir)
+            )
         print(
             f"[batch] input={input_path} candidates={source_count} images={len(sources)} "
             f"variants={len(variants)} sample_mode={args.sample_mode} "
@@ -200,7 +232,7 @@ def main():
         if not input_path.is_file():
             raise SystemExit(f"Input does not exist: {input_path}")
         sources = [input_path]
-        variant_outputs = [(None, args.prompt, None, None)]
+        variant_outputs = [(None, args.prompt, 1.0, None, None)]
 
     # The Space carries patched Qwen pipeline modules outside the pip package.
     space_dir = snapshot_download(
@@ -279,13 +311,16 @@ def main():
         memory_snapshot("pipeline-cuda")
         print("[memory] full pipeline resident on CUDA")
 
-    records_by_variant = {tag: [] for tag, _, _, _ in variant_outputs}
+    records_by_variant = {tag: [] for tag, _, _, _, _ in variant_outputs}
     total_started = time.time()
     total_jobs = len(sources) * len(variant_outputs)
     completed_jobs = 0
-    for tag, prompt, variant_root, target_output_dir in variant_outputs:
+    for tag, prompt, style_scale, variant_root, target_output_dir in variant_outputs:
+        pipe.set_adapters(["anime-v2"], adapter_weights=[style_scale])
         if tag is not None:
-            print(f"[variant] tag={tag} prompt={prompt!r}")
+            print(
+                f"[variant] tag={tag} style_scale={style_scale:g} prompt={prompt!r}"
+            )
         for index, source in enumerate(sources):
             if batch_mode:
                 output = target_output_dir / f"{source.stem}.png"
@@ -324,6 +359,7 @@ def main():
                 "output": str(output),
                 "variant": tag,
                 "prompt": prompt,
+                "style_scale": style_scale,
                 "negative_prompt": NEGATIVE_PROMPT,
                 "seed": seed,
                 "seed_mode": args.seed_mode,
@@ -352,7 +388,7 @@ def main():
             )
 
     if batch_mode:
-        for tag, _, variant_root, _ in variant_outputs:
+        for tag, _, _, variant_root, _ in variant_outputs:
             manifest_path = variant_root / "manifest.jsonl"
             with manifest_path.open("w", encoding="utf-8") as handle:
                 for record in records_by_variant[tag]:
