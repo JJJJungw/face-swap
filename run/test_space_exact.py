@@ -44,6 +44,11 @@ def main():
     parser.add_argument("--steps", type=int, default=4)
     parser.add_argument("--cfg", type=float, default=1.0)
     parser.add_argument(
+        "--cpu-offload",
+        action="store_true",
+        help="Keep inactive pipeline modules in system RAM for GPUs below 48 GiB.",
+    )
+    parser.add_argument(
         "--space-revision",
         default="main",
         help="Space git revision. Use a commit hash to freeze an exact version.",
@@ -78,16 +83,17 @@ def main():
     print(f"[env] torch={torch.__version__} cuda={torch.version.cuda} gpu={torch.cuda.get_device_name(0)}")
     print(f"[space] repo={SPACE_REPO} revision={args.space_revision} snapshot={space_dir}")
 
-    transformer = QwenImageTransformer2DModel.from_pretrained(
-        RAPID_MODEL,
-        torch_dtype=dtype,
-        device_map="cuda",
-    )
+    transformer_kwargs = {"torch_dtype": dtype}
+    if not args.cpu_offload:
+        transformer_kwargs["device_map"] = "cuda"
+    transformer = QwenImageTransformer2DModel.from_pretrained(RAPID_MODEL, **transformer_kwargs)
     pipe = QwenImageEditPlusPipeline.from_pretrained(
         BASE_MODEL,
         transformer=transformer,
         torch_dtype=dtype,
-    ).to(device)
+    )
+    if not args.cpu_offload:
+        pipe = pipe.to(device)
 
     if QwenDoubleStreamAttnProcessorFA3 is None:
         attention = f"SDPA fallback (FA3 import failed: {fa3_import_error})"
@@ -101,6 +107,11 @@ def main():
 
     pipe.load_lora_weights(ANIME_REPO, weight_name=ANIME_FILE, adapter_name="anime-v2")
     pipe.set_adapters(["anime-v2"], adapter_weights=[1.0])
+    if args.cpu_offload:
+        pipe.enable_model_cpu_offload(gpu_id=0)
+        print("[memory] model CPU offload enabled")
+    else:
+        print("[memory] full pipeline resident on CUDA")
 
     image = ImageOps.exif_transpose(Image.open(args.input)).convert("RGB")
     width, height = space_size(image)
@@ -142,6 +153,7 @@ def main():
         "transformer": RAPID_MODEL,
         "adapter": f"{ANIME_REPO}/{ANIME_FILE}",
         "attention": attention,
+        "cpu_offload": args.cpu_offload,
         "seconds": round(time.time() - started, 3),
         "sha256": digest,
     }
