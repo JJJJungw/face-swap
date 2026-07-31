@@ -137,6 +137,11 @@ def main():
         action="store_true",
         help="Skip batch outputs that already have both PNG and JSON metadata.",
     )
+    parser.add_argument(
+        "--compile-transformer",
+        action="store_true",
+        help="Compile the transformer with torch.compile after loading the fixed LoRA scale.",
+    )
     args = parser.parse_args()
 
     if args.cpu_offload and args.int8_transformer:
@@ -193,6 +198,9 @@ def main():
             variants.append((tag, args.prompt, style_scale))
     else:
         variants = [(None, args.prompt, args.style_scale)]
+
+    if args.compile_transformer and len(variants) != 1:
+        parser.error("--compile-transformer requires a single prompt and style scale")
 
     if batch_mode:
         sources = sorted(
@@ -326,12 +334,22 @@ def main():
         memory_snapshot("pipeline-cuda")
         print("[memory] full pipeline resident on CUDA")
 
+    if args.compile_transformer:
+        compile_scale = variant_outputs[0][2]
+        pipe.set_adapters(["anime-v2"], adapter_weights=[compile_scale])
+        pipe.transformer = torch.compile(pipe.transformer)
+        print(
+            f"[compile] transformer enabled at fixed style_scale={compile_scale:g}; "
+            "the first inference includes compilation time"
+        )
+
     records_by_variant = {tag: [] for tag, _, _, _, _ in variant_outputs}
     total_started = time.time()
     total_jobs = len(sources) * len(variant_outputs)
     completed_jobs = 0
     for tag, prompt, style_scale, variant_root, target_output_dir in variant_outputs:
-        pipe.set_adapters(["anime-v2"], adapter_weights=[style_scale])
+        if not args.compile_transformer:
+            pipe.set_adapters(["anime-v2"], adapter_weights=[style_scale])
         if tag is not None:
             print(
                 f"[variant] tag={tag} style_scale={style_scale:g} prompt={prompt!r}"
@@ -404,6 +422,7 @@ def main():
                 "attention": attention,
                 "cpu_offload": args.cpu_offload,
                 "int8_transformer": args.int8_transformer,
+                "compile_transformer": args.compile_transformer,
                 "seconds": round(time.time() - started, 3),
                 "sha256": digest,
             }
