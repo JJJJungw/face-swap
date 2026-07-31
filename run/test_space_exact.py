@@ -75,6 +75,18 @@ def main():
     parser.add_argument("--cfg", type=float, default=1.0)
     parser.add_argument("--n", type=int, default=0, help="Directory mode image limit (0=all).")
     parser.add_argument(
+        "--sample-mode",
+        choices=("uniform", "head"),
+        default="uniform",
+        help="Select directory samples across the full sorted list or only from its start.",
+    )
+    parser.add_argument(
+        "--seed-mode",
+        choices=("fixed", "increment"),
+        default="fixed",
+        help="Use the same seed for every image or add the batch index.",
+    )
+    parser.add_argument(
         "--cpu-offload",
         action="store_true",
         help="Keep inactive pipeline modules in system RAM for GPUs below 48 GiB.",
@@ -103,8 +115,13 @@ def main():
         sources = sorted(
             path for path in input_path.iterdir() if path.suffix.lower() in IMAGE_EXTENSIONS
         )
-        if args.n > 0:
-            sources = sources[: args.n]
+        source_count = len(sources)
+        if 0 < args.n < source_count:
+            if args.sample_mode == "uniform" and args.n > 1:
+                indices = [round(index * (source_count - 1) / (args.n - 1)) for index in range(args.n)]
+                sources = [sources[index] for index in indices]
+            else:
+                sources = sources[: args.n]
         if not sources:
             raise SystemExit(f"No supported images found in {input_path}")
         output_root = Path(args.out)
@@ -115,7 +132,10 @@ def main():
         input_output_dir.mkdir(parents=True, exist_ok=True)
         target_output_dir.mkdir(parents=True, exist_ok=True)
         jobs = [(source, target_output_dir / f"{source.stem}.png") for source in sources]
-        print(f"[batch] input={input_path} images={len(jobs)} output={output_root}")
+        print(
+            f"[batch] input={input_path} candidates={source_count} images={len(jobs)} "
+            f"sample_mode={args.sample_mode} seed_mode={args.seed_mode} output={output_root}"
+        )
     else:
         if not input_path.is_file():
             raise SystemExit(f"Input does not exist: {input_path}")
@@ -203,7 +223,7 @@ def main():
     for index, (source, output) in enumerate(jobs):
         image = ImageOps.exif_transpose(Image.open(source)).convert("RGB")
         width, height = space_size(image)
-        seed = args.seed + index
+        seed = args.seed if args.seed_mode == "fixed" else args.seed + index
         generator = torch.Generator(device=device).manual_seed(seed)
         print(
             f"[run {index + 1}/{len(jobs)}] input={source} output_size={width}x{height} "
@@ -234,6 +254,7 @@ def main():
             "prompt": args.prompt,
             "negative_prompt": NEGATIVE_PROMPT,
             "seed": seed,
+            "seed_mode": args.seed_mode,
             "steps": args.steps,
             "true_cfg_scale": args.cfg,
             "size": [width, height],
