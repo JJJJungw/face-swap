@@ -76,9 +76,9 @@ def main():
         help="Keep inactive pipeline modules in system RAM for GPUs below 48 GiB.",
     )
     parser.add_argument(
-        "--fp8-transformer",
+        "--int8-transformer",
         action="store_true",
-        help="Fuse Anime-V2 and quantize only the Rapid transformer to FP8 weight-only.",
+        help="Load only the Rapid transformer in bitsandbytes INT8 (MIT licensed).",
     )
     parser.add_argument(
         "--space-revision",
@@ -87,8 +87,8 @@ def main():
     )
     args = parser.parse_args()
 
-    if args.cpu_offload and args.fp8_transformer:
-        parser.error("--cpu-offload and --fp8-transformer are mutually exclusive")
+    if args.cpu_offload and args.int8_transformer:
+        parser.error("--cpu-offload and --int8-transformer are mutually exclusive")
 
     if not torch.cuda.is_available():
         raise SystemExit("CUDA GPU is required")
@@ -120,14 +120,26 @@ def main():
     memory_snapshot("start")
 
     transformer_kwargs = {"torch_dtype": dtype}
+    if args.int8_transformer:
+        try:
+            from diffusers import BitsAndBytesConfig
+        except ImportError as exc:
+            raise SystemExit(
+                "--int8-transformer requires a Diffusers build with BitsAndBytesConfig"
+            ) from exc
+        transformer_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
     if not args.cpu_offload:
         transformer_kwargs["device_map"] = "cuda"
     transformer = QwenImageTransformer2DModel.from_pretrained(RAPID_MODEL, **transformer_kwargs)
     memory_snapshot("transformer-loaded")
+    pipeline_kwargs = {}
+    if args.int8_transformer:
+        pipeline_kwargs["device_map"] = "cuda"
     pipe = QwenImageEditPlusPipeline.from_pretrained(
         BASE_MODEL,
         transformer=transformer,
         torch_dtype=dtype,
+        **pipeline_kwargs,
     )
     memory_snapshot("pipeline-loaded")
 
@@ -150,24 +162,9 @@ def main():
     if args.cpu_offload:
         pipe.enable_model_cpu_offload(gpu_id=0)
         print("[memory] model CPU offload enabled")
-    elif args.fp8_transformer:
-        try:
-            from torchao.quantization import Float8WeightOnlyConfig, quantize_
-        except ImportError as exc:
-            raise SystemExit(
-                "--fp8-transformer requires torchao. Install it with: pip install torchao"
-            ) from exc
-        print("[quantize] fusing Anime-V2 LoRA into the Rapid transformer")
-        pipe.fuse_lora(adapter_names=["anime-v2"], lora_scale=1.0)
-        pipe.unload_lora_weights()
-        memory_snapshot("lora-fused")
-        print("[quantize] applying FP8 weight-only quantization to the transformer")
-        quantize_(pipe.transformer, Float8WeightOnlyConfig())
-        torch.cuda.empty_cache()
-        memory_snapshot("transformer-fp8")
-        pipe = pipe.to(device)
+    elif args.int8_transformer:
         memory_snapshot("pipeline-cuda")
-        print("[memory] FP8 transformer pipeline resident on CUDA")
+        print("[memory] INT8 transformer pipeline resident on CUDA")
     else:
         pipe = pipe.to(device)
         memory_snapshot("pipeline-cuda")
@@ -214,7 +211,7 @@ def main():
         "adapter": f"{ANIME_REPO}/{ANIME_FILE}",
         "attention": attention,
         "cpu_offload": args.cpu_offload,
-        "fp8_transformer": args.fp8_transformer,
+        "int8_transformer": args.int8_transformer,
         "seconds": round(time.time() - started, 3),
         "sha256": digest,
     }
