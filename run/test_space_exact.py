@@ -63,8 +63,15 @@ def main():
     sys.path.insert(0, space_dir)
 
     from qwenimage.pipeline_qwenimage_edit_plus import QwenImageEditPlusPipeline
-    from qwenimage.qwen_fa3_processor import QwenDoubleStreamAttnProcessorFA3
     from qwenimage.transformer_qwenimage import QwenImageTransformer2DModel
+
+    try:
+        from qwenimage.qwen_fa3_processor import QwenDoubleStreamAttnProcessorFA3
+    except Exception as exc:
+        QwenDoubleStreamAttnProcessorFA3 = None
+        fa3_import_error = exc
+    else:
+        fa3_import_error = None
 
     device = torch.device("cuda")
     dtype = torch.bfloat16
@@ -82,11 +89,14 @@ def main():
         torch_dtype=dtype,
     ).to(device)
 
-    try:
-        pipe.transformer.set_attn_processor(QwenDoubleStreamAttnProcessorFA3())
-        attention = "FA3"
-    except Exception as exc:
-        attention = f"SDPA fallback ({exc})"
+    if QwenDoubleStreamAttnProcessorFA3 is None:
+        attention = f"SDPA fallback (FA3 import failed: {fa3_import_error})"
+    else:
+        try:
+            pipe.transformer.set_attn_processor(QwenDoubleStreamAttnProcessorFA3())
+            attention = "FA3"
+        except Exception as exc:
+            attention = f"SDPA fallback ({exc})"
     print(f"[attention] {attention}")
 
     pipe.load_lora_weights(ANIME_REPO, weight_name=ANIME_FILE, adapter_name="anime-v2")
@@ -114,7 +124,8 @@ def main():
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     result.save(args.out)
-    digest = hashlib.sha256(open(args.out, "rb").read()).hexdigest()
+    with open(args.out, "rb") as output_file:
+        digest = hashlib.sha256(output_file.read()).hexdigest()
     metadata = {
         "input": args.input,
         "output": args.out,
@@ -126,6 +137,7 @@ def main():
         "size": [width, height],
         "space_repo": SPACE_REPO,
         "space_revision": args.space_revision,
+        "space_commit": os.path.basename(space_dir),
         "base_model": BASE_MODEL,
         "transformer": RAPID_MODEL,
         "adapter": f"{ANIME_REPO}/{ANIME_FILE}",
