@@ -189,25 +189,65 @@ def blur_crop(crop, mode="pixelate", cap=12):
     blocks = max(1, min(min(w, h)//10, cap))
     return cv2.resize(cv2.resize(crop, (blocks, blocks)), (w, h), interpolation=cv2.INTER_NEAREST)
 
-def composite(frame, boxes, stylizer, cartoon_min, blur_mode="pixelate", expand=0.15, color_match=0.0):
+def composite(frame, boxes, stylizer, cartoon_min, blur_mode="pixelate", expand=0.15,
+              color_match=0.0, square_crop=False, mask_mode="crop-ellipse",
+              mask_scale_x=0.92, mask_scale_y=1.0, mask_feather=0.04):
     H, W = frame.shape[:2]; nc = nb = 0
     for x1, y1, x2, y2, sc in boxes:
         bw, bh = x2-x1, y2-y1; size = max(bw, bh)
-        cx1 = int(max(0, x1-bw*expand)); cy1 = int(max(0, y1-bh*expand))
-        cx2 = int(min(W, x2+bw*expand)); cy2 = int(min(H, y2+bh*expand))
-        crop = frame[cy1:cy2, cx1:cx2]
+        if square_crop:
+            side = size * (1.0 + 2.0 * expand)
+            center_x, center_y = (x1 + x2) * 0.5, (y1 + y2) * 0.5
+            cx1 = int(np.floor(center_x - side * 0.5))
+            cy1 = int(np.floor(center_y - side * 0.5))
+            cx2 = int(np.ceil(center_x + side * 0.5))
+            cy2 = int(np.ceil(center_y + side * 0.5))
+            pad_left, pad_top = max(0, -cx1), max(0, -cy1)
+            pad_right, pad_bottom = max(0, cx2-W), max(0, cy2-H)
+            padded = cv2.copyMakeBorder(
+                frame, pad_top, pad_bottom, pad_left, pad_right, cv2.BORDER_REFLECT_101,
+            )
+            crop = padded[
+                cy1+pad_top:cy2+pad_top,
+                cx1+pad_left:cx2+pad_left,
+            ]
+            px1, py1, px2, py2 = max(0, cx1), max(0, cy1), min(W, cx2), min(H, cy2)
+            ox1, oy1 = px1-cx1, py1-cy1
+            ox2, oy2 = ox1+(px2-px1), oy1+(py2-py1)
+        else:
+            cx1 = int(max(0, x1-bw*expand)); cy1 = int(max(0, y1-bh*expand))
+            cx2 = int(min(W, x2+bw*expand)); cy2 = int(min(H, y2+bh*expand))
+            crop = frame[cy1:cy2, cx1:cx2]
+            px1, py1, px2, py2 = cx1, cy1, cx2, cy2
+            ox1 = oy1 = 0
+            ox2, oy2 = cx2-cx1, cy2-cy1
         if crop.size == 0: continue
         if size >= cartoon_min:
             styl = cv2.resize(stylizer.stylize(crop), (cx2-cx1, cy2-cy1), interpolation=cv2.INTER_LANCZOS4)
             proc = color_transfer(styl, crop, color_match); nc += 1
         else:
             proc = blur_crop(crop, blur_mode); nb += 1
-        mask = np.zeros((cy2-cy1, cx2-cx1), dtype=np.uint8)
-        ecx, ecy = (cx2-cx1)//2, (cy2-cy1)//2
-        cv2.ellipse(mask, (ecx, ecy), (max(1, ecx-2), max(1, ecy-2)), 0, 0, 360, 255, -1)
-        fk = min(31, max(5, (min(cx2-cx1, cy2-cy1)//8) | 1))
+        crop_h, crop_w = crop.shape[:2]
+        mask = np.zeros((crop_h, crop_w), dtype=np.uint8)
+        if mask_mode == "face-ellipse":
+            ecx = int(round((x1 + x2) * 0.5 - cx1))
+            ecy = int(round((y1 + y2) * 0.5 - cy1))
+            eax = max(1, int(round(bw * 0.5 * mask_scale_x)))
+            eay = max(1, int(round(bh * 0.5 * mask_scale_y)))
+            cv2.ellipse(mask, (ecx, ecy), (eax, eay), 0, 0, 360, 255, -1)
+            fk = max(3, int(round(min(crop_w, crop_h) * mask_feather)) | 1)
+            fk = min(31, fk)
+        else:
+            ecx, ecy = crop_w//2, crop_h//2
+            cv2.ellipse(mask, (ecx, ecy), (max(1, ecx-2), max(1, ecy-2)), 0, 0, 360, 255, -1)
+            fk = min(31, max(5, (min(crop_w, crop_h)//8) | 1))
         m = cv2.GaussianBlur(mask, (fk, fk), 0).astype(np.float32)/255.0
-        frame[cy1:cy2, cx1:cx2] = (crop*(1-m[:, :, None]) + proc*m[:, :, None]).astype(np.uint8)
+        original = frame[py1:py2, px1:px2]
+        proc_roi = proc[oy1:oy2, ox1:ox2]
+        mask_roi = m[oy1:oy2, ox1:ox2, None]
+        frame[py1:py2, px1:px2] = (
+            original*(1-mask_roi) + proc_roi*mask_roi
+        ).astype(np.uint8)
     return nc, nb
 
 def main():
@@ -218,6 +258,15 @@ def main():
     ap.add_argument("--cartoon-min", type=int, default=150, dest="cartoon_min", help="이 픽셀 이상 → 카툰, 미만 → 블러")
     ap.add_argument("--blur-mode", default="pixelate", choices=["pixelate", "gaussian", "box"], dest="blur_mode")
     ap.add_argument("--color-match", type=float, default=0.0, dest="color_match", help="원본 색감 매칭 0~1")
+    ap.add_argument("--face-expand", type=float, default=0.15, dest="face_expand",
+                    help="검출 얼굴 박스 바깥으로 모델 입력 crop을 확장할 비율")
+    ap.add_argument("--square-crop", action="store_true", dest="square_crop",
+                    help="얼굴 중심의 정사각 crop 사용(얼굴 전용 학습 입력과 일치)")
+    ap.add_argument("--mask-mode", default="crop-ellipse", choices=["crop-ellipse", "face-ellipse"],
+                    dest="mask_mode", help="crop 전체 또는 원래 얼굴 박스 기준 합성 타원")
+    ap.add_argument("--mask-scale-x", type=float, default=0.92, dest="mask_scale_x")
+    ap.add_argument("--mask-scale-y", type=float, default=1.0, dest="mask_scale_y")
+    ap.add_argument("--mask-feather", type=float, default=0.04, dest="mask_feather")
     ap.add_argument("--trt", action="store_true", help="TensorRT 검출(첫 실행은 엔진 빌드로 느림)")
     ap.add_argument("--encoder", default="nvenc", choices=["nvenc", "x264"], help="영상 인코더")
     ap.add_argument("--half", action="store_true", help="카툰 GAN fp16(torch 백엔드)")
@@ -230,6 +279,12 @@ def main():
     ap.add_argument("--max-frames", type=int, default=0, dest="max_frames", help="N프레임만 처리(측정용). 0=전체")
     ap.add_argument("--out", default="out/deid_cartoon.mp4")
     args = ap.parse_args()
+    if args.face_expand < 0:
+        ap.error("--face-expand must be non-negative")
+    if args.mask_scale_x <= 0 or args.mask_scale_y <= 0:
+        ap.error("mask scales must be positive")
+    if args.mask_feather < 0:
+        ap.error("--mask-feather must be non-negative")
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
 
     det = Detector(args.model, args.size, use_trt=args.trt)
@@ -261,7 +316,13 @@ def main():
         a = time.perf_counter()
         boxes = det.detect(frame, W, H)
         b = time.perf_counter()
-        nc, nb = composite(frame, boxes, styl, args.cartoon_min, args.blur_mode, color_match=args.color_match)
+        nc, nb = composite(
+            frame, boxes, styl, args.cartoon_min, args.blur_mode,
+            expand=args.face_expand, color_match=args.color_match,
+            square_crop=args.square_crop, mask_mode=args.mask_mode,
+            mask_scale_x=args.mask_scale_x, mask_scale_y=args.mask_scale_y,
+            mask_feather=args.mask_feather,
+        )
         c = time.perf_counter()
         proc.stdin.write(frame.tobytes())
         d = time.perf_counter()

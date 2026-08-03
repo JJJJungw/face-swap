@@ -514,6 +514,7 @@ python3 -u run/eval_student.py --data out/pairs_anime12_13500 --n 64 --size 512 
 | `test_space_exact.py` | 공개 Space 모델 경로 재현 · INT8 transformer · 배치/scale 비교 · resume |
 | `select_sfhq_sources.py` | SFHQ-T2I 메타데이터 필터 · 연령/생성모델/질감 비율 통제 |
 | `generate_anime_13500.sh` | 현재 13,500쌍 코퍼스 선택+생성 진입점. 중단 후 재실행 가능 |
+| `build_localface_pairs.py` | 기존 페어를 재사용해 확장 정사각 crop + 얼굴 한정 target 생성(teacher 재실행 없음) |
 | `pair_utils.py` | 확장자 독립 stem 페어 매칭 · 중복/미지 파일 검증 공통 로직 |
 | `qwen_pairgen.py` | teacher(구) — 2509 + autoweeb LoRA. 재현용 보존 |
 | `ab_2511.sh` | 화풍×프롬프트 교차 A/B |
@@ -608,6 +609,10 @@ python3 -u run/eval_student.py --data out/pairs_anime12_13500 --n 64 --size 512 
    **학습형 gate**를 먼저 시험한다. 목표는 4~6M 파라미터 범위와 L4 속도 예산 유지다.
 5. **conditional adversarial:** L1/perceptual/edge가 안정된 뒤 `D(input, target)` 6채널 PatchGAN을
    `w-adv 0.1~0.2`로 후반 도입한다. generic anime 얼굴로 수렴하면 즉시 제외한다.
+
+영상의 얼굴만 바꾸는 제품 목표에는 별도 localized fine-tuning을 사용한다. 기존 teacher 페어에서
+동일한 얼굴 crop을 만들고, 얼굴 타원 내부는 teacher·외부는 실사인 target으로 재합성한다.
+`--init-ckpt`는 clean48의 G만 로드하고 optimizer·step·split을 초기화한다.
 
 ### C. 실험 승격 기준
 

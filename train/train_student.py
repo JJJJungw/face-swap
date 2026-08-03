@@ -275,7 +275,8 @@ def parse_aug_mix(value):
 
 
 class PairImgs(Dataset):
-    def __init__(self, root, size, aug=False, aug_level=0, pairs=None, aug_mix=None, seed=0):
+    def __init__(self, root, size, aug=False, aug_level=0, pairs=None, aug_mix=None, seed=0,
+                 load_masks=False):
         din, dtg = os.path.join(root, "input"), os.path.join(root, "target")
         self.pairs = list(pairs) if pairs is not None else discover_pairs(din, dtg)
         if not self.pairs:
@@ -286,6 +287,10 @@ class PairImgs(Dataset):
         self.aug_mix = aug_mix
         self.seed = seed
         self.rng = None
+        self.load_masks = load_masks
+        self.mask_dir = os.path.join(root, "mask")
+        if self.load_masks and not os.path.isdir(self.mask_dir):
+            raise SystemExit(f"face mask directory missing: {self.mask_dir}")
 
     def __len__(self):
         return len(self.pairs)
@@ -294,8 +299,16 @@ class PairImgs(Dataset):
         pair = self.pairs[i]
         a = cv2.cvtColor(np.array(Image.open(pair.input_path).convert("RGB")), cv2.COLOR_RGB2BGR)
         b = cv2.cvtColor(np.array(Image.open(pair.target_path).convert("RGB")), cv2.COLOR_RGB2BGR)
+        mask = None
+        if self.load_masks:
+            mask_path = os.path.join(self.mask_dir, f"{pair.stem}.png")
+            if not os.path.isfile(mask_path):
+                raise SystemExit(f"face mask missing: {mask_path}")
+            mask = np.array(Image.open(mask_path).convert("L"))
         if a.shape[:2] != b.shape[:2]:                   # teacher 출력이 더 큰 경우 정렬
             b = cv2.resize(b, (a.shape[1], a.shape[0]), interpolation=cv2.INTER_AREA)
+        if mask is not None and mask.shape[:2] != a.shape[:2]:
+            mask = cv2.resize(mask, (a.shape[1], a.shape[0]), interpolation=cv2.INTER_LINEAR)
 
         if self.rng is None:
             worker = get_worker_info()
@@ -310,6 +323,8 @@ class PairImgs(Dataset):
             # ── 기하: input·target 동일 적용 (정합 유지) ────────────────
             if rng.random() < 0.5:
                 a, b = a[:, ::-1], b[:, ::-1]
+                if mask is not None:
+                    mask = mask[:, ::-1]
             if level >= 2 and rng.random() < 0.7:
                 # 런타임은 expand 0.15 박스를 종횡비 무시하고 정사각으로 눌러 넣는다.
                 # → 타이트 크롭 + 종횡비 왜곡 재현. 반드시 양쪽에 같이.
@@ -319,16 +334,23 @@ class PairImgs(Dataset):
                 th, tw = int(H * ch), int(W * cw)
                 y0 = int(rng.integers(0, H - th + 1)); x0 = int(rng.integers(0, W - tw + 1))
                 a = a[y0:y0 + th, x0:x0 + tw]; b = b[y0:y0 + th, x0:x0 + tw]
+                if mask is not None:
+                    mask = mask[y0:y0 + th, x0:x0 + tw]
 
         a = cv2.resize(np.ascontiguousarray(a), (self.size, self.size), interpolation=cv2.INTER_AREA)
         b = cv2.resize(np.ascontiguousarray(b), (self.size, self.size), interpolation=cv2.INTER_AREA)
+        if mask is not None:
+            mask = cv2.resize(np.ascontiguousarray(mask), (self.size, self.size), interpolation=cv2.INTER_LINEAR)
 
         if level >= 1:
             a = _degrade(a, level, rng, self.size)             # ★ input에만
 
         ta = torch.from_numpy(cv2.cvtColor(a, cv2.COLOR_BGR2RGB).copy()).permute(2, 0, 1).float() / 127.5 - 1
         tb = torch.from_numpy(cv2.cvtColor(b, cv2.COLOR_BGR2RGB).copy()).permute(2, 0, 1).float() / 127.5 - 1
-        return ta, tb
+        if mask is None:
+            return ta, tb
+        tm = torch.from_numpy(mask.copy()).unsqueeze(0).float() / 255.0
+        return ta, tb, tm
 
 
 def cycle(dl):
@@ -354,6 +376,8 @@ def main():
     ap.add_argument("--w-tv", type=float, default=0.0, dest="w_tv")
     ap.add_argument("--id-loss", type=float, default=0.0, dest="id_loss", help="신원억제(0=off). input 신원에서 멀어지게")
     ap.add_argument("--id-margin", type=float, default=0.3, dest="id_margin")
+    ap.add_argument("--face-mask-weight", type=float, default=1.0, dest="face_mask_weight",
+                    help="mask/ 내부 L1 가중치. 1=마스크 미사용, 얼굴 국소 파인튜닝은 4~8 권장")
     ap.add_argument("--gen-ch", type=int, default=32, dest="gen_ch", help="제너레이터 기본채널(용량↑=32→48→64, 속도↓)")
     ap.add_argument("--d-ch", type=int, default=48, dest="d_ch")
     ap.add_argument("--d-n", type=int, default=3, dest="d_n")
@@ -378,6 +402,8 @@ def main():
                     help="진단용으로 앞 N개 페어만 사용하고 validation/증강을 끔")
     ap.add_argument("--resume", nargs="?", const="auto", default=None,
                     help="full checkpoint에서 재시작. 경로 생략 시 <out>/checkpoint_latest.pt")
+    ap.add_argument("--init-ckpt", default=None, dest="init_ckpt",
+                    help="새 실험 초기화용 checkpoint. G 가중치만 로드하고 step/optimizer/split은 초기화")
     ap.add_argument("--smoke", action="store_true")
     args = ap.parse_args()
 
@@ -387,6 +413,8 @@ def main():
         ap.error("--overfit-n must be non-negative")
     if args.val_n < 0:
         ap.error("--val-n must be non-negative")
+    if args.face_mask_weight < 1:
+        ap.error("--face-mask-weight must be at least 1")
     try:
         aug_mix = parse_aug_mix(args.aug_mix)
     except (ValueError, TypeError) as exc:
@@ -395,6 +423,8 @@ def main():
         ap.error("--aug-mix cannot be combined with --aug/--aug-level")
     if args.overfit_n and (aug_mix or args.aug or args.aug_level):
         ap.error("--overfit-n requires clean inputs; do not pass augmentation options")
+    if args.resume and args.init_ckpt:
+        ap.error("--resume and --init-ckpt are mutually exclusive")
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -411,6 +441,20 @@ def main():
     optD = Adam(D.parameters(), args.lr, betas=(0.5, 0.999))
     start_step = 0
     resume_state = None
+
+    if args.init_ckpt:
+        try:
+            init_state = torch.load(args.init_ckpt, map_location=dev, weights_only=False)
+        except TypeError:
+            init_state = torch.load(args.init_ckpt, map_location=dev)
+        init_weights = init_state["G"] if isinstance(init_state, dict) and "G" in init_state else init_state
+        detected_ch = int(init_weights["in_conv.1.weight"].shape[0])
+        if detected_ch != args.gen_ch:
+            raise SystemExit(
+                f"--gen-ch {args.gen_ch} does not match --init-ckpt channel count {detected_ch}"
+            )
+        G.load_state_dict(init_weights, strict=True)
+        print(f"[init] G only from {args.init_ckpt}; optimizer/step/split reset")
 
     def checkpoint_state(step):
         numpy_state = np.random.get_state()
@@ -473,10 +517,17 @@ def main():
             ))
         print(f"[resume] {resume_path} step={start_step}")
 
-    def g_losses(inp, tgt, w_adv_eff):
+    def g_losses(inp, tgt, w_adv_eff, face_mask=None):
         fake = G(inp)
-        l1 = F.l1_loss(fake, tgt)                        # ★ target 직접 재현 → 유화 없이 2.5D 그대로
-        perc = vgg(fake, tgt)                            # 다층 perceptual(디테일·선명)
+        if face_mask is not None:
+            weights = 1.0 + (args.face_mask_weight - 1.0) * face_mask
+            l1 = ((fake - tgt).abs() * weights).sum() / (weights.sum() * fake.shape[1])
+            # 바깥을 target으로 치환하면 perceptual gradient가 얼굴 주변에 집중된다.
+            perceptual_fake = fake * face_mask + tgt.detach() * (1.0 - face_mask)
+            perc = vgg(perceptual_fake, tgt)
+        else:
+            l1 = F.l1_loss(fake, tgt)                    # ★ target 직접 재현 → 유화 없이 2.5D 그대로
+            perc = vgg(fake, tgt)                        # 다층 perceptual(디테일·선명)
         g = args.w_l1 * l1 + args.w_perc * perc
         adv = torch.tensor(0.0, device=dev)
         if w_adv_eff > 0:
@@ -540,14 +591,22 @@ def main():
             train_pairs = all_pairs[val_count:]
     if len(train_pairs) < args.batch:
         raise SystemExit(f"학습 페어 {len(train_pairs)}개가 batch {args.batch}보다 적음")
-    ds = PairImgs(args.data, args.size, args.aug, args.aug_level, train_pairs, aug_mix, args.seed)
-    val_ds = PairImgs(args.data, args.size, pairs=val_pairs, seed=args.seed) if val_pairs else None
+    use_face_masks = args.face_mask_weight > 1
+    ds = PairImgs(
+        args.data, args.size, args.aug, args.aug_level, train_pairs, aug_mix, args.seed,
+        load_masks=use_face_masks,
+    )
+    val_ds = (
+        PairImgs(args.data, args.size, pairs=val_pairs, seed=args.seed, load_masks=use_face_masks)
+        if val_pairs else None
+    )
     generator = torch.Generator().manual_seed(args.seed)
     loader = cycle(DataLoader(
         ds, args.batch, shuffle=True, num_workers=args.workers, drop_last=True,
         pin_memory=(dev == "cuda"), persistent_workers=(args.workers > 0), generator=generator,
     ))
-    print(f"[data] train={len(ds)} val={len(val_ds) if val_ds else 0} aug_mix={aug_mix}")
+    print(f"[data] train={len(ds)} val={len(val_ds) if val_ds else 0} "
+          f"aug_mix={aug_mix} face_mask_weight={args.face_mask_weight:g}")
 
     for name, pairs in (("train_stems.txt", train_pairs), ("val_stems.txt", val_pairs)):
         path = os.path.join(args.out, name)
@@ -560,8 +619,8 @@ def main():
     eval_ds = val_ds or ds
     ne = min(4, len(eval_ds))
     ev = [eval_ds[i] for i in range(ne)]
-    ev_in = torch.stack([a for a, _ in ev]).to(dev)
-    ev_tg = torch.stack([b for _, b in ev]).to(dev)
+    ev_in = torch.stack([item[0] for item in ev]).to(dev)
+    ev_tg = torch.stack([item[1] for item in ev]).to(dev)
 
     def save_eval(step):
         G.eval()
@@ -571,25 +630,36 @@ def main():
             save_image(grid, os.path.join(args.out, "samples", f"s{step:06d}.png"), nrow=ne)
             if val_ds is not None and args.val_n:
                 losses = []
+                face_losses = []
                 for begin in range(0, min(args.val_n, len(val_ds)), args.batch):
                     batch = [val_ds[i] for i in range(begin, min(begin + args.batch, len(val_ds), args.val_n))]
-                    va = torch.stack([a for a, _ in batch]).to(dev)
-                    vt = torch.stack([b for _, b in batch]).to(dev)
+                    va = torch.stack([item[0] for item in batch]).to(dev)
+                    vt = torch.stack([item[1] for item in batch]).to(dev)
                     vf = G(va).clamp(-1, 1)
                     losses.extend(F.l1_loss(vf, vt, reduction="none").mean((1, 2, 3)).cpu().tolist())
-                print(f"[val:{step}] n={len(losses)} l1={np.mean(losses):.4f}")
+                    if len(batch[0]) == 3:
+                        vm = torch.stack([item[2] for item in batch]).to(dev)
+                        face_error = ((vf - vt).abs() * vm).sum((1, 2, 3))
+                        face_norm = vm.sum((1, 2, 3)).clamp_min(1.0) * vf.shape[1]
+                        face_losses.extend((face_error / face_norm).cpu().tolist())
+                suffix = f" face_l1={np.mean(face_losses):.4f}" if face_losses else ""
+                print(f"[val:{step}] n={len(losses)} l1={np.mean(losses):.4f}{suffix}")
         G.train()
 
     for step in range(start_step + 1, args.steps + 1):
-        inp, tgt = next(loader)
+        train_batch = next(loader)
+        inp, tgt = train_batch[:2]
+        face_mask = train_batch[2] if len(train_batch) == 3 else None
         inp = inp.to(dev, non_blocking=True)
         tgt = tgt.to(dev, non_blocking=True)
+        if face_mask is not None:
+            face_mask = face_mask.to(dev, non_blocking=True)
         w_adv_eff = 0.0 if step <= args.init_steps else args.w_adv * min(1.0, (step - args.init_steps) / max(1, args.adv_ramp))
         if w_adv_eff > 0:
             dl = d_loss(inp, tgt); optD.zero_grad(); dl.backward(); optD.step()
         else:
             dl = torch.tensor(0.0)
-        fake, gl, parts = g_losses(inp, tgt, w_adv_eff); optG.zero_grad(); gl.backward(); optG.step()
+        fake, gl, parts = g_losses(inp, tgt, w_adv_eff, face_mask); optG.zero_grad(); gl.backward(); optG.step()
         if step % 100 == 0:
             print(f"[{step}/{args.steps}] wadv={w_adv_eff:.2f} D={float(dl):.3f} G={gl.item():.3f} "
                   f"l1={parts['l1']:.3f} perc={parts['perc']:.3f} adv={parts['adv']:.2f} id={parts['idl']:.3f}")
