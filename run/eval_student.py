@@ -74,6 +74,21 @@ def id_embed(m, x):
     return F.normalize(m(x), dim=1)
 
 
+
+
+def _pair_index(din, dtg, exts=(".png", ".jpg", ".jpeg", ".webp")):
+    """확장자를 무시하고 파일명(stem)으로 input↔target 매칭.
+    코퍼스에 따라 input=.jpg / target=.png 인 경우가 있어, 확장자 일치를 가정하면 0쌍이 된다."""
+    import glob as _g, os as _o
+    def _idx(d):
+        m = {}
+        for p in sorted(_g.glob(_o.path.join(d, "*"))):
+            if p.lower().endswith(exts):
+                m.setdefault(_o.path.splitext(_o.path.basename(p))[0], p)
+        return m
+    a, b = _idx(din), _idx(dtg)
+    return sorted(set(a) & set(b)), a, b
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", action="append", required=True, help="student_*.pt (반복 지정 가능)")
@@ -88,8 +103,7 @@ def main():
 
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     din, dtg = os.path.join(args.data, "input"), os.path.join(args.data, "target")
-    names = sorted(set(os.path.basename(p) for p in glob.glob(f"{din}/*.png"))
-                   & set(os.path.basename(p) for p in glob.glob(f"{dtg}/*.png")))
+    names, PIN, PTG = _pair_index(din, dtg)
     if not names:
         raise SystemExit(f"페어 없음: {args.data}")
     if len(names) > args.n:                      # 앞쪽만 쓰면 편향 → 균등 간격
@@ -111,8 +125,8 @@ def main():
         saved = []
         for i in range(0, len(names), args.batch):
             ch = names[i:i + args.batch]
-            a = torch.stack([load_img(os.path.join(din, n), args.size) for n in ch]).to(dev)
-            t = torch.stack([load_img(os.path.join(dtg, n), args.size) for n in ch]).to(dev)
+            a = torch.stack([load_img(PIN[n], args.size) for n in ch]).to(dev)
+            t = torch.stack([load_img(PTG[n], args.size) for n in ch]).to(dev)
             with torch.no_grad():
                 f = G(a).clamp(-1, 1)
                 if idm is not None:

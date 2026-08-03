@@ -256,12 +256,24 @@ def _degrade(img, level, rng, size):
 
 
 # ============ 데이터 (PAIRED: input↔target 같은 파일명) ============
+def _pair_index(din, dtg, exts=(".png", ".jpg", ".jpeg", ".webp")):
+    """확장자를 무시하고 파일명(stem)으로 input↔target 매칭.
+    코퍼스에 따라 input=.jpg / target=.png 인 경우가 있어, 확장자 일치를 가정하면 0쌍이 된다."""
+    import glob as _g, os as _o
+    def _idx(d):
+        m = {}
+        for p in sorted(_g.glob(_o.path.join(d, "*"))):
+            if p.lower().endswith(exts):
+                m.setdefault(_o.path.splitext(_o.path.basename(p))[0], p)
+        return m
+    a, b = _idx(din), _idx(dtg)
+    return sorted(set(a) & set(b)), a, b
+
+
 class PairImgs(Dataset):
     def __init__(self, root, size, aug=False, aug_level=0):
         din, dtg = os.path.join(root, "input"), os.path.join(root, "target")
-        namesin = {os.path.basename(p) for p in glob.glob(os.path.join(din, "*")) if p.lower().endswith(EXTS)}
-        namestg = {os.path.basename(p) for p in glob.glob(os.path.join(dtg, "*")) if p.lower().endswith(EXTS)}
-        self.names = sorted(namesin & namestg)          # 공통(정렬된) 페어만
+        self.names, self.pin, self.ptg = _pair_index(din, dtg, EXTS)   # 확장자 무시 stem 매칭
         if not self.names:
             raise SystemExit(f"페어 없음: {din} ∩ {dtg}")
         self.din, self.dtg, self.size = din, dtg, size
@@ -274,8 +286,8 @@ class PairImgs(Dataset):
 
     def __getitem__(self, i):
         n = self.names[i]
-        a = cv2.cvtColor(np.array(Image.open(os.path.join(self.din, n)).convert("RGB")), cv2.COLOR_RGB2BGR)
-        b = cv2.cvtColor(np.array(Image.open(os.path.join(self.dtg, n)).convert("RGB")), cv2.COLOR_RGB2BGR)
+        a = cv2.cvtColor(np.array(Image.open(self.pin[n]).convert("RGB")), cv2.COLOR_RGB2BGR)
+        b = cv2.cvtColor(np.array(Image.open(self.ptg[n]).convert("RGB")), cv2.COLOR_RGB2BGR)
         if a.shape[:2] != b.shape[:2]:                   # teacher 출력이 더 큰 경우 정렬
             b = cv2.resize(b, (a.shape[1], a.shape[0]), interpolation=cv2.INTER_AREA)
 

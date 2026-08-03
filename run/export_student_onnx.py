@@ -20,7 +20,11 @@ def main():
     ap.add_argument("--size", type=int, default=512, help="런타임 고정 입력 크기(기본 512)")
     args = ap.parse_args()
 
-    m = Generator().eval()
+    _sd = torch.load(args.ckpt, map_location="cpu")
+    _sd = _sd["G"] if isinstance(_sd, dict) and "G" in _sd else _sd
+    _ch = _sd["in_conv.1.weight"].shape[0]      # 체크포인트가 채널 수를 알고 있다
+    print(f"[export] ch={_ch} 자동 감지")
+    m = Generator(ch=_ch).eval()
     sd = torch.load(args.ckpt, map_location="cpu")
     sd = sd.get("G", sd) if isinstance(sd, dict) else sd    # {"G":...} 저장본 지원
     m.load_state_dict(sd)

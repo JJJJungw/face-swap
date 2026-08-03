@@ -88,6 +88,21 @@ def cv_of(v):
     return v.std() / v.mean() if len(v) and v.mean() else float("nan")
 
 
+
+
+def _pair_index(din, dtg, exts=(".png", ".jpg", ".jpeg", ".webp")):
+    """확장자를 무시하고 파일명(stem)으로 input↔target 매칭.
+    코퍼스에 따라 input=.jpg / target=.png 인 경우가 있어, 확장자 일치를 가정하면 0쌍이 된다."""
+    import glob as _g, os as _o
+    def _idx(d):
+        m = {}
+        for p in sorted(_g.glob(_o.path.join(d, "*"))):
+            if p.lower().endswith(exts):
+                m.setdefault(_o.path.splitext(_o.path.basename(p))[0], p)
+        return m
+    a, b = _idx(din), _idx(dtg)
+    return sorted(set(a) & set(b)), a, b
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dir", required=True, help="input/ 와 target/ 을 가진 페어 폴더")
@@ -104,22 +119,21 @@ def main():
 
     din = os.path.join(args.dir, "input")
     dtg = os.path.join(args.dir, "target")
-    names = sorted(set(os.path.basename(p) for p in glob.glob(os.path.join(din, "*.png")))
-                   & set(os.path.basename(p) for p in glob.glob(os.path.join(dtg, "*.png"))))
+    names, PIN, PTG = _pair_index(din, dtg)
     if not names:
         raise SystemExit(f"페어 없음: {din} ∩ {dtg}")
     print(f"[qc] {len(names)}쌍 스캔 중...")
 
     rows = []
     for i, n in enumerate(names):
-        a = cv2.imread(os.path.join(din, n))
-        b = cv2.imread(os.path.join(dtg, n))
+        a = cv2.imread(PIN[n])
+        b = cv2.imread(PTG[n])
         if a is None or b is None:
             print(f"  [경고] 읽기 실패: {n}")
             continue
         f = feats(b)
         cc, sh = align(a, b)
-        f.update(name=n, idx=int(os.path.splitext(n)[0].split("_")[-1]), ecc=cc, shift=sh)
+        f.update(name=n, idx=i, ecc=cc, shift=sh)   # 파일명이 pair_XXXXX 형식이 아닐 수 있어 순번 사용
         rows.append(f)
         if (i + 1) % 100 == 0:
             print(f"  {i+1}/{len(names)}")
@@ -181,8 +195,8 @@ def main():
         S, COLS = 200, 4
         tiles = []
         for r in worst[:args.n_worst]:
-            a = cv2.resize(cv2.imread(os.path.join(din, r["name"])), (S, S))
-            b = cv2.resize(cv2.imread(os.path.join(dtg, r["name"])), (S, S))
+            a = cv2.resize(cv2.imread(PIN[r["name"]]), (S, S))
+            b = cv2.resize(cv2.imread(PTG[r["name"]]), (S, S))
             t = np.hstack([a, b])
             cv2.rectangle(t, (0, 0), (t.shape[1], 22), (0, 0, 0), -1)
             cv2.putText(t, f"#{r['idx']} {r['reason']} ecc{r['ecc']:.2f}",

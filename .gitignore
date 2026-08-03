@@ -23,3 +23,19 @@ _ref_facedeid/
 # LoRA 학습(ai-toolkit clone·데이터셋)
 ai-toolkit/
 train/dataset/
+
+# 학습 산출물 (샘플 png 700MB+ — *.pt 만으로는 안 막힌다)
+train/s_*/
+train/student_*/
+train/*/samples/
+
+# TensorRT 엔진 캐시 (GPU별로 재생성됨, 125MB)
+**/trt_cache/
+gan_ckpt/*
+!gan_ckpt/model.py
+models/*
+
+# 백업·로그
+*.bak
+*.bak.*
+*.log
