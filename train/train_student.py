@@ -411,11 +411,15 @@ class PairImgs(Dataset):
         self.load_masks = load_masks
         self.localize_records = load_localize_manifest(localize_manifest)
         if localize_manifest:
-            missing = [pair.stem for pair in self.pairs if pair.stem not in self.localize_records]
-            if missing:
-                raise SystemExit(
-                    f"localize manifest is missing {len(missing)} selected pairs: {missing[:5]}"
-                )
+            # 검출 실패·패딩 초과 페어는 build_localface_pairs 가 의도적으로 제외한다.
+            # 매니페스트에 있는 것만 학습에 쓰고, 빠진 수는 기록만 남긴다.
+            kept = [pair for pair in self.pairs if pair.stem in self.localize_records]
+            dropped = len(self.pairs) - len(kept)
+            if not kept:
+                raise SystemExit(f"localize manifest matches no selected pair: {localize_manifest}")
+            if dropped:
+                print(f"[data] 매니페스트에 없는 {dropped}쌍 제외 → {len(kept)}쌍 사용")
+            self.pairs = kept
         self.mask_dir = os.path.join(root, "mask")
         if self.load_masks and not self.localize_records and not os.path.isdir(self.mask_dir):
             raise SystemExit(f"face mask directory missing: {self.mask_dir}")
