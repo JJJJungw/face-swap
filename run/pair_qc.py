@@ -18,18 +18,20 @@
 출력:
   - <dir>/qc.csv                모든 페어의 지표
   - <dir>/qc_worst.png          최악 N장 컨택트시트(육안 확인용)
-  - stdout                      코퍼스 통계 + pair_curate.py 에 그대로 붙일 --reject 문자열
+  - qc_reject.txt               불량 stem 목록(pair_curate.py 입력)
+  - stdout                      코퍼스 통계 + 안전한 큐레이션 명령
                                 + 제외했을 때 CV가 얼마나 개선되는지
 
 사용:
   python3 run/pair_qc.py --dir out/pairs_2511
-  # 결과의 reject 문자열을 확인 후:
-  python3 run/pair_curate.py --dir out/pairs_2511 --reject <문자열>          # 미리보기
-  python3 run/pair_curate.py --dir out/pairs_2511 --reject <문자열> --apply  # 실제 이동
+  # 결과의 컨택트시트와 reject 목록을 확인 후:
+  python3 run/pair_curate.py --dir out/pairs_2511 --reject-file out/pairs_2511/qc_reject.txt
+  python3 run/pair_curate.py --dir out/pairs_2511 --reject-file out/pairs_2511/qc_reject.txt --apply
 """
-import argparse, os, glob, csv
+import argparse, os, csv
 import numpy as np
 import cv2
+from pair_utils import discover_pairs
 
 R_FEAT = 512    # 지표 정규화 해상도(학생 학습 해상도와 맞춤)
 R_ECC = 256     # ECC는 반복법이라 비용이 큼 → 절반 해상도로
@@ -88,21 +90,6 @@ def cv_of(v):
     return v.std() / v.mean() if len(v) and v.mean() else float("nan")
 
 
-
-
-def _pair_index(din, dtg, exts=(".png", ".jpg", ".jpeg", ".webp")):
-    """확장자를 무시하고 파일명(stem)으로 input↔target 매칭.
-    코퍼스에 따라 input=.jpg / target=.png 인 경우가 있어, 확장자 일치를 가정하면 0쌍이 된다."""
-    import glob as _g, os as _o
-    def _idx(d):
-        m = {}
-        for p in sorted(_g.glob(_o.path.join(d, "*"))):
-            if p.lower().endswith(exts):
-                m.setdefault(_o.path.splitext(_o.path.basename(p))[0], p)
-        return m
-    a, b = _idx(din), _idx(dtg)
-    return sorted(set(a) & set(b)), a, b
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dir", required=True, help="input/ 와 target/ 을 가진 페어 폴더")
@@ -119,24 +106,28 @@ def main():
 
     din = os.path.join(args.dir, "input")
     dtg = os.path.join(args.dir, "target")
-    names, PIN, PTG = _pair_index(din, dtg)
-    if not names:
+    pairs = discover_pairs(din, dtg)
+    if not pairs:
         raise SystemExit(f"페어 없음: {din} ∩ {dtg}")
-    print(f"[qc] {len(names)}쌍 스캔 중...")
+    print(f"[qc] {len(pairs)}쌍 스캔 중...")
 
     rows = []
-    for i, n in enumerate(names):
-        a = cv2.imread(PIN[n])
-        b = cv2.imread(PTG[n])
+    pair_by_stem = {pair.stem: pair for pair in pairs}
+    for i, pair in enumerate(pairs):
+        a = cv2.imread(str(pair.input_path))
+        b = cv2.imread(str(pair.target_path))
         if a is None or b is None:
-            print(f"  [경고] 읽기 실패: {n}")
+            print(f"  [경고] 읽기 실패: {pair.stem}")
             continue
         f = feats(b)
         cc, sh = align(a, b)
-        f.update(name=n, idx=i, ecc=cc, shift=sh)   # 파일명이 pair_XXXXX 형식이 아닐 수 있어 순번 사용
+        f.update(name=pair.stem, ecc=cc, shift=sh)
         rows.append(f)
         if (i + 1) % 100 == 0:
-            print(f"  {i+1}/{len(names)}")
+            print(f"  {i+1}/{len(pairs)}")
+
+    if not rows:
+        raise SystemExit("읽을 수 있는 페어가 없음")
 
     KEYS = ["lap", "inner", "nc", "sat", "edge"]
     zs = {}
@@ -164,7 +155,7 @@ def main():
         r["reason"] = "+".join(x for x, c in [("ALIGN", ba), ("STYLE", bs)] if c) or ""
 
     with open(os.path.join(args.dir, "qc.csv"), "w", newline="") as fp:
-        w = csv.DictWriter(fp, fieldnames=["idx", "name", "ecc", "shift", "zmax", "reason"] + KEYS)
+        w = csv.DictWriter(fp, fieldnames=["name", "ecc", "shift", "zmax", "reason"] + KEYS)
         w.writeheader()
         for r in rows:
             w.writerow(r)
@@ -178,7 +169,7 @@ def main():
                    key=lambda r: (r["ecc"] if not np.isnan(r["ecc"]) else -1))
     if worst:
         print(f"\n  최악 10장: " + ", ".join(
-            f"{r['idx']}(ecc {r['ecc']:.2f},z {r['zmax']:.1f})" for r in worst[:10]))
+            f"{r['name']}(ecc {r['ecc']:.2f},z {r['zmax']:.1f})" for r in worst[:10]))
 
     # ── 제외 시 CV 개선 추정 ───────────────────────────────────────────────
     keep = [r for r, c in zip(rows, bad) if not c]
@@ -195,11 +186,12 @@ def main():
         S, COLS = 200, 4
         tiles = []
         for r in worst[:args.n_worst]:
-            a = cv2.resize(cv2.imread(PIN[r["name"]]), (S, S))
-            b = cv2.resize(cv2.imread(PTG[r["name"]]), (S, S))
+            pair = pair_by_stem[r["name"]]
+            a = cv2.resize(cv2.imread(str(pair.input_path)), (S, S))
+            b = cv2.resize(cv2.imread(str(pair.target_path)), (S, S))
             t = np.hstack([a, b])
             cv2.rectangle(t, (0, 0), (t.shape[1], 22), (0, 0, 0), -1)
-            cv2.putText(t, f"#{r['idx']} {r['reason']} ecc{r['ecc']:.2f}",
+            cv2.putText(t, f"{r['name'][-18:]} {r['reason']} ecc{r['ecc']:.2f}",
                         (4, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 1)
             tiles.append(t)
         while len(tiles) % COLS:
@@ -208,23 +200,19 @@ def main():
         cv2.imwrite(sheet, grid)
         print(f"\n컨택트시트 → {sheet}  (최악 {min(len(worst), args.n_worst)}장)")
 
-    # ── pair_curate.py 로 넘길 문자열 ──────────────────────────────────────
-    ids = sorted(r["idx"] for r, c in zip(rows, bad) if c)
-    if ids:
-        # 연속 구간은 a-b 로 압축
-        parts, s, prev = [], ids[0], ids[0]
-        for x in ids[1:] + [None]:
-            if x is not None and x == prev + 1:
-                prev = x; continue
-            parts.append(f"{s}-{prev}" if prev > s else f"{s}")
-            if x is not None:
-                s = prev = x
-        rej = ",".join(parts)
+    # ── pair_curate.py 로 넘길 stem 목록 ───────────────────────────────────
+    rejected_stems = sorted(r["name"] for r, c in zip(rows, bad) if c)
+    reject_file = os.path.join(args.dir, "qc_reject.txt")
+    if rejected_stems:
+        with open(reject_file, "w", encoding="utf-8") as handle:
+            handle.write("".join(f"{stem}\n" for stem in rejected_stems))
         print(f"\n=== 다음 명령 ===")
         print(f"  # 반드시 컨택트시트 먼저 확인할 것 (자동 판정은 참고용)")
-        print(f"  python3 run/pair_curate.py --dir {args.dir} --reject {rej}")
-        print(f"  python3 run/pair_curate.py --dir {args.dir} --reject {rej} --apply")
+        print(f"  python3 run/pair_curate.py --dir {args.dir} --reject-file {reject_file}")
+        print(f"  python3 run/pair_curate.py --dir {args.dir} --reject-file {reject_file} --apply")
     else:
+        if os.path.exists(reject_file):
+            os.remove(reject_file)
         print("\n불량 없음 — 큐레이션 불필요.")
 
 

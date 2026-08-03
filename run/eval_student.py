@@ -26,8 +26,9 @@
       --ckpt train/student_id05/student_final.pt \
       --ckpt train/student_id20/student_final.pt
 """
-import argparse, os, sys, glob, time
+import argparse, os, sys, time
 import numpy as np
+from pair_utils import discover_pairs
 
 try:
     import torch
@@ -72,30 +73,16 @@ def id_embed(m, x):
     """train_student.py 의 id_embed()와 동일 — 학습 중 id-loss가 본 값과 일치시켜야 비교가 성립"""
     x = F.interpolate(x, 160, mode="bilinear", align_corners=False)
     return F.normalize(m(x), dim=1)
-
-
-
-
-def _pair_index(din, dtg, exts=(".png", ".jpg", ".jpeg", ".webp")):
-    """확장자를 무시하고 파일명(stem)으로 input↔target 매칭.
-    코퍼스에 따라 input=.jpg / target=.png 인 경우가 있어, 확장자 일치를 가정하면 0쌍이 된다."""
-    import glob as _g, os as _o
-    def _idx(d):
-        m = {}
-        for p in sorted(_g.glob(_o.path.join(d, "*"))):
-            if p.lower().endswith(exts):
-                m.setdefault(_o.path.splitext(_o.path.basename(p))[0], p)
-        return m
-    a, b = _idx(din), _idx(dtg)
-    return sorted(set(a) & set(b)), a, b
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", action="append", required=True, help="student_*.pt (반복 지정 가능)")
     ap.add_argument("--data", required=True, help="input/ 와 target/ 을 가진 페어 폴더")
+    ap.add_argument("--include-file", default=None, dest="include_file",
+                    help="평가할 stem 목록(한 줄에 하나). train/validation 고정 평가용")
     ap.add_argument("--n", type=int, default=64, help="평가 표본 수")
     ap.add_argument("--size", type=int, default=512, help="학습 때 쓴 --size 와 동일해야 함")
-    ap.add_argument("--gen-ch", type=int, default=32, dest="gen_ch", help="학습 때 쓴 --gen-ch 와 동일")
+    ap.add_argument("--gen-ch", type=int, default=None, dest="gen_ch",
+                    help="생략하면 체크포인트에서 자동 감지")
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--sheet", default="out/eval_student.png")
     ap.add_argument("--bench", type=int, default=50, help="속도 측정 반복 횟수(0=건너뜀)")
@@ -103,12 +90,25 @@ def main():
 
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     din, dtg = os.path.join(args.data, "input"), os.path.join(args.data, "target")
-    names, PIN, PTG = _pair_index(din, dtg)
-    if not names:
+    pairs = discover_pairs(din, dtg)
+    if not pairs:
         raise SystemExit(f"페어 없음: {args.data}")
-    if len(names) > args.n:                      # 앞쪽만 쓰면 편향 → 균등 간격
-        names = names[::max(1, len(names) // args.n)][:args.n]
-    print(f"[eval] device={dev}  표본 {len(names)}쌍  size={args.size}")
+    if args.include_file:
+        with open(args.include_file, encoding="utf-8") as handle:
+            stems = [
+                line.strip() for line in handle
+                if line.strip() and not line.lstrip().startswith("#")
+            ]
+        pair_by_stem = {pair.stem: pair for pair in pairs}
+        missing = [stem for stem in stems if stem not in pair_by_stem]
+        if missing:
+            raise SystemExit(
+                f"--include-file의 {len(missing)}개 stem을 찾지 못함: {missing[:10]}"
+            )
+        pairs = [pair_by_stem[stem] for stem in stems]
+    if len(pairs) > args.n:                      # 앞쪽만 쓰면 편향 → 균등 간격
+        pairs = pairs[::max(1, len(pairs) // args.n)][:args.n]
+    print(f"[eval] device={dev}  표본 {len(pairs)}쌍  size={args.size} include={args.include_file}")
 
     idm = load_id(dev)
     rows = {}
@@ -116,17 +116,27 @@ def main():
 
     for ck in args.ckpt:
         tag = os.path.basename(os.path.dirname(ck)) or os.path.basename(ck)
-        G = Generator(args.gen_ch).to(dev).eval()
-        sd = torch.load(ck, map_location=dev)
-        missing = G.load_state_dict(sd["G"] if "G" in sd else sd, strict=True)
+        try:
+            sd = torch.load(ck, map_location=dev, weights_only=False)
+        except TypeError:
+            sd = torch.load(ck, map_location=dev)
+        weights = sd["G"] if "G" in sd else sd
+        detected_ch = int(weights["in_conv.1.weight"].shape[0])
+        if args.gen_ch is not None and args.gen_ch != detected_ch:
+            raise SystemExit(
+                f"--gen-ch {args.gen_ch} != checkpoint channel count {detected_ch}: {ck}"
+            )
+        G = Generator(detected_ch).to(dev).eval()
+        G.load_state_dict(weights, strict=True)
         print(f"\n[{tag}] {ck}  (step {sd.get('step','?')})")
+        print(f"[model] gen_ch={detected_ch}")
 
         cos, l1, perc_proxy = [], [], []
         saved = []
-        for i in range(0, len(names), args.batch):
-            ch = names[i:i + args.batch]
-            a = torch.stack([load_img(PIN[n], args.size) for n in ch]).to(dev)
-            t = torch.stack([load_img(PTG[n], args.size) for n in ch]).to(dev)
+        for i in range(0, len(pairs), args.batch):
+            ch = pairs[i:i + args.batch]
+            a = torch.stack([load_img(pair.input_path, args.size) for pair in ch]).to(dev)
+            t = torch.stack([load_img(pair.target_path, args.size) for pair in ch]).to(dev)
             with torch.no_grad():
                 f = G(a).clamp(-1, 1)
                 if idm is not None:

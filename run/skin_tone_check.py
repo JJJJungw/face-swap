@@ -28,9 +28,10 @@
   python3 -u run/skin_tone_check.py --dir out/pairs_2511            # 전수
   python3 -u run/skin_tone_check.py --dir out/pairs_2511 --n 3000   # 균등 표본
 """
-import argparse, os, glob, csv
+import argparse, os, csv
 import numpy as np
 import cv2
+from pair_utils import discover_pairs
 
 R = 256          # 측정용 축소 (피부톤은 저주파라 충분)
 REG = (0.40, 0.58, 0.38, 0.62)      # 볼 주변 (r0, r1, c0, c1)
@@ -78,30 +79,33 @@ def main():
     args = ap.parse_args()
 
     din, dtg = os.path.join(args.dir, "input"), os.path.join(args.dir, "target")
-    names = sorted(set(os.path.basename(p) for p in glob.glob(f"{din}/*.png"))
-                   & set(os.path.basename(p) for p in glob.glob(f"{dtg}/*.png")))
-    if not names:
+    pairs = discover_pairs(din, dtg)
+    if not pairs:
         raise SystemExit(f"페어 없음: {args.dir}")
-    if args.n > 0 and len(names) > args.n:
-        names = names[::max(1, len(names) // args.n)][:args.n]
-    print(f"[skin] {len(names)}쌍 측정 중... (영역 {REG}, 백분위 {PCT})")
+    if args.n > 0 and len(pairs) > args.n:
+        pairs = pairs[::max(1, len(pairs) // args.n)][:args.n]
+    print(f"[skin] {len(pairs)}쌍 측정 중... (영역 {REG}, 백분위 {PCT})")
 
     rows = []
-    for i, n in enumerate(names):
-        a, b = cv2.imread(os.path.join(din, n)), cv2.imread(os.path.join(dtg, n))
+    for i, pair in enumerate(pairs):
+        a = cv2.imread(str(pair.input_path))
+        b = cv2.imread(str(pair.target_path))
         if a is None or b is None:
             continue
         La, Aa, Ba = lab_stats(a)
         Lt, At, Bt = lab_stats(b)
         ia, it = ita_of(La, Ba), ita_of(Lt, Bt)
-        rows.append(dict(name=n, idx=int(os.path.splitext(n)[0].split("_")[-1]),
+        rows.append(dict(name=pair.stem,
                          L_in=La, a_in=Aa, b_in=Ba, L_tg=Lt, a_tg=At, b_tg=Bt,
                          d_L=Lt - La, d_a=At - Aa, d_b=Bt - Ba,
                          ita_in=ia if ia is not None else "",
                          ita_tg=it if it is not None else "",
                          d_ita=(it - ia) if (ia is not None and it is not None) else ""))
         if (i + 1) % 1000 == 0:
-            print(f"  {i+1}/{len(names)}")
+            print(f"  {i+1}/{len(pairs)}")
+
+    if not rows:
+        raise SystemExit("읽을 수 있는 페어가 없음")
 
     with open(os.path.join(args.dir, "skin_tone.csv"), "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
@@ -154,7 +158,7 @@ def main():
     bad = sorted([r for r in ok if r["d_ita"] > args.flag], key=lambda r: -r["d_ita"])
     print(f"\n=== ΔITA > {args.flag} (크게 밝아진 페어) {len(bad)}장 / {len(ok)} ===")
     for r in bad[:15]:
-        print(f"  #{r['idx']:<6} ITA {r['ita_in']:+6.1f} → {r['ita_tg']:+6.1f}  (Δ {r['d_ita']:+.1f})"
+        print(f"  {r['name']:<36} ITA {r['ita_in']:+6.1f} → {r['ita_tg']:+6.1f}  (Δ {r['d_ita']:+.1f})"
               f"   L* {r['L_in']:.0f}→{r['L_tg']:.0f}")
 
     try:

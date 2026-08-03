@@ -20,21 +20,21 @@
   python train/train_student.py --data out/pairs_dataset --out train/student_paired \
     --size 256 --batch 8 --init-steps 1500 --steps 40000 --id-loss 0
 """
-import os, argparse, glob
+import os, argparse, sys, random
 import cv2
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import Adam
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, get_worker_info
 from torch.nn.utils import spectral_norm
 from torchvision import transforms, models
 from torchvision.utils import save_image
 from PIL import Image
 
-EXTS = (".png", ".jpg", ".jpeg", ".webp")
-
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "run"))
+from pair_utils import discover_pairs
 
 # ============ Generator (animegan2-pytorch 구조 재구현, MIT 귀속 — 런타임 호환) ============
 class ConvNormLReLU(nn.Sequential):
@@ -134,11 +134,13 @@ class Discriminator(nn.Module):
 class VGGPerceptual(nn.Module):
     LAYERS = (3, 8, 17, 26)
 
-    def __init__(self):
+    def __init__(self, allow_random=False):
         super().__init__()
         try:
             v = models.vgg19(weights=models.VGG19_Weights.IMAGENET1K_V1)
         except Exception as e:
+            if not allow_random:
+                raise RuntimeError(f"VGG19 pretrained weights are required: {e}") from e
             print(f"[vgg] 가중치 다운로드 실패 → 랜덤init(스모크용): {e}")
             v = models.vgg19(weights=None)
         self.v = v.features[:27].eval()
@@ -255,48 +257,60 @@ def _degrade(img, level, rng, size):
     return img
 
 
-# ============ 데이터 (PAIRED: input↔target 같은 파일명) ============
-def _pair_index(din, dtg, exts=(".png", ".jpg", ".jpeg", ".webp")):
-    """확장자를 무시하고 파일명(stem)으로 input↔target 매칭.
-    코퍼스에 따라 input=.jpg / target=.png 인 경우가 있어, 확장자 일치를 가정하면 0쌍이 된다."""
-    import glob as _g, os as _o
-    def _idx(d):
-        m = {}
-        for p in sorted(_g.glob(_o.path.join(d, "*"))):
-            if p.lower().endswith(exts):
-                m.setdefault(_o.path.splitext(_o.path.basename(p))[0], p)
-        return m
-    a, b = _idx(din), _idx(dtg)
-    return sorted(set(a) & set(b)), a, b
+# ============ 데이터 (PAIRED: input↔target 같은 stem) ============
+def parse_aug_mix(value):
+    if not value:
+        return None
+    mix = []
+    for item in value.split(","):
+        level_text, weight_text = item.split(":", 1)
+        level, weight = int(level_text), float(weight_text)
+        if level not in (0, 1, 2, 3) or weight < 0:
+            raise ValueError(f"invalid augmentation mix item: {item}")
+        mix.append((level, weight))
+    total = sum(weight for _, weight in mix)
+    if total <= 0:
+        raise ValueError("augmentation mix weights must sum to a positive value")
+    return [(level, weight / total) for level, weight in mix]
 
 
 class PairImgs(Dataset):
-    def __init__(self, root, size, aug=False, aug_level=0):
+    def __init__(self, root, size, aug=False, aug_level=0, pairs=None, aug_mix=None, seed=0):
         din, dtg = os.path.join(root, "input"), os.path.join(root, "target")
-        self.names, self.pin, self.ptg = _pair_index(din, dtg, EXTS)   # 확장자 무시 stem 매칭
-        if not self.names:
+        self.pairs = list(pairs) if pairs is not None else discover_pairs(din, dtg)
+        if not self.pairs:
             raise SystemExit(f"페어 없음: {din} ∩ {dtg}")
         self.din, self.dtg, self.size = din, dtg, size
         # 구 --aug 플래그 호환: 켜져 있고 --aug-level 미지정이면 1
         self.level = aug_level if aug_level > 0 else (1 if aug else 0)
-        self.rng = np.random.default_rng()
+        self.aug_mix = aug_mix
+        self.seed = seed
+        self.rng = None
 
     def __len__(self):
-        return len(self.names)
+        return len(self.pairs)
 
     def __getitem__(self, i):
-        n = self.names[i]
-        a = cv2.cvtColor(np.array(Image.open(self.pin[n]).convert("RGB")), cv2.COLOR_RGB2BGR)
-        b = cv2.cvtColor(np.array(Image.open(self.ptg[n]).convert("RGB")), cv2.COLOR_RGB2BGR)
+        pair = self.pairs[i]
+        a = cv2.cvtColor(np.array(Image.open(pair.input_path).convert("RGB")), cv2.COLOR_RGB2BGR)
+        b = cv2.cvtColor(np.array(Image.open(pair.target_path).convert("RGB")), cv2.COLOR_RGB2BGR)
         if a.shape[:2] != b.shape[:2]:                   # teacher 출력이 더 큰 경우 정렬
             b = cv2.resize(b, (a.shape[1], a.shape[0]), interpolation=cv2.INTER_AREA)
 
+        if self.rng is None:
+            worker = get_worker_info()
+            worker_seed = worker.seed if worker is not None else self.seed
+            self.rng = np.random.default_rng(worker_seed)
         rng = self.rng
-        if self.level >= 1:
+        level = self.level
+        if self.aug_mix:
+            levels, weights = zip(*self.aug_mix)
+            level = int(rng.choice(levels, p=weights))
+        if level >= 1:
             # ── 기하: input·target 동일 적용 (정합 유지) ────────────────
             if rng.random() < 0.5:
                 a, b = a[:, ::-1], b[:, ::-1]
-            if self.level >= 2 and rng.random() < 0.7:
+            if level >= 2 and rng.random() < 0.7:
                 # 런타임은 expand 0.15 박스를 종횡비 무시하고 정사각으로 눌러 넣는다.
                 # → 타이트 크롭 + 종횡비 왜곡 재현. 반드시 양쪽에 같이.
                 H, W = a.shape[:2]
@@ -309,8 +323,8 @@ class PairImgs(Dataset):
         a = cv2.resize(np.ascontiguousarray(a), (self.size, self.size), interpolation=cv2.INTER_AREA)
         b = cv2.resize(np.ascontiguousarray(b), (self.size, self.size), interpolation=cv2.INTER_AREA)
 
-        if self.level >= 1:
-            a = _degrade(a, self.level, rng, self.size)             # ★ input에만
+        if level >= 1:
+            a = _degrade(a, level, rng, self.size)             # ★ input에만
 
         ta = torch.from_numpy(cv2.cvtColor(a, cv2.COLOR_BGR2RGB).copy()).permute(2, 0, 1).float() / 127.5 - 1
         tb = torch.from_numpy(cv2.cvtColor(b, cv2.COLOR_BGR2RGB).copy()).permute(2, 0, 1).float() / 127.5 - 1
@@ -352,16 +366,112 @@ def main():
     ap.add_argument("--sample-every", type=int, default=500, dest="sample_every")
     ap.add_argument("--ckpt-every", type=int, default=5000, dest="ckpt_every")
     ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--split-seed", type=int, default=0, dest="split_seed")
+    ap.add_argument("--val-ratio", type=float, default=0.05, dest="val_ratio",
+                    help="고정 validation 분할 비율(0=분할 안 함)")
+    ap.add_argument("--val-n", type=int, default=64, dest="val_n",
+                    help="샘플 저장 시 validation L1을 계산할 최대 페어 수")
+    ap.add_argument("--aug-mix", default=None, dest="aug_mix",
+                    help="샘플별 증강 혼합. 예: 0:0.7,1:0.2,2:0.1")
+    ap.add_argument("--overfit-n", type=int, default=0, dest="overfit_n",
+                    help="진단용으로 앞 N개 페어만 사용하고 validation/증강을 끔")
+    ap.add_argument("--resume", nargs="?", const="auto", default=None,
+                    help="full checkpoint에서 재시작. 경로 생략 시 <out>/checkpoint_latest.pt")
     ap.add_argument("--smoke", action="store_true")
     args = ap.parse_args()
+
+    if not 0 <= args.val_ratio < 1:
+        ap.error("--val-ratio must be in [0, 1)")
+    if args.overfit_n < 0:
+        ap.error("--overfit-n must be non-negative")
+    if args.val_n < 0:
+        ap.error("--val-n must be non-negative")
+    try:
+        aug_mix = parse_aug_mix(args.aug_mix)
+    except (ValueError, TypeError) as exc:
+        ap.error(str(exc))
+    if aug_mix and (args.aug or args.aug_level):
+        ap.error("--aug-mix cannot be combined with --aug/--aug-level")
+    if args.overfit_n and (aug_mix or args.aug or args.aug_level):
+        ap.error("--overfit-n requires clean inputs; do not pass augmentation options")
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
 
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     G = Generator(args.gen_ch).to(dev)
     D = Discriminator(args.d_ch, args.d_n).to(dev)
-    vgg = VGGPerceptual().to(dev)
+    vgg = VGGPerceptual(allow_random=args.smoke).to(dev)
     idm = load_id(dev) if args.id_loss > 0 else None
     optG = Adam(G.parameters(), args.lr, betas=(0.5, 0.999))
     optD = Adam(D.parameters(), args.lr, betas=(0.5, 0.999))
+    start_step = 0
+    resume_state = None
+
+    def checkpoint_state(step):
+        numpy_state = np.random.get_state()
+        return {
+            "G": G.state_dict(),
+            "D": D.state_dict(),
+            "optG": optG.state_dict(),
+            "optD": optD.state_dict(),
+            "step": step,
+            "args": vars(args),
+            "torch_rng": torch.get_rng_state(),
+            "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            "python_rng": random.getstate(),
+            "split": {
+                "train": [pair.stem for pair in train_pairs],
+                "val": [pair.stem for pair in val_pairs],
+            },
+            "numpy_rng": (
+                numpy_state[0], numpy_state[1].tolist(), numpy_state[2],
+                numpy_state[3], numpy_state[4],
+            ),
+        }
+
+    def save_checkpoint(path, step):
+        path = os.path.abspath(path)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        temporary = path + ".tmp"
+        torch.save(checkpoint_state(step), temporary)
+        os.replace(temporary, path)
+
+    if args.resume:
+        resume_path = (
+            os.path.join(args.out, "checkpoint_latest.pt")
+            if args.resume == "auto" else args.resume
+        )
+        try:
+            state = torch.load(resume_path, map_location=dev, weights_only=False)
+        except TypeError:
+            state = torch.load(resume_path, map_location=dev)
+        saved_args = state.get("args", {})
+        if saved_args.get("gen_ch", args.gen_ch) != args.gen_ch:
+            raise SystemExit("--gen-ch does not match resume checkpoint")
+        G.load_state_dict(state["G"], strict=True)
+        D.load_state_dict(state["D"], strict=True)
+        optG.load_state_dict(state["optG"])
+        optD.load_state_dict(state["optD"])
+        start_step = int(state["step"])
+        resume_state = state
+        if "torch_rng" in state:
+            torch.set_rng_state(state["torch_rng"].cpu())
+        if torch.cuda.is_available() and state.get("cuda_rng") is not None:
+            torch.cuda.set_rng_state_all(state["cuda_rng"])
+        if "python_rng" in state:
+            random.setstate(state["python_rng"])
+        if "numpy_rng" in state:
+            numpy_state = state["numpy_rng"]
+            np.random.set_state((
+                numpy_state[0], np.asarray(numpy_state[1], dtype=np.uint32),
+                numpy_state[2], numpy_state[3], numpy_state[4],
+            ))
+        print(f"[resume] {resume_path} step={start_step}")
 
     def g_losses(inp, tgt, w_adv_eff):
         fake = G(inp)
@@ -399,13 +509,57 @@ def main():
         return
 
     os.makedirs(os.path.join(args.out, "samples"), exist_ok=True)
-    ds = PairImgs(args.data, args.size, args.aug, args.aug_level)
-    loader = cycle(DataLoader(ds, args.batch, shuffle=True, num_workers=args.workers, drop_last=True))
-    print(f"[data] 페어 {len(ds)}쌍  (input↔target 정렬)")
+    all_pairs = discover_pairs(os.path.join(args.data, "input"), os.path.join(args.data, "target"))
+    pair_by_stem = {pair.stem: pair for pair in all_pairs}
+    saved_split = resume_state.get("split") if resume_state else None
+    if saved_split:
+        missing = [
+            stem for stem in saved_split["train"] + saved_split["val"]
+            if stem not in pair_by_stem
+        ]
+        if missing:
+            raise SystemExit(
+                f"resume split에서 {len(missing)}개 페어를 찾지 못함: {missing[:5]}"
+            )
+        train_pairs = [pair_by_stem[stem] for stem in saved_split["train"]]
+        val_pairs = [pair_by_stem[stem] for stem in saved_split["val"]]
+        print("[split] checkpoint에 저장된 train/validation 분할 복구")
+    else:
+        split_rng = random.Random(args.split_seed)
+        split_rng.shuffle(all_pairs)
+        if args.overfit_n:
+            train_pairs = all_pairs[:args.overfit_n]
+            val_pairs = []
+            print(f"[overfit] clean diagnostic subset={len(train_pairs)}")
+        else:
+            val_count = (
+                min(len(all_pairs) - 1, max(1, round(len(all_pairs) * args.val_ratio)))
+                if args.val_ratio and len(all_pairs) > 1 else 0
+            )
+            val_pairs = all_pairs[:val_count]
+            train_pairs = all_pairs[val_count:]
+    if len(train_pairs) < args.batch:
+        raise SystemExit(f"학습 페어 {len(train_pairs)}개가 batch {args.batch}보다 적음")
+    ds = PairImgs(args.data, args.size, args.aug, args.aug_level, train_pairs, aug_mix, args.seed)
+    val_ds = PairImgs(args.data, args.size, pairs=val_pairs, seed=args.seed) if val_pairs else None
+    generator = torch.Generator().manual_seed(args.seed)
+    loader = cycle(DataLoader(
+        ds, args.batch, shuffle=True, num_workers=args.workers, drop_last=True,
+        pin_memory=(dev == "cuda"), persistent_workers=(args.workers > 0), generator=generator,
+    ))
+    print(f"[data] train={len(ds)} val={len(val_ds) if val_ds else 0} aug_mix={aug_mix}")
+
+    for name, pairs in (("train_stems.txt", train_pairs), ("val_stems.txt", val_pairs)):
+        path = os.path.join(args.out, name)
+        temporary = path + ".tmp"
+        with open(temporary, "w", encoding="utf-8") as handle:
+            handle.write("".join(f"{pair.stem}\n" for pair in pairs))
+        os.replace(temporary, path)
 
     # 고정 평가셋 4쌍(진행 추적)
-    ne = min(4, len(ds))
-    ev = [ds[i] for i in range(ne)]
+    eval_ds = val_ds or ds
+    ne = min(4, len(eval_ds))
+    ev = [eval_ds[i] for i in range(ne)]
     ev_in = torch.stack([a for a, _ in ev]).to(dev)
     ev_tg = torch.stack([b for _, b in ev]).to(dev)
 
@@ -413,13 +567,23 @@ def main():
         G.eval()
         with torch.no_grad():
             fk = G(ev_in).clamp(-1, 1)
-        grid = torch.cat([ev_in, fk, ev_tg], 0) * 0.5 + 0.5   # 입력 / 학생출력 / 정답target
-        save_image(grid, os.path.join(args.out, "samples", f"s{step:06d}.png"), nrow=ne)
+            grid = torch.cat([ev_in, fk, ev_tg], 0) * 0.5 + 0.5   # 입력 / 학생출력 / 정답target
+            save_image(grid, os.path.join(args.out, "samples", f"s{step:06d}.png"), nrow=ne)
+            if val_ds is not None and args.val_n:
+                losses = []
+                for begin in range(0, min(args.val_n, len(val_ds)), args.batch):
+                    batch = [val_ds[i] for i in range(begin, min(begin + args.batch, len(val_ds), args.val_n))]
+                    va = torch.stack([a for a, _ in batch]).to(dev)
+                    vt = torch.stack([b for _, b in batch]).to(dev)
+                    vf = G(va).clamp(-1, 1)
+                    losses.extend(F.l1_loss(vf, vt, reduction="none").mean((1, 2, 3)).cpu().tolist())
+                print(f"[val:{step}] n={len(losses)} l1={np.mean(losses):.4f}")
         G.train()
 
-    for step in range(1, args.steps + 1):
+    for step in range(start_step + 1, args.steps + 1):
         inp, tgt = next(loader)
-        inp, tgt = inp.to(dev), tgt.to(dev)
+        inp = inp.to(dev, non_blocking=True)
+        tgt = tgt.to(dev, non_blocking=True)
         w_adv_eff = 0.0 if step <= args.init_steps else args.w_adv * min(1.0, (step - args.init_steps) / max(1, args.adv_ramp))
         if w_adv_eff > 0:
             dl = d_loss(inp, tgt); optD.zero_grad(); dl.backward(); optD.step()
@@ -432,8 +596,10 @@ def main():
         if step % args.sample_every == 0:
             save_eval(step)
         if step % args.ckpt_every == 0:
-            torch.save({"G": G.state_dict(), "step": step}, os.path.join(args.out, f"student_{step:06d}.pt"))
-    torch.save({"G": G.state_dict(), "step": args.steps}, os.path.join(args.out, "student_final.pt"))
+            save_checkpoint(os.path.join(args.out, f"student_{step:06d}.pt"), step)
+            save_checkpoint(os.path.join(args.out, "checkpoint_latest.pt"), step)
+    save_checkpoint(os.path.join(args.out, "student_final.pt"), args.steps)
+    save_checkpoint(os.path.join(args.out, "checkpoint_latest.pt"), args.steps)
     print(f"완료 → {args.out}/student_final.pt")
 
 

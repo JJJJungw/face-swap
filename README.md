@@ -412,13 +412,14 @@ python3 -u run/qwen2511_pairgen.py --input input/sfhq_t2i/images/images \
 
 # QC → 큐레이션
 python3 -u run/pair_qc.py --dir out/pairs_XXX
-python3 run/pair_curate.py --dir out/pairs_XXX --reject <문자열> --apply
+python3 run/pair_curate.py --dir out/pairs_XXX \
+  --reject-file out/pairs_XXX/qc_reject.txt --apply
 
 # 학습 → 평가
 python3 -u train/train_student.py --data out/pairs_XXX --out train/sX \
   --size 512 --batch 8 --steps 15000 --gen-ch 48 --aug-level 0 \
   --w-l1 3.0 --w-perc 2.0 --w-adv 1.0 --init-steps 2000 --adv-ramp 4000 --ckpt-every 2000
-python3 -u run/eval_student.py --data out/pairs_XXX --n 64 --size 512 --gen-ch 48 \
+python3 -u run/eval_student.py --data out/pairs_XXX --n 64 --size 512 \
   --ckpt train/sX/student_final.pt
 ```
 
@@ -434,7 +435,7 @@ python3 -u run/eval_student.py --data out/pairs_XXX --n 64 --size 512 --gen-ch 4
 | `qwen2511_pairgen.py` | **teacher** — 2511 + Anime LoRA. `--variant`(1회 로드 다중 프롬프트) · `--every` · `--resume` · manifest 기반 중복 방지 |
 | `qwen_pairgen.py` | teacher(구) — 2509 + autoweeb LoRA. 재현용 보존 |
 | `ab_2511.sh` | 화풍×프롬프트 교차 A/B |
-| `pair_qc.py` | 페어 자동 QC — 정합(ECC)·화풍이탈(robust z) → 컨택트시트 + reject 문자열 |
+| `pair_qc.py` | 페어 자동 QC — 정합(ECC)·화풍이탈(robust z) → 컨택트시트 + reject stem 목록 |
 | `pair_curate.py` | 불량 페어를 input/target 동시에 `rejected/`로 이동 |
 | `measure_id.py` | **신원 잔존도** cos(input, target) |
 | `skin_tone_check.py` | 피부톤 편향 전수 측정(ITA) |

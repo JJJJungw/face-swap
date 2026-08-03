@@ -46,13 +46,16 @@ python3 run/pair_qc.py --dir out/pairs_2511      # 11,000쌍이면 15~25분
 출력물:
 - `out/pairs_2511/qc.csv` — 전 페어 지표
 - `out/pairs_2511/qc_worst.png` — **불량 의심 24장 컨택트시트**
-- stdout — `--reject` 문자열 + 제외 시 CV 개선 추정
+- `out/pairs_2511/qc_reject.txt` — 불량 의심 stem 목록
+- stdout — 안전한 큐레이션 명령 + 제외 시 CV 개선 추정
 
 **반드시 컨택트시트를 눈으로 확인한 뒤** 제외한다(자동 판정은 참고용):
 
 ```bash
-python3 run/pair_curate.py --dir out/pairs_2511 --reject <문자열>          # 미리보기
-python3 run/pair_curate.py --dir out/pairs_2511 --reject <문자열> --apply  # rejected/ 로 이동
+python3 run/pair_curate.py --dir out/pairs_2511 \
+  --reject-file out/pairs_2511/qc_reject.txt          # 미리보기
+python3 run/pair_curate.py --dir out/pairs_2511 \
+  --reject-file out/pairs_2511/qc_reject.txt --apply  # rejected/ 로 이동
 ```
 
 **기준선(1,000쌍 시점):** ECC 중앙값 0.933 · 불량률 1.5% · CV 평균 0.248
@@ -94,12 +97,36 @@ print(f'페어 {len(ds)}쌍 | aug_level=3 정상')
 "
 ```
 
-**⚠️ `[vgg] 가중치 다운로드 실패` 가 뜨면 즉시 중단.**
-랜덤 init으로 조용히 넘어가서 40,000스텝을 통째로 날린다.
+일반 학습에서 VGG19 pretrained 가중치를 불러오지 못하면 이제 즉시 오류로 중단된다.
+랜덤 VGG 허용은 `--smoke`에만 한정된다.
 
 ---
 
-## 4. 본 학습 — 1차는 반드시 `--id-loss 0`
+## 4. 32장 overfit 진단
+
+본 학습 전에 학생 구조가 teacher를 실제로 외울 수 있는지 확인한다. 이 테스트에서도
+2행이 3행에 거의 붙지 않으면 데이터 양이나 학습 시간이 아니라 generator/손실의 한계다.
+
+```bash
+python3 -u train/train_student.py --data out/pairs_2511 \
+  --out train/overfit32 --size 512 --batch 8 --steps 5000 --gen-ch 48 \
+  --overfit-n 32 --val-ratio 0 --workers 4 \
+  --w-l1 3.0 --w-perc 2.0 --w-adv 0 --id-loss 0 \
+  --sample-every 250 --ckpt-every 1000 \
+  2>&1 | tee out/train_overfit32.log
+```
+
+판정은 `train/overfit32/samples/s005000.png`와 아래 평가의 화풍 L1이다.
+
+```bash
+python3 run/eval_student.py --data out/pairs_2511 --n 32 --size 512 \
+  --include-file train/overfit32/train_stems.txt \
+  --ckpt train/overfit32/student_final.pt --sheet out/eval_overfit32.png
+```
+
+---
+
+## 5. 본 학습 — 1차는 반드시 `--id-loss 0`
 
 **왜 0인가:** 화풍 재현과 신원 제거를 동시에 켜면 결과가 나빠도 원인을 구분할 수 없다.
 먼저 "이 그림체를 1.36M 학생이 낼 수 있는가"만 본다.
@@ -110,7 +137,7 @@ cd ~/face-swap && source .venv/bin/activate
 
 python3 train/train_student.py --data out/pairs_2511 \
   --out train/s_aug3 --size 512 --batch 8 --steps 40000 \
-  --aug-level 3 \
+  --aug-mix 0:0.60,1:0.20,2:0.15,3:0.05 \
   --w-l1 3.0 --w-perc 2.0 --w-adv 1.0 --init-steps 2000 --adv-ramp 4000 \
   --id-loss 0 \
   2>&1 | tee out/train_aug3.log
@@ -131,10 +158,15 @@ python3 train/train_student.py --data out/pairs_2511 \
 샘플은 500스텝마다 `train/s_aug3/samples/s0*.png`.
 **행 순서: 1행=입력 / 2행=학생 출력 / 3행=teacher 정답.**
 `s005000` 즈음에 2행이 3행 쪽으로 가고 있는지 확인 — 1행(사진)에 머물러 있으면 일찍 끊는다.
+`[val:STEP] l1=...`도 함께 내려가야 한다. 분할은 `train_stems.txt`와
+`val_stems.txt`에 기록되며 체크포인트에도 저장된다.
+
+중단 후에는 같은 명령 끝에 `--resume`만 추가한다. 모델, 판별자, optimizer,
+step, RNG, train/validation 분할을 모두 복구한다.
 
 ---
 
-## 5. 학생 평가
+## 6. 학생 평가
 
 ```bash
 python3 run/eval_student.py --data out/pairs_2511 --n 64 --size 512 \
@@ -154,7 +186,7 @@ python3 run/eval_student.py --data out/pairs_2511 --n 64 --size 512 \
 
 ---
 
-## 6. id-loss 스윕
+## 7. id-loss 스윕
 
 화풍 재현이 확인된 뒤에만. teacher cos 0.80에서 출발하므로 밀어야 할 거리가 멀다.
 
@@ -179,7 +211,7 @@ id-loss는 content-loss와 정면으로 싸우므로 "충분히 낮추는 최소
 
 ---
 
-## 7. 런타임 반영
+## 8. 런타임 반영
 
 ```bash
 python3 run/export_student_onnx.py --ckpt <최적ckpt> --out gan_ckpt/student.onnx

@@ -20,14 +20,15 @@ def main():
     ap.add_argument("--size", type=int, default=512, help="런타임 고정 입력 크기(기본 512)")
     args = ap.parse_args()
 
-    _sd = torch.load(args.ckpt, map_location="cpu")
-    _sd = _sd["G"] if isinstance(_sd, dict) and "G" in _sd else _sd
-    _ch = _sd["in_conv.1.weight"].shape[0]      # 체크포인트가 채널 수를 알고 있다
+    try:
+        checkpoint = torch.load(args.ckpt, map_location="cpu", weights_only=False)
+    except TypeError:
+        checkpoint = torch.load(args.ckpt, map_location="cpu")
+    weights = checkpoint["G"] if isinstance(checkpoint, dict) and "G" in checkpoint else checkpoint
+    _ch = weights["in_conv.1.weight"].shape[0]      # 체크포인트가 채널 수를 알고 있다
     print(f"[export] ch={_ch} 자동 감지")
     m = Generator(ch=_ch).eval()
-    sd = torch.load(args.ckpt, map_location="cpu")
-    sd = sd.get("G", sd) if isinstance(sd, dict) else sd    # {"G":...} 저장본 지원
-    m.load_state_dict(sd)
+    m.load_state_dict(weights)
     print(f"[load] {args.ckpt}  (params={sum(p.numel() for p in m.parameters())/1e6:.2f}M)")
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)

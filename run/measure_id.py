@@ -37,8 +37,9 @@
   # 여러 코퍼스 비교
   python3 run/measure_id.py --dir out/pairs_2511 --dir out/pairs_fp3 --n 100
 """
-import argparse, os, glob
+import argparse, os
 import numpy as np
+from pair_utils import discover_pairs
 
 try:
     import torch
@@ -73,21 +74,6 @@ def load(p, size=256):
     return transforms.functional.to_tensor(im) * 2 - 1
 
 
-
-
-def _pair_index(din, dtg, exts=(".png", ".jpg", ".jpeg", ".webp")):
-    """확장자를 무시하고 파일명(stem)으로 input↔target 매칭.
-    코퍼스에 따라 input=.jpg / target=.png 인 경우가 있어, 확장자 일치를 가정하면 0쌍이 된다."""
-    import glob as _g, os as _o
-    def _idx(d):
-        m = {}
-        for p in sorted(_g.glob(_o.path.join(d, "*"))):
-            if p.lower().endswith(exts):
-                m.setdefault(_o.path.splitext(_o.path.basename(p))[0], p)
-        return m
-    a, b = _idx(din), _idx(dtg)
-    return sorted(set(a) & set(b)), a, b
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dir", action="append", required=True, help="페어 폴더(반복 지정 가능)")
@@ -103,18 +89,18 @@ def main():
     results = {}
     for d in args.dir:
         din, dtg = os.path.join(d, "input"), os.path.join(d, "target")
-        names, PIN, PTG = _pair_index(din, dtg)
-        if not names:
+        pairs = discover_pairs(din, dtg)
+        if not pairs:
             print(f"  [건너뜀] 페어 없음: {d}")
             continue
-        if args.n > 0 and len(names) > args.n:      # 앞쪽만 쓰면 편향 → 균등 간격
-            names = names[::max(1, len(names) // args.n)][:args.n]
+        if args.n > 0 and len(pairs) > args.n:      # 앞쪽만 쓰면 편향 → 균등 간격
+            pairs = pairs[::max(1, len(pairs) // args.n)][:args.n]
 
         cos = []
-        for i in range(0, len(names), args.batch):
-            chunk = names[i:i + args.batch]
-            a = torch.stack([load(PIN[n]) for n in chunk]).to(dev)
-            b = torch.stack([load(PTG[n]) for n in chunk]).to(dev)
+        for i in range(0, len(pairs), args.batch):
+            chunk = pairs[i:i + args.batch]
+            a = torch.stack([load(pair.input_path) for pair in chunk]).to(dev)
+            b = torch.stack([load(pair.target_path) for pair in chunk]).to(dev)
             with torch.no_grad():
                 c = (embed(m, a) * embed(m, b)).sum(1)
             cos += c.cpu().tolist()
