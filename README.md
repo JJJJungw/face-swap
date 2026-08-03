@@ -17,7 +17,7 @@
 
 ---
 
-## 현재 상태 (2026-07-31)
+## 현재 상태 (2026-08-03)
 
 | 항목 | 상태 | 비고 |
 |---|---|---|
@@ -25,13 +25,27 @@
 | 합성 | ✅ | 타원 페더 마스크(배경 유지) |
 | 영상 파이프라인 | ✅ | 검출→카툰/블러→합성→NVENC(+오디오) |
 | 속도 | ⚠️ | L4 기준 재측정 필요. 단 **학생 모델은 여유 큼**(33ms eager) |
-| teacher 모델 | ✅ | Qwen-Image-Edit-2511 + Anime LoRA (전 구간 Apache 2.0) |
-| **teacher 프롬프트** | ❌ | **잘못 골랐음.** A/B 지표가 "변환을 덜 하는 조건"에 상을 줬다 → [판정 오류](#ab-판정-오류-2026-07-31) |
-| 페어 코퍼스 | ⚠️ | `out/pairs_2511` 10,987쌍 — **화풍이 약해 재생성 예정** |
-| 학생 학습 | 🔬 | 2회 실패(둘 다 흐릿). 원인 분석 완료 → [학습 기록](#학생-학습-기록) |
-| **비식별화** | ❌ | **미해결.** teacher cos 0.799 / 학생 0.826 = 100% 동일인 판정 |
-| 학생 구조 한계 | 🔬 | 형태 변형 가능 여부 미검증 → [구조 분석](#학생-구조의-한계-repainter-vs-reshaper) |
+| teacher 모델 | ✅ | 공개 Space의 Anime-V2 경로를 L40S에서 재현. INT8 transformer, 4 step, scale 1.2 |
+| **teacher 화풍** | ✅ | 공식 trigger `Transform into anime.` + Anime LoRA. 공식 샘플과 같은 출력 확인 |
+| 페어 코퍼스 | ✅ | `out/pairs_anime12_13500` 13,500쌍 생성 완료. 연령·생성모델·고질감 비율 통제 |
+| 학생 표현력 | ✅ | 32쌍 과적합에서 화풍 L1 **0.0386**, teacher 형태 변형을 거의 재현 |
+| 학생 일반화 | 🔬 | `s_clean48` 40k 학습 진행 중. 15k 시점 val L1 **0.1146** |
+| **비식별화** | ❌ | **미해결.** 현재 clean 실험은 `id-loss=0`; 화풍 일반화 확정 후 별도 최적화 |
+| 학생 병목 | 🔬 | 절대 표현력보다 **미관측 얼굴 일반화**가 현재 핵심 → [진단](#학생-구조-진단-표현력-vs-일반화) |
 | 작은 얼굴 경계 튐 | 🔬 | 트랙 히스테리시스 실험 중(`deid_track.py`) |
+
+### 이번 라운드에서 확정된 것
+
+1. **공개 Space 재현 성공.** `run/test_space_exact.py`로 Anime-V2의 모델·LoRA·4-step 설정을
+   동일하게 맞췄고, 공식 샘플이 Space 출력과 육안상 일치했다. L40S 44GB에서는
+   `--int8-transformer`가 안정적이었고 추론은 약 13.8초/장이었다.
+2. **LoRA scale 1.2 채택.** 동일 이미지 20장에 1.0/1.2/1.4를 적용해 비교했다.
+   1.2는 1.0보다 애니 형태 변형이 분명하고 1.4보다 과장·이탈이 적었다.
+   이는 정식 정량 최적값이 아니라 **현재 코퍼스에 대한 육안 선택값**이다.
+3. **13,500쌍 코퍼스 재구축 완료.** 이전 `pairs_2511`은 폐기 대상인 약한 painterly teacher 기록이고,
+   현재 기준 코퍼스는 `pairs_anime12_13500`이다.
+4. **학생 구조는 teacher 변형을 표현할 수 있다.** 32쌍 과적합 통과로 눈·턱·코·머리 형태를
+   바꾸지 못한다는 가설은 주 병목 설명에서 제외됐다. 남은 문제는 처음 보는 얼굴로의 일반화다.
 
 ---
 
@@ -101,11 +115,12 @@ Transform into anime. flat cel shading
 
 ---
 
-## 학생 구조의 한계 (repainter vs reshaper)
+## 학생 구조 진단: 표현력 vs 일반화
 
-`train/train_student.py`의 `Generator`가 **공식 예시 수준의 형태 변형을 할 수 있는가**를 검토했다.
+`train/train_student.py`의 `Generator`가 공식 예시 수준의 형태 변형을 할 수 있는지
+32쌍 clean 과적합으로 직접 검증했다.
 
-**구조상 불리한 점:**
+**검증 전 구조상 우려:**
 
 ```python
 h = self.dec1(torch.cat([h, s2], 1))   # skip2  (/2)
@@ -113,27 +128,37 @@ h = self.dec2(torch.cat([h, s1], 1))   # skip1  (/1 = 원본 해상도)  ← 문
 ```
 
 - **전체 해상도 skip**이 인코더 첫 층 출력을 디코더 마지막에 직결한다(유화 방지 목적으로 의도적으로 넣음).
-  이것이 **출력을 입력 구조에 고정**한다 — 눈을 키우면 원래 눈의 경계가 skip으로 흘러들어 고스팅이 난다.
+  이것이 출력을 입력 구조에 과도하게 고정할 가능성이 있었다.
 - **수용영역 부족** — 병목이 /4 하나, 3×3 컨볼루션만. 512 입력에서 유효 수용영역 100~150px 추정.
-  얼굴이 ~300px이므로 **얼굴 전체를 한 번에 보지 못한다** → 비율의 일관된 변경이 어렵다.
+  얼굴 전체 비율을 처음 보는 샘플에 일관되게 적용하기에는 불리할 수 있다.
 
 **참고:** CycleGAN·AnimeGAN 계열은 "질감·색은 바꾸되 형태는 못 바꾼다"가 정설이며,
 그 한계 때문에 [U-GAT-IT](https://github.com/taki0112/UGATIT)(NCSOFT, **MIT**)이 나왔다 —
 CAM 어텐션 + AdaLIN으로 형태 변화량을 학습으로 조절, 목적이 문자 그대로 selfie2anime다.
 
-**단, 단정하지 않는다.** U-GAT-IT 논거는 *large shape change*(전면 재구성)에 대한 것이고,
-공식 예시는 **국소적 중간 변형**(눈 20~40% 확대 수준)이다. 이 규모는 conv 네트워크의 사정거리 안일 수 있다.
+### 32쌍 과적합 결과
+
+`gen-ch=48`, clean pair, `L1=3`, `perceptual=2`, `adv=0`, `id-loss=0`으로 5,000스텝 학습했다.
+최종 train batch L1은 약 0.035였고, 학습에 사용한 정확한 32쌍 평가 결과는 다음과 같다.
+
+| 신원 cos | >0.3 | 화풍 L1 | 톤 L1 |
+|---:|---:|---:|---:|
+| 0.600 | 94% | **0.0386** | **0.0215** |
+
+비교 시트에서 학생은 teacher의 눈 크기·턱선·코 단순화·머리 형태를 거의 그대로 재현했다.
+차이는 잔주름, 속눈썹, 수염, 하이라이트 같은 고주파 디테일에 집중됐다.
+따라서 **현재 Generator가 형태를 바꿀 수 없다는 가설은 반증됐다.**
 
 | 변형 규모 | animegan2 계열 |
 |---|---|
-| 채색·선만 (현재 2511 반실사) | ✅ |
-| **공식 예시 수준** (눈 확대, 코 단순화) | ⚠️ **미검증 — 실측으로 확인할 것** |
+| 채색·선만 | ✅ |
+| **공식 예시 수준** (눈 확대, 코 단순화) | ✅ **학습 샘플에서 확인** |
 | selfie2anime 전면 재구성 | ❌ |
 
-**대안(필요 시):**
-1. **skip 약화** — `dec2`의 /1 skip 제거 또는 학습형 게이트. 코드 5줄. 유화 재발 위험은 있으나
-   지금은 `--w-perc 2.0` + adv가 있어 조건이 다르다.
-2. **U-GAT-IT 계열 교체** — 런타임 ONNX 슬롯 재설계 + 속도 재검증 필요.
+**현재 해석:** 과적합 화풍 L1 0.0386과 `s_clean48` 15k val L1 0.1146의 차이가 크다.
+즉 병목은 우선 **미관측 얼굴에서 teacher의 변환 규칙을 예측하는 일반화**다.
+full-resolution skip과 /4 병목은 일반화를 방해하는 후보지만, 지금 당장 제거해야 할 확정 원인은 아니다.
+구조 변경은 clean48 최종 결과를 기준선으로 확보한 뒤 한 번에 하나씩 비교한다.
 
 ---
 
@@ -144,6 +169,8 @@ CAM 어텐션 + AdaLIN으로 형태 변화량을 학습으로 조절, 목적이 
 | 1차 | 1,000 | 0 | L1 **10** | 32 | 6k | 흐림. 사진에 가까움 |
 | 2차 | 10,987 | **3** | L1 3 / perc 2 / adv 1 | 32 | **40k** | **흐림.** l1이 40k 내내 0.145 평평 |
 | 3차 | 10,987 | 0 | 동일 | **48** | 15k | 중단(화풍 교체 결정) |
+| 진단 | **32** | 0 | L1 3 / perc 2 / adv 0 | **48** | 5k | 과적합 성공. 화풍 L1 **0.0386** |
+| **clean48** | **13,500** | **0** | L1 3 / perc 2 / adv 0 | **48** | **40k 진행 중** | 15k val L1 **0.1146** |
 
 ### 2차에서 배운 것
 
@@ -167,6 +194,15 @@ CAM 어텐션 + AdaLIN으로 형태 변화량을 학습으로 조절, 목적이 
 
 **용량을 올릴 여유가 충분하다.** 1.36M은 속도 예산을 크게 남기고 있다.
 
+### clean48 진행 판정
+
+- 데이터 분할: train 12,825 / val 675, 고정 seed와 고정 split 사용.
+- val L1: 500스텝 0.1599 → 5k 0.1302 → 10k 0.1211 → 15k **0.1146**.
+- 10k 이후 개선폭은 작아졌지만 아직 붕괴나 명확한 과적합은 없다.
+- clean48은 **일반화 기준선**이다. `adv=0`, `id-loss=0`, 증강 0이므로 이 결과만으로
+  비식별화나 작은 얼굴 강건성을 판정하지 않는다.
+- 40k 완료 전에는 중간 샘플의 육안 품질과 고정 validation 비교 시트를 함께 본다.
+
 ---
 
 ## 비식별화 측정
@@ -174,16 +210,19 @@ CAM 어텐션 + AdaLIN으로 형태 변화량을 학습으로 조절, 목적이 
 `run/measure_id.py` — facenet(vggface2) 임베딩의 `cos(input, target)`.
 전처리를 `train_student.py`의 `id_embed()`와 동일하게 맞춰 **학습 중 id-loss가 보는 값과 일치**시켰다.
 
-| 대상 | 중앙값 | >0.5 |
+> 아래 수치는 **폐기 대상인 기존 `pairs_2511` painterly 코퍼스**에서 측정한 과거 기준이다.
+> 새 `pairs_anime12_13500`과 clean48의 비식별화 최종 평가는 아직 하지 않았다.
+
+| 대상(구 코퍼스) | 중앙값 | >0.5 |
 |---|---|---|
-| teacher target (2511, 현 프롬프트) | **0.799** | **100%** |
+| teacher target (2511, 구 painterly 프롬프트) | **0.799** | **100%** |
 | 학생 출력 (id-loss 0) | **0.826** | **100%** |
 | 참고: 2509 코퍼스 | 0.434 | 38% |
 
-**현 화풍만으로는 비식별화가 전혀 안 된다.** 10,987장 전부 동일인 판정.
+**구 painterly 화풍만으로는 비식별화가 전혀 안 됐다.** 10,987장 전부 동일인 판정.
 2509가 0.434였던 것은 화풍이 얼굴을 다시 그렸기 때문이다.
 
-### `--style-scale`은 레버가 아니다
+### 구 코퍼스에서 `--style-scale`만으로는 부족했다
 
 | scale | 신원 cos |
 |---|---|
@@ -196,7 +235,8 @@ CAM 어텐션 + AdaLIN으로 형태 변화량을 학습으로 조절, 목적이 
 그 전에 그림이 붕괴한다. **이유: prithiv LoRA의 셀링포인트가 "preserves pose, proportions"이고,
 얼굴인식이 보는 것이 바로 그 구조다.** 구조를 보존하는 한 강도로는 신원이 안 지워진다.
 
-→ **해법은 강도가 아니라 프롬프트(화풍)** 였다. [A/B 판정 오류](#ab-판정-오류-2026-07-31) 참조.
+이 실험은 현재 Anime-V2의 1.0/1.2/1.4 비교와 대상이 다르다. 새 코퍼스의 1.2는
+비식별화 수치를 맞추기 위한 값이 아니라 teacher 화풍의 육안 균형점으로 선택했다.
 
 ### 남은 수단: id-loss (미검증)
 
@@ -228,7 +268,7 @@ QC 시트에서 갈색 피부 여성이 금발 백인으로 바뀐 사례(`#6543
 `dark` 구간 35%가 실제 피부톤이라고 보기 어렵다. **판정은 육안이 최종이다** —
 `#6543`처럼 인물 자체가 바뀌는 것은 노출 보정으로 설명되지 않으므로 명백한 실패로 본다.
 
-→ **화풍 교체 후 재측정할 것.** 현재 수치는 교체될 코퍼스 기준이다.
+→ **`pairs_anime12_13500` 기준으로 재측정할 것.** 현재 수치는 폐기 대상 코퍼스 기준이다.
 
 ---
 
@@ -263,7 +303,8 @@ sudo docker stop ubuntu-faceblur-1      # 측정 후 docker start
 
 - **`cartoon-min 150`은 사전학습 `face_paint_512_v2`가 작은 얼굴에서 무너져 막아둔 우회책**이다.
   자체 학생을 학습하는 지금은 목표가 다르다 — **작은 얼굴도 카툰화하도록 명시적으로 가르친다.**
-  `--aug-level`이 그 장치다(레벨 3에서 학습 샘플의 38%가 150px 미만, 최소 62px).
+  clean 화풍 일반화를 확인한 뒤 `--aug-mix`로 저해상도 입력을 일부 섞는 것이 그 장치다
+  (레벨 3에서 학습 샘플의 38%가 150px 미만, 최소 62px).
   성공하면 임계값을 64~80까지 낮출 수 있고, 그러면 **비식별 커버리지↑ + 경계 튐 문제 자체가 축소**된다.
 - **경계 튐 해결(`deid_track.py`, 실험):** IoU 트래커 + 트랙별 히스테리시스(hi=165/lo=135) + 크기 median 스무딩(5f).
 
@@ -324,26 +365,49 @@ sudo docker stop ubuntu-faceblur-1      # 측정 후 docker start
 
 ---
 
-## teacher: Qwen-Image-Edit-2511
+## teacher: 공개 Space Anime-V2 재현
 
-### 구성 (전 구간 Apache 2.0)
+### 구성 (허용 라이선스 범위)
 
 | 구성요소 | 리포 / 파일 |
 |---|---|
 | 베이스 | `Qwen/Qwen-Image-Edit-2511` |
 | 화풍 LoRA | `prithivMLmods/Qwen-Image-Edit-2511-Anime` / `...-Anime-2000.safetensors` |
-| 속도 LoRA | `lightx2v/Qwen-Image-Edit-2511-Lightning` / `...-4steps-V1.0-bf16.safetensors` |
-| 양자화 | `unsloth/Qwen-Image-Edit-2511-GGUF` / `qwen-image-edit-2511-Q8_0.gguf` (21.8GB) |
+| 공개 Space | `prithivMLmods/Qwen-Image-Edit-2511-LoRAs-Fast` |
+| 4-step transformer | `prithivMLmods/Qwen-Image-Edit-Rapid-AIO-V19` |
+| 양자화 | `bitsandbytes` INT8 (`BitsAndBytesConfig(load_in_8bit=True)`, MIT) |
+| 실행 설정 | prompt `Transform into anime.` · seed 0 · 4 steps · CFG 1.0 · LoRA scale 1.2 |
 
-※ `QuantStack/Qwen-Image-Edit-2511-GGUF`는 **존재하지 않는다**(404). 2509용만 있다.
+**재현 결과:** 공식 샘플 입력에서 공개 Space와 육안상 같은 출력을 얻었다.
+FP 모델 전체를 GPU에 올리는 경로는 L40S 44GB에서 OOM이 났고, CPU offload는 RAM·swap 압박과
+극심한 지연을 만들었다. INT8 transformer 경로는 약 10GB VRAM 로드 상태에서 안정적으로 실행됐고
+실제 denoise 4 step은 약 9~12초, 전체 장당 약 13초였다.
 
-**Q8_0을 쓰는 이유:** teacher는 오프라인 1회 실행이고 그 출력이 학생의 **정답**이 된다.
-양자화 손실이 학습 타겟에 영구히 박히므로, 런타임과 반대로 VRAM이 남으면 아끼지 않는다.
+**CFG 주의:** 4-step 모델은 `true_cfg_scale=1.0`을 사용하므로 negative prompt가 적용되지 않는다.
+teacher 품질은 negative prompt가 아니라 LoRA, prompt, scale, 입력 분포와 사후 QC로 통제한다.
 
-**Lightning 주의:** step-distilled라 `true_cfg_scale=1.0`이 정석 → **negative_prompt가 무시된다.**
-NEG 가드가 필요하면 `--no-fast`(28 step / cfg 4.0).
+### 현재 코퍼스 구성
+
+`run/select_sfhq_sources.py`로 SFHQ-T2I 메타데이터를 먼저 필터링하고,
+`run/generate_anime_13500.sh`로 중단 재개 가능한 생성을 수행했다.
+
+| 구분 | 수량 / 비율 |
+|---|---:|
+| adult | 10,800 / 80% |
+| senior | 1,350 / 10% |
+| teen | 675 / 5% |
+| child | 675 / 5% |
+| 고질감 프롬프트 | 676 / 5.0% |
+| 생성 모델 | FLUX1-schnell 6,331 · SDXL 5,953 · FLUX1-dev 828 · FLUX1-pro 388 |
+
+DALL-E 3 출처 1,123장과 비사진 프롬프트 1,595장은 후보에서 제외했다.
+연령 비율을 줄이는 것만으로 화풍 일관성이 보장되지는 않으므로, senior를 포함한 상태에서
+teacher의 과도한 주름·그래픽노블 이탈을 별도 QC 대상으로 본다.
 
 ### 2509 대비 코퍼스 품질 (10,987쌍 기준)
+
+> 아래 표는 teacher 구현을 2511로 옮긴 당시의 **구 `pairs_2511` 기록**이다.
+> 현재 `pairs_anime12_13500` 품질 수치로 해석하지 않는다.
 
 | | 2509 (`pairs_fp3`, n=16) | 2511 (`pairs_2511`, n=10,987) |
 |---|---|---|
@@ -406,24 +470,38 @@ pip install --no-deps facenet-pytorch && pip install requests tqdm
 # 런타임
 bash run/run_deid.sh --video input/swap4.mp4 --trt --gan-backend onnx --cartoon-min 150
 
-# 페어 코퍼스 (teacher)  ※ 반드시 tmux 안에서
-python3 -u run/qwen2511_pairgen.py --input input/sfhq_t2i/images/images \
-  --out out/pairs_XXX --n 10000 --every 12 --resume --size 768 --prompt "<프롬프트>"
+# 페어 코퍼스 (공개 Space Anime-V2 재현, 중단 시 같은 명령 재실행)
+bash run/generate_anime_13500.sh
 
 # QC → 큐레이션
-python3 -u run/pair_qc.py --dir out/pairs_XXX
-python3 run/pair_curate.py --dir out/pairs_XXX \
-  --reject-file out/pairs_XXX/qc_reject.txt --apply
+python3 -u run/pair_qc.py --dir out/pairs_anime12_13500
+python3 run/pair_curate.py --dir out/pairs_anime12_13500 \
+  --reject-file out/pairs_anime12_13500/qc_reject.txt --apply
 
-# 학습 → 평가
-python3 -u train/train_student.py --data out/pairs_XXX --out train/sX \
-  --size 512 --batch 8 --steps 15000 --gen-ch 48 --aug-level 0 \
-  --w-l1 3.0 --w-perc 2.0 --w-adv 1.0 --init-steps 2000 --adv-ramp 4000 --ckpt-every 2000
-python3 -u run/eval_student.py --data out/pairs_XXX --n 64 --size 512 \
-  --ckpt train/sX/student_final.pt
+# clean 일반화 기준선 학습
+python3 -u train/train_student.py --data out/pairs_anime12_13500 --out train/s_clean48 \
+  --size 512 --batch 8 --steps 40000 --gen-ch 48 --lr 2e-4 --aug-level 0 \
+  --val-ratio 0.05 --val-n 64 --seed 0 --split-seed 0 --workers 4 \
+  --w-l1 3.0 --w-perc 2.0 --w-adv 0 --id-loss 0 \
+  --sample-every 500 --ckpt-every 5000
+
+# 고정 validation 평가
+python3 -u run/eval_student.py --data out/pairs_anime12_13500 --n 64 --size 512 \
+  --include-file train/s_clean48/val_stems.txt --ckpt train/s_clean48/student_final.pt \
+  --sheet out/eval_s_clean48.png
 ```
 
 상세 절차: **[docs/post-corpus-runbook.md](docs/post-corpus-runbook.md)**
+
+### 학습 재현·안전 장치
+
+- input/target은 확장자와 무관하게 stem으로 짝을 맞추고, 중복 stem·미지 파일·짝 누락은 즉시 실패한다.
+- 일반 학습에서 pretrained VGG를 못 불러오면 중단한다. random VGG 허용은 smoke test 전용이다.
+- train/val stem 목록과 split seed를 저장해 재시작·평가가 정확히 같은 표본을 사용한다.
+- checkpoint에는 G/D, optimizer, step, split, 전역 RNG를 저장하고 atomic write한다.
+- `--resume`은 위 상태 전체를 복원하며, DataLoader worker마다 독립 RNG를 사용한다.
+- `eval_student.py`와 ONNX export는 checkpoint에서 `gen-ch`를 자동 판별한다.
+- 모든 구조 변경은 먼저 `--overfit-n 32` 진단을 통과해야 한다.
 
 ### 스크립트 목록 (`run/`)
 | 스크립트 | 용도 |
@@ -433,6 +511,10 @@ python3 -u run/eval_student.py --data out/pairs_XXX --n 64 --size 512 \
 | `setup_venv.sh` · `requirements.txt` | **런타임** venv 설치·핀 |
 | `requirements-train.txt` | **학습·teacher** 의존성 (런타임과 분리) |
 | `qwen2511_pairgen.py` | **teacher** — 2511 + Anime LoRA. `--variant`(1회 로드 다중 프롬프트) · `--every` · `--resume` · manifest 기반 중복 방지 |
+| `test_space_exact.py` | 공개 Space 모델 경로 재현 · INT8 transformer · 배치/scale 비교 · resume |
+| `select_sfhq_sources.py` | SFHQ-T2I 메타데이터 필터 · 연령/생성모델/질감 비율 통제 |
+| `generate_anime_13500.sh` | 현재 13,500쌍 코퍼스 선택+생성 진입점. 중단 후 재실행 가능 |
+| `pair_utils.py` | 확장자 독립 stem 페어 매칭 · 중복/미지 파일 검증 공통 로직 |
 | `qwen_pairgen.py` | teacher(구) — 2509 + autoweeb LoRA. 재현용 보존 |
 | `ab_2511.sh` | 화풍×프롬프트 교차 A/B |
 | `pair_qc.py` | 페어 자동 QC — 정합(ECC)·화풍이탈(robust z) → 컨택트시트 + reject stem 목록 |
@@ -458,10 +540,12 @@ python3 -u run/eval_student.py --data out/pairs_XXX --n 64 --size 512 \
 
 **teacher·코퍼스**
 - **일관성이 품질보다 중요하다.** 소형 학생은 화풍 분산을 고르지 못하고 평균낸다 → 평균값이 아니라 **CV**로 본다.
-- **teacher 출력은 학생의 정답이므로 양자화를 아끼지 않는다** (Q4 대신 Q8).
+- **teacher 경로 자체를 먼저 재현한다.** 공식 샘플, 모델 revision, LoRA 파일, seed, scale을 고정하지 않으면
+  입력 분포 차이와 구현 차이를 구분할 수 없다.
+- L40S에서는 공개 Space transformer의 **INT8 경로가 FP+offload보다 빠르고 안정적이었다.**
 - **페어 정합이 L1 blur의 숨은 원인이다.** 화풍 이전에 ECC·전역이동을 먼저 잰다.
 - **negative prompt는 기하 변형을 못 막는다** (`big eyes, chibi`를 cfg 4.5로 명시해도 발생).
-- **step-distilled(Lightning)는 negative_prompt를 못 쓴다** (`true_cfg_scale=1.0` → CFG 꺼짐).
+- **4-step 모델은 negative_prompt를 못 쓴다** (`true_cfg_scale=1.0` → CFG 꺼짐).
 - **재현에 필요한 실제 프롬프트는 README가 아니라 `manifest.jsonl`과 실행 로그에 있다.**
 
 **학생**
@@ -470,7 +554,11 @@ python3 -u run/eval_student.py --data out/pairs_XXX --n 64 --size 512 \
 - **adv 램프를 충분히 길게** — 2000에서는 5,200스텝에 판별자가 붕괴(D 0.02), 4000으로 늘리자 전 구간 안정.
 - **LSGAN의 평형점은 D=0.25** (진짜·가짜 둘 다 0.5로 찍을 때). 0.05 아래는 판별자 승리.
 - **속도 예산이 크게 남는다** — ch=32에서 33ms eager(animegan2의 3.4배 빠름). **ch 48~64를 쓸 수 있다.**
-- **animegan2 계열은 repainter다** — 전체 해상도 skip이 출력을 입력 구조에 고정한다. 형태 변형은 미검증.
+- **32쌍 과적합은 형태 변형 표현력을 입증했다.** 현재 병목은 구조의 절대 불능이 아니라
+  미관측 얼굴에서 teacher mapping을 예측하는 일반화다.
+- **과적합 통과는 일반화 통과가 아니다.** 0.0386(train 32)과 0.1146(val)의 차이를 줄이는 실험이 우선이다.
+- correspondence가 중요한 paired distillation에서는 처음부터 큰 unconditional adv를 넣지 않는다.
+  필요하면 input+output을 함께 보는 conditional PatchGAN을 낮은 가중치로 후반 도입한다.
 
 **비식별화**
 - **"카툰화 = 비식별화"가 아니다** (StyleID 재식별 0.744).
@@ -498,36 +586,45 @@ python3 -u run/eval_student.py --data out/pairs_XXX --n 64 --size 512 \
 
 ## 다음 단계
 
-**A — 화풍 확정 (최우선)**
+### A. clean48 기준선 확정
 
-1. **프롬프트 3조건 비교 (5분)** — 공식 프롬프트가 목표 화풍을 내는지 + **신원 cos로 판정**
-   ```bash
-   python3 -u run/qwen2511_pairgen.py --input /tmp/ab_src --out out/ptest --n 16 \
-     --variant "official::Transform into anime. flat cel shading" \
-     --variant "trigger::Transform into anime." \
-     --variant "current::<현재 긴 프롬프트>"
-   python3 -u run/measure_id.py --n 16 --dir out/ptest_official --dir out/ptest_trigger --dir out/ptest_current
-   ```
-   **판정 기준은 ECC·CV가 아니라 ① 육안으로 공식 예시 수준인가 ② 신원 cos가 내려가는가.**
+1. **40k까지 현재 설정을 바꾸지 않는다.** 5k 간격 checkpoint와 동일 validation 64장의
+   L1·톤 L1·비교 시트를 나란히 본다. 최종 step이 아니라 **최저 val + 육안 최상** checkpoint를 기준선으로 잡는다.
+2. 학습률을 기록한다. 현재 고정 `2e-4`가 10k 이후 정체를 만들었다면 다음 실험은
+   `2e-4 → 1e-4 → 5e-5` decay만 추가하고 다른 조건은 고정한다.
+3. 32쌍 train 과적합 시트와 고정 validation 시트를 혼동하지 않는다.
+   전자는 표현력 진단, 후자는 일반화 진단이다.
 
-2. **소규모 코퍼스 2,000장 (~5시간)** — 확정된 프롬프트로. 25시간을 걸기 전 검증용.
-   `--resume`과 manifest 중복 방지가 있으므로 나중에 9,000장을 이어붙이면 그대로 본 코퍼스가 된다.
+### B. 일반화 병목 개선
 
-3. **학생 검증 (~3시간)** — `--gen-ch 48 --aug-level 0 --steps 8000`
-   **핵심 질문: 이 구조가 눈 확대 같은 형태 변형을 따라가는가.**
-   - 따라감 → 4단계
-   - **고스팅(원본 눈이 비침)** → [skip 약화 실험](#학생-구조의-한계-repainter-vs-reshaper)
+아래 변경은 **한 번에 하나씩** clean48과 같은 split으로 비교한다.
 
-4. **나머지 9,000장 + 본 학습**
+1. **teacher outlier 정리:** 주름이 과도한 senior, 그래픽노블·반실사 이탈, 시선/기하 오류를
+   자동 후보화한 뒤 육안 큐레이션한다. 일관되지 않은 1,000장을 더 넣는 것보다 잘못된 100장을 빼는 편이 낫다.
+2. **약한 curriculum:** clean 화풍을 먼저 수렴시킨 checkpoint에서 열화를 섞는다.
+   시작 후보는 aug level `0/1/2/3 = 0.70/0.20/0.08/0.02`; level 3 단독 학습은 금지한다.
+3. **edge loss:** teacher target의 Sobel edge에 낮은 가중치를 추가해 눈·턱·머리 선의 위치를 직접 감독한다.
+4. **구조 V2:** /8 semantic bottleneck과 6~8개 residual block을 추가하고, /1 skip은 제거보다
+   **학습형 gate**를 먼저 시험한다. 목표는 4~6M 파라미터 범위와 L4 속도 예산 유지다.
+5. **conditional adversarial:** L1/perceptual/edge가 안정된 뒤 `D(input, target)` 6채널 PatchGAN을
+   `w-adv 0.1~0.2`로 후반 도입한다. generic anime 얼굴로 수렴하면 즉시 제외한다.
 
-**B — 비식별화 확정**
+### C. 실험 승격 기준
 
-5. **id-loss 스윕** (0 / 2 / 5 / 10) → `eval_student.py`로 한 표 비교.
-   최적점은 **신원cos가 0.3 아래로 내려가는 것 중 화풍L1이 가장 낮은** 설정.
-   화풍 교체로 cos가 이미 충분히 내려가면 id-loss 부담이 줄어든다.
-6. **피부톤 재측정** — 새 코퍼스 기준으로.
+모든 새 구조·손실은 다음 순서를 통과해야 13,500장 본 학습으로 승격한다.
 
-**C — 런타임 반영**
+1. **32쌍 과적합:** 화풍 L1이 기존 0.0386 수준에 도달하고 teacher 형태를 육안 재현한다.
+2. **512쌍 소규모 일반화:** 고정 validation에서 clean48보다 낮은 L1과 더 선명한 눈·윤곽을 동시에 보인다.
+3. **13,500쌍 본 학습:** 전체 평균뿐 아니라 연령·피부톤·가림·측면 얼굴 slice별로 비교한다.
+4. **속도 게이트:** ONNX→TensorRT 512, 단일/다중 얼굴을 L4에서 측정해 2× 실시간 예산을 확인한다.
 
-7. ONNX export → **`--cartoon-min` 재설정**(150 → 64~80 비교) → **L4에서 속도 재측정**
-8. 경계 튐(`deid_track.py`) 정식 흡수 · 검출기 멀티스케일 연동 · 다중 얼굴 배치 스타일화
+### D. 비식별화와 런타임
+
+1. 화풍 일반화가 통과한 checkpoint에서 `id-loss`를 0부터 작은 값으로 스윕한다.
+   목표는 **신원 cos < 0.3 조건을 만족하는 것 중 화풍 L1이 가장 낮은 점**이다.
+2. 새 코퍼스와 학생 출력에서 피부톤·연령별 신원 cos, 화풍 L1, 실패율을 다시 측정한다.
+3. ONNX export 후 `--cartoon-min 150 → 64~80`을 비교하고, 트랙 히스테리시스·다중 얼굴 배치·NVENC를 통합한다.
+
+**하지 않을 것:** clean48이 끝나기 전에 구조·adv·id-loss를 동시에 바꾸기, validation 감소만 보고
+화풍을 판정하기, senior 전체를 제거해 해당 연령대 일반화를 포기하기, 라이선스가 불명확한 가중치를
+"나중에 증빙하면 된다"는 전제로 섞기.
