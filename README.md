@@ -631,6 +631,30 @@ python3 -u run/eval_student.py --data out/pairs_anime12_13500 --n 64 --size 512 
 5. **conditional adversarial:** L1/perceptual/edge가 안정된 뒤 `D(input, target)` 6채널 PatchGAN을
    `w-adv 0.1~0.2`로 후반 도입한다. generic anime 얼굴로 수렴하면 즉시 제외한다.
 
+현재 구조 V2 실험은 `--gen-arch deep8`로 선택한다. 이 구조는 `/8` bottleneck과 6개 residual
+block을 사용하고, `/4`·`/2` skip은 0.1에서 시작하는 학습형 gate로 제한하며 `/1` skip은 두지 않는다.
+`--edge-mode sobel-ms`는 3개 해상도의 윤곽을 감독하고, `--w-fm`은 conditional discriminator의
+중간 특징을 teacher target과 맞춰 낮은 adversarial 가중치에서도 선명도를 유지한다.
+
+999쌍 localized probe 권장 시작점:
+
+```bash
+python3 -u train/train_student.py \
+  --data out/pairs_anime12_13500 \
+  --localize-manifest out/localface_index_13500/manifest.jsonl \
+  --out train/localface_deep8_probe1k \
+  --size 512 --batch 8 --steps 5000 --gen-ch 32 --gen-arch deep8 \
+  --lr 2e-4 --aug-level 0 --val-ratio 0.05 --val-n 50 --workers 4 \
+  --w-l1 1.5 --w-perc 3.0 --w-edge 2.0 --edge-mode sobel-ms \
+  --w-adv 0.08 --w-fm 2.0 --conditional-gan --init-steps 1000 --adv-ramp 1500 \
+  --id-loss 0 --face-mask-weight 4 --amp bf16 --perc-size 0 \
+  --sample-every 500 --ckpt-every 500 \
+  2>&1 | tee out/train_localface_deep8_probe1k.log
+```
+
+이 probe는 기존 `sharp1k`를 이어 학습하지 않고 새 구조로 처음부터 학습한다. 5k 결과가 teacher의
+눈 크기·윤곽·주름 단순화를 더 잘 재현하면서 halo가 줄어든 경우에만 13,500쌍으로 승격한다.
+
 영상의 얼굴만 바꾸는 제품 목표에는 별도 localized fine-tuning을 사용한다. 기존 teacher 페어에서
 동일한 얼굴 crop을 만들고, 얼굴 타원 내부는 teacher·외부는 실사인 target으로 재합성한다.
 `--init-ckpt`는 clean48의 G만 로드하고 optimizer·step·split을 초기화한다.

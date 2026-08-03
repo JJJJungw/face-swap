@@ -10,7 +10,7 @@ import os, sys, argparse, torch
 
 # 우리 Generator 정의 재사용 (train/train_student.py)
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "train"))
-from train_student import Generator
+from train_student import build_generator, checkpoint_generator_arch
 
 
 def main():
@@ -26,8 +26,9 @@ def main():
         checkpoint = torch.load(args.ckpt, map_location="cpu")
     weights = checkpoint["G"] if isinstance(checkpoint, dict) and "G" in checkpoint else checkpoint
     _ch = weights["in_conv.1.weight"].shape[0]      # 체크포인트가 채널 수를 알고 있다
-    print(f"[export] ch={_ch} 자동 감지")
-    m = Generator(ch=_ch).eval()
+    arch = checkpoint_generator_arch(checkpoint, weights)
+    print(f"[export] arch={arch} ch={_ch} 자동 감지")
+    m = build_generator(ch=_ch, arch=arch).eval()
     m.load_state_dict(weights)
     print(f"[load] {args.ckpt}  (params={sum(p.numel() for p in m.parameters())/1e6:.2f}M)")
 

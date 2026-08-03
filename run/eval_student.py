@@ -43,10 +43,10 @@ except ImportError as e:
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "train"))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 try:
-    from train_student import Generator
+    from train_student import build_generator, checkpoint_generator_arch
 except ImportError:
     try:
-        from train.train_student import Generator
+        from train.train_student import build_generator, checkpoint_generator_arch
     except ImportError as e:
         raise SystemExit(f"train_student.py의 Generator를 못 찾음: {e}\n"
                          "  레포 루트에서 실행할 것: python3 run/eval_student.py ...")
@@ -126,10 +126,11 @@ def main():
             raise SystemExit(
                 f"--gen-ch {args.gen_ch} != checkpoint channel count {detected_ch}: {ck}"
             )
-        G = Generator(detected_ch).to(dev).eval()
+        detected_arch = checkpoint_generator_arch(sd, weights)
+        G = build_generator(detected_ch, detected_arch).to(dev).eval()
         G.load_state_dict(weights, strict=True)
         print(f"\n[{tag}] {ck}  (step {sd.get('step','?')})")
-        print(f"[model] gen_ch={detected_ch}")
+        print(f"[model] gen_arch={detected_arch} gen_ch={detected_ch}")
 
         cos, l1, perc_proxy = [], [], []
         saved = []

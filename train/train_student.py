@@ -20,7 +20,7 @@
   python train/train_student.py --data out/pairs_dataset --out train/student_paired \
     --size 256 --batch 8 --init-steps 1500 --steps 40000 --id-loss 0
 """
-import os, argparse, sys, random, json, time
+import os, argparse, sys, random, json, time, math
 from contextlib import nullcontext
 import cv2
 import numpy as np
@@ -113,6 +113,75 @@ class Generator(nn.Module):
         return self.out(h)
 
 
+class GatedSkip(nn.Module):
+    """Add a skip connection with a learnable, deliberately weak initial gain."""
+
+    def __init__(self, init_gain=0.1):
+        super().__init__()
+        init_gain = min(max(float(init_gain), 1e-4), 1.0 - 1e-4)
+        self.logit = nn.Parameter(torch.tensor(math.log(init_gain / (1.0 - init_gain))))
+
+    def forward(self, decoded, skip):
+        return decoded + torch.sigmoid(self.logit) * skip
+
+
+class GeneratorDeep8(nn.Module):
+    """Redraw-oriented generator with a /8 bottleneck and weak low-resolution skips."""
+
+    def __init__(self, ch=32):
+        super().__init__()
+        c1, c2, c3, c4 = ch, ch * 2, ch * 4, ch * 6
+        self.in_conv = ConvNormLReLU(3, c1, k=7, p=3)
+        self.down1 = nn.Sequential(ConvNormLReLU(c1, c2, s=2), ConvNormLReLU(c2, c2))
+        self.down2 = nn.Sequential(ConvNormLReLU(c2, c3, s=2), ConvNormLReLU(c3, c3))
+        self.down3 = nn.Sequential(ConvNormLReLU(c3, c4, s=2), ConvNormLReLU(c4, c4))
+        self.mid = nn.Sequential(
+            ConvNormLReLU(c4, c4),
+            *[InvertedResidual(c4, c4) for _ in range(6)],
+            ConvNormLReLU(c4, c4),
+        )
+        self.up1 = UpPixelShuffle(c4, c3)
+        self.skip4 = GatedSkip(0.1)
+        self.dec1 = nn.Sequential(ConvNormLReLU(c3, c3), ConvNormLReLU(c3, c3))
+        self.up2 = UpPixelShuffle(c3, c2)
+        self.skip2 = GatedSkip(0.1)
+        self.dec2 = nn.Sequential(ConvNormLReLU(c2, c2), ConvNormLReLU(c2, c2))
+        # No full-resolution skip: the output must redraw facial features instead of copying pixels.
+        self.up3 = UpPixelShuffle(c2, c1)
+        self.dec3 = nn.Sequential(ConvNormLReLU(c1, c1), ConvNormLReLU(c1, c1))
+        self.out = nn.Sequential(nn.Conv2d(c1, 3, 1, 1, 0, bias=False), nn.Tanh())
+
+    def forward(self, x):
+        s1 = self.in_conv(x)
+        s2 = self.down1(s1)
+        s4 = self.down2(s2)
+        h = self.mid(self.down3(s4))
+        h = self.dec1(self.skip4(self.up1(h), s4))
+        h = self.dec2(self.skip2(self.up2(h), s2))
+        h = self.dec3(self.up3(h))
+        return self.out(h)
+
+
+def build_generator(ch=32, arch="legacy"):
+    if arch == "legacy":
+        return Generator(ch)
+    if arch == "deep8":
+        return GeneratorDeep8(ch)
+    raise ValueError(f"unknown generator architecture: {arch}")
+
+
+def checkpoint_generator_arch(checkpoint, weights=None):
+    if isinstance(checkpoint, dict):
+        saved_args = checkpoint.get("args") or {}
+        if saved_args.get("gen_arch"):
+            return saved_args["gen_arch"]
+    if weights is None:
+        weights = checkpoint.get("G") if isinstance(checkpoint, dict) else checkpoint
+    if isinstance(weights, dict) and any(key.startswith("down3.") for key in weights):
+        return "deep8"
+    return "legacy"
+
+
 # ============ Discriminator (PatchGAN + spectral norm) ============
 class Discriminator(nn.Module):
     def __init__(self, ch=48, n=3, in_channels=3):
@@ -127,8 +196,15 @@ class Discriminator(nn.Module):
         L += [spectral_norm(nn.Conv2d(c, 1, 3, 1, 1))]
         self.net = nn.Sequential(*L)
 
-    def forward(self, x):
-        return self.net(x)
+    def forward(self, x, return_features=False):
+        features = []
+        for layer in self.net:
+            x = layer(x)
+            if return_features and isinstance(layer, nn.LeakyReLU):
+                features.append(x)
+        if return_features:
+            return x, features
+        return x
 
 
 # ============ VGG19 다층 perceptual (relu1_2,2_2,3_4,4_4) — gram 아님! 특징 L1 ============
@@ -461,8 +537,12 @@ def main():
     ap.add_argument("--w-adv", type=float, default=1.0, dest="w_adv", help="경량 adversarial(선명)")
     ap.add_argument("--w-edge", type=float, default=0.0, dest="w_edge",
                     help="target 윤곽 gradient L1. 애니 눈/코/턱선 재현은 2~4 권장")
+    ap.add_argument("--edge-mode", choices=("diff", "sobel-ms"), default="diff", dest="edge_mode",
+                    help="윤곽 손실 방식. sobel-ms는 3개 해상도에서 선 구조를 비교")
     ap.add_argument("--conditional-gan", action="store_true", dest="conditional_gan",
                     help="PatchGAN이 input+output 쌍을 판별하여 입력과 맞는 선명한 변환을 강제")
+    ap.add_argument("--w-fm", type=float, default=0.0, dest="w_fm",
+                    help="discriminator feature matching. conditional GAN 안정화는 1~5 권장")
     ap.add_argument("--w-tv", type=float, default=0.0, dest="w_tv")
     ap.add_argument("--id-loss", type=float, default=0.0, dest="id_loss", help="신원억제(0=off). input 신원에서 멀어지게")
     ap.add_argument("--id-margin", type=float, default=0.3, dest="id_margin")
@@ -475,6 +555,8 @@ def main():
     ap.add_argument("--perc-size", type=int, default=0, dest="perc_size",
                     help="VGG perceptual 계산 해상도. 0=학습 크기, 256=빠른 512 학습 권장")
     ap.add_argument("--gen-ch", type=int, default=32, dest="gen_ch", help="제너레이터 기본채널(용량↑=32→48→64, 속도↓)")
+    ap.add_argument("--gen-arch", choices=("legacy", "deep8"), default="legacy", dest="gen_arch",
+                    help="legacy=/4 U-Net, deep8=/8 병목+약한 skip의 얼굴 redraw 구조")
     ap.add_argument("--d-ch", type=int, default=48, dest="d_ch")
     ap.add_argument("--d-n", type=int, default=3, dest="d_n")
     ap.add_argument("--aug", action="store_true", help="(구) 약한 색 aug. --aug-level 1과 동등")
@@ -513,6 +595,12 @@ def main():
         ap.error("--face-mask-weight must be at least 1")
     if args.perc_size < 0:
         ap.error("--perc-size must be non-negative")
+    if args.w_fm < 0:
+        ap.error("--w-fm must be non-negative")
+    if args.w_fm > 0 and args.w_adv <= 0:
+        ap.error("--w-fm requires --w-adv > 0")
+    if args.gen_arch == "deep8" and args.size % 8:
+        ap.error("--gen-arch deep8 requires --size divisible by 8")
     try:
         aug_mix = parse_aug_mix(args.aug_mix)
     except (ValueError, TypeError) as exc:
@@ -543,7 +631,7 @@ def main():
             return nullcontext()
         return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
 
-    G = Generator(args.gen_ch).to(dev)
+    G = build_generator(args.gen_ch, args.gen_arch).to(dev)
     D = Discriminator(args.d_ch, args.d_n, 6 if args.conditional_gan else 3).to(dev)
     vgg = VGGPerceptual(allow_random=args.smoke).to(dev)
     idm = load_id(dev) if args.id_loss > 0 else None
@@ -559,9 +647,14 @@ def main():
             init_state = torch.load(args.init_ckpt, map_location=dev)
         init_weights = init_state["G"] if isinstance(init_state, dict) and "G" in init_state else init_state
         detected_ch = int(init_weights["in_conv.1.weight"].shape[0])
+        detected_arch = checkpoint_generator_arch(init_state, init_weights)
         if detected_ch != args.gen_ch:
             raise SystemExit(
                 f"--gen-ch {args.gen_ch} does not match --init-ckpt channel count {detected_ch}"
+            )
+        if detected_arch != args.gen_arch:
+            raise SystemExit(
+                f"--gen-arch {args.gen_arch} does not match --init-ckpt architecture {detected_arch}"
             )
         G.load_state_dict(init_weights, strict=True)
         print(f"[init] G only from {args.init_ckpt}; optimizer/step/split reset")
@@ -607,6 +700,8 @@ def main():
         saved_args = state.get("args", {})
         if saved_args.get("gen_ch", args.gen_ch) != args.gen_ch:
             raise SystemExit("--gen-ch does not match resume checkpoint")
+        if checkpoint_generator_arch(state, state.get("G")) != args.gen_arch:
+            raise SystemExit("--gen-arch does not match resume checkpoint")
         G.load_state_dict(state["G"], strict=True)
         D.load_state_dict(state["D"], strict=True)
         optG.load_state_dict(state["optG"])
@@ -645,12 +740,46 @@ def main():
             )
         return vgg(fake, tgt)
 
-    def edge_loss(fake, tgt):
+    def difference_edge_loss(fake, tgt):
         fake_dx = fake[:, :, :, 1:] - fake[:, :, :, :-1]
         tgt_dx = tgt[:, :, :, 1:] - tgt[:, :, :, :-1]
         fake_dy = fake[:, :, 1:, :] - fake[:, :, :-1, :]
         tgt_dy = tgt[:, :, 1:, :] - tgt[:, :, :-1, :]
         return 0.5 * (F.l1_loss(fake_dx, tgt_dx) + F.l1_loss(fake_dy, tgt_dy))
+
+    def sobel_edges(x):
+        channels = x.shape[1]
+        kx = x.new_tensor(((-1, 0, 1), (-2, 0, 2), (-1, 0, 1))).view(1, 1, 3, 3) / 8
+        ky = kx.transpose(2, 3)
+        kx = kx.repeat(channels, 1, 1, 1)
+        ky = ky.repeat(channels, 1, 1, 1)
+        padded = F.pad(x, (1, 1, 1, 1), mode="reflect")
+        return (
+            F.conv2d(padded, kx, groups=channels),
+            F.conv2d(padded, ky, groups=channels),
+        )
+
+    def multiscale_sobel_loss(fake, tgt):
+        losses = []
+        for scale in (1, 2, 4):
+            if scale > 1:
+                f = F.avg_pool2d(fake, scale, scale)
+                t = F.avg_pool2d(tgt, scale, scale)
+            else:
+                f, t = fake, tgt
+            fdx, fdy = sobel_edges(f)
+            tdx, tdy = sobel_edges(t)
+            losses.append(0.5 * (F.l1_loss(fdx, tdx) + F.l1_loss(fdy, tdy)))
+        return sum(losses) / len(losses)
+
+    def edge_loss(fake, tgt):
+        if args.edge_mode == "sobel-ms":
+            return multiscale_sobel_loss(fake, tgt)
+        return difference_edge_loss(fake, tgt)
+
+    def set_requires_grad(model, enabled):
+        for parameter in model.parameters():
+            parameter.requires_grad_(enabled)
 
     def g_losses(inp, tgt, w_adv_eff, face_mask=None):
         with amp_context():
@@ -667,10 +796,23 @@ def main():
             edge = edge_loss(perceptual_fake if face_mask is not None else fake, tgt)
             g = args.w_l1 * l1 + args.w_perc * perc + args.w_edge * edge
             adv = torch.tensor(0.0, device=dev)
+            fm = torch.tensor(0.0, device=dev)
             if w_adv_eff > 0:
-                df = D(torch.cat([inp, fake], 1) if args.conditional_gan else fake)
+                fake_d_input = torch.cat([inp, fake], 1) if args.conditional_gan else fake
+                real_d_input = torch.cat([inp, tgt], 1) if args.conditional_gan else tgt
+                df, fake_features = D(fake_d_input, return_features=True)
                 adv = F.mse_loss(df, torch.ones_like(df))
                 g = g + w_adv_eff * adv
+                if args.w_fm > 0:
+                    with torch.no_grad():
+                        _, real_features = D(real_d_input, return_features=True)
+                    fm = sum(
+                        F.l1_loss(fake_feature, real_feature)
+                        for fake_feature, real_feature in zip(fake_features, real_features)
+                    ) / len(fake_features)
+                    # Introduce feature matching on the same ramp as adversarial training.
+                    fm_ramp = min(1.0, w_adv_eff / max(args.w_adv, 1e-12))
+                    g = g + args.w_fm * fm_ramp * fm
             if args.w_tv > 0:
                 tv = ((fake[:, :, 1:] - fake[:, :, :-1]).abs().mean()
                       + (fake[:, :, :, 1:] - fake[:, :, :, :-1]).abs().mean())
@@ -681,7 +823,7 @@ def main():
                 idl = F.relu(cos - args.id_margin).mean()
                 g = g + args.id_loss * idl
         return fake, g, dict(l1=l1.item(), perc=perc.item(), edge=edge.item(),
-                             adv=float(adv.detach()), idl=float(idl.detach()))
+                             adv=float(adv.detach()), fm=float(fm.detach()), idl=float(idl.detach()))
 
     def d_loss(inp, tgt):
         with amp_context():
@@ -696,9 +838,12 @@ def main():
         print(f"[smoke] dev={dev} size={args.size}")
         inp = torch.rand(2, 3, args.size, args.size, device=dev) * 2 - 1
         tgt = torch.rand(2, 3, args.size, args.size, device=dev) * 2 - 1
+        set_requires_grad(D, True)
         dl = d_loss(inp, tgt); optD.zero_grad(); dl.backward(); optD.step()
+        set_requires_grad(D, False)
         fake, gl, parts = g_losses(inp, tgt, args.w_adv); optG.zero_grad(); gl.backward(); optG.step()
-        d_input = torch.cat([inp, fake], 1) if args.conditional_gan else inp
+        set_requires_grad(D, True)
+        d_input = torch.cat([inp, fake], 1) if args.conditional_gan else fake
         print(f"[smoke] out={tuple(fake.shape)} D_patch={tuple(D(d_input).shape)} d={dl.item():.3f} g={gl.item():.3f} {parts}")
         print(f"[smoke] G params={sum(p.numel() for p in G.parameters())/1e6:.2f}M → 배선 OK")
         return
@@ -764,6 +909,8 @@ def main():
     print(f"[data] train={len(ds)} val={len(val_ds) if val_ds else 0} "
           f"aug_mix={aug_mix} face_mask_weight={args.face_mask_weight:g} "
           f"localize_manifest={args.localize_manifest or 'none'}")
+    print(f"[model] gen_arch={args.gen_arch} gen_ch={args.gen_ch} "
+          f"params={sum(p.numel() for p in G.parameters())/1e6:.2f}M")
     print(f"[speed] amp={args.amp} perc_size={args.perc_size or args.size} tf32={dev == 'cuda'}")
 
     for name, pairs in (("train_stems.txt", train_pairs), ("val_stems.txt", val_pairs)):
@@ -818,16 +965,19 @@ def main():
             face_mask = face_mask.to(dev, non_blocking=True)
         w_adv_eff = 0.0 if step <= args.init_steps else args.w_adv * min(1.0, (step - args.init_steps) / max(1, args.adv_ramp))
         if w_adv_eff > 0:
+            set_requires_grad(D, True)
             dl = d_loss(inp, tgt); optD.zero_grad(); dl.backward(); optD.step()
         else:
             dl = torch.tensor(0.0)
+        set_requires_grad(D, False)
         fake, gl, parts = g_losses(inp, tgt, w_adv_eff, face_mask); optG.zero_grad(); gl.backward(); optG.step()
+        set_requires_grad(D, True)
         if step % 100 == 0:
             elapsed = time.perf_counter() - log_time
             steps_per_second = (step - log_step) / max(elapsed, 1e-9)
             print(f"[{step}/{args.steps}] wadv={w_adv_eff:.2f} D={float(dl):.3f} G={gl.item():.3f} "
                   f"l1={parts['l1']:.3f} perc={parts['perc']:.3f} edge={parts['edge']:.3f} "
-                  f"adv={parts['adv']:.2f} "
+                  f"adv={parts['adv']:.2f} fm={parts['fm']:.3f} "
                   f"id={parts['idl']:.3f} step/s={steps_per_second:.2f}")
             log_time = time.perf_counter()
             log_step = step
