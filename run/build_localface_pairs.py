@@ -18,6 +18,8 @@ from PIL import Image
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from deid_cartoon import Detector
+from crop_utils import (crop_with_edge_padding, occupancy_crop_bounds,
+                        pad_ratio, square_crop_bounds)
 from pair_utils import discover_pairs
 
 
@@ -46,33 +48,6 @@ def largest_face(boxes):
     if not boxes:
         return None
     return max(boxes, key=lambda b: max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1]) * b[4])
-
-
-def square_crop_bounds(box, width, height, expand):
-    x1, y1, x2, y2 = box[:4]
-    bw, bh = x2 - x1, y2 - y1
-    side = max(bw, bh) * (1.0 + 2.0 * expand)
-    cx, cy = (x1 + x2) * 0.5, (y1 + y2) * 0.5
-    left = int(np.floor(cx - side * 0.5))
-    top = int(np.floor(cy - side * 0.5))
-    right = int(np.ceil(cx + side * 0.5))
-    bottom = int(np.ceil(cy + side * 0.5))
-    return left, top, right, bottom
-
-
-def crop_with_reflect(image, bounds):
-    left, top, right, bottom = bounds
-    height, width = image.shape[:2]
-    pad_left, pad_top = max(0, -left), max(0, -top)
-    pad_right, pad_bottom = max(0, right - width), max(0, bottom - height)
-    if pad_left or pad_top or pad_right or pad_bottom:
-        image = cv2.copyMakeBorder(
-            image, pad_top, pad_bottom, pad_left, pad_right, cv2.BORDER_REFLECT_101
-        )
-    return image[
-        top + pad_top:bottom + pad_top,
-        left + pad_left:right + pad_left,
-    ]
 
 
 def face_oval_mask(box, bounds, output_size, scale_x, scale_y, feather):
@@ -121,10 +96,26 @@ def main():
         "--manifest-only", action="store_true",
         help="Detect and save crop metadata only; do not duplicate input/target PNG files",
     )
+    parser.add_argument(
+        "--face-occupancy", type=float, default=0.0, dest="face_occupancy",
+        help="얼굴 면적 / 크롭 면적. 0=--crop-expand 사용. 권장 0.65 (학습·런타임 공유값)",
+    )
+    parser.add_argument(
+        "--max-pad", type=float, default=0.02, dest="max_pad",
+        help="이 비율을 넘는 합성 픽셀이 필요한 페어는 제외한다",
+    )
+    parser.add_argument(
+        "--no-blend", action="store_true", dest="no_blend",
+        help="타원 블렌딩 없이 teacher crop 자체를 target으로. 합성은 런타임 전용",
+    )
     args = parser.parse_args()
 
     if args.crop_expand < 0:
         parser.error("--crop-expand must be non-negative")
+    if args.face_occupancy and not 0.0 < args.face_occupancy < 1.0:
+        parser.error("--face-occupancy must be in (0,1)")
+    if not 0.0 <= args.max_pad <= 1.0:
+        parser.error("--max-pad must be in [0,1]")
     if args.output_size <= 0:
         parser.error("--output-size must be positive")
     if args.mask_scale_x <= 0 or args.mask_scale_y <= 0:
@@ -186,7 +177,15 @@ def main():
                 print(f"[reject {index}/{len(pairs)}] no face: {pair.stem}")
                 continue
 
-            bounds = square_crop_bounds(box, width, height, args.crop_expand)
+            if args.face_occupancy > 0:
+                bounds = occupancy_crop_bounds(box, args.face_occupancy)
+            else:
+                bounds = square_crop_bounds(box, width, height, args.crop_expand)
+            pad = pad_ratio(bounds, width, height)
+            if pad > args.max_pad:
+                rejected += 1
+                print(f"[reject {index}/{len(pairs)}] pad={pad:.3f}: {pair.stem}")
+                continue
             if not args.manifest_only:
                 teacher = load_bgr(pair.target_path)
                 if teacher.shape[:2] != real.shape[:2]:
@@ -194,23 +193,26 @@ def main():
                         teacher, (width, height), interpolation=cv2.INTER_AREA
                     )
                 real_crop = cv2.resize(
-                    crop_with_reflect(real, bounds), (args.output_size, args.output_size),
+                    crop_with_edge_padding(real, bounds), (args.output_size, args.output_size),
                     interpolation=cv2.INTER_AREA,
                 )
                 teacher_crop = cv2.resize(
-                    crop_with_reflect(teacher, bounds), (args.output_size, args.output_size),
+                    crop_with_edge_padding(teacher, bounds), (args.output_size, args.output_size),
                     interpolation=cv2.INTER_AREA,
                 )
                 mask = face_oval_mask(
                     box, bounds, args.output_size, args.mask_scale_x,
                     args.mask_scale_y, args.feather,
                 )
-                alpha = mask.astype(np.float32)[:, :, None] / 255.0
-                localized = np.clip(
-                    teacher_crop.astype(np.float32) * alpha
-                    + real_crop.astype(np.float32) * (1.0 - alpha),
-                    0, 255,
-                ).astype(np.uint8)
+                if args.no_blend:
+                    localized = teacher_crop          # 정답 = teacher crop 그대로
+                else:
+                    alpha = mask.astype(np.float32)[:, :, None] / 255.0
+                    localized = np.clip(
+                        teacher_crop.astype(np.float32) * alpha
+                        + real_crop.astype(np.float32) * (1.0 - alpha),
+                        0, 255,
+                    ).astype(np.uint8)
 
                 atomic_write_image(input_out, real_crop)
                 atomic_write_image(target_out, localized)
@@ -223,6 +225,9 @@ def main():
                 "box": [round(float(value), 3) for value in box],
                 "crop_bounds": bounds,
                 "crop_expand": args.crop_expand,
+                "face_occupancy": args.face_occupancy,
+                "pad_ratio": round(float(pad), 4),
+                "blend": not args.no_blend,
                 "mask_scale": [args.mask_scale_x, args.mask_scale_y],
                 "feather": args.feather,
             }

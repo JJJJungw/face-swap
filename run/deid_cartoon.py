@@ -9,6 +9,8 @@
 """
 import os, sys, argparse, subprocess, ssl, urllib.request, time
 import numpy as np, cv2
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from crop_utils import occupancy_crop_bounds
 
 # ============ 검출 파라미터 (face-deid presets "default") ============
 DET_LOW=0.20; NMS=0.45; MIN_SIZE=19; MAX_FRAC=0.90; BIG_FRAC=0.45; BIG_CONF=0.5
@@ -191,12 +193,17 @@ def blur_crop(crop, mode="pixelate", cap=12):
 
 def composite(frame, boxes, stylizer, cartoon_min, blur_mode="pixelate", expand=0.15,
               color_match=0.0, square_crop=False, mask_mode="crop-ellipse",
-              mask_scale_x=0.92, mask_scale_y=1.0, mask_feather=0.04):
+              mask_scale_x=0.92, mask_scale_y=1.0, mask_feather=0.04, occupancy=0.0):
     H, W = frame.shape[:2]; nc = nb = 0
     for x1, y1, x2, y2, sc in boxes:
         bw, bh = x2-x1, y2-y1; size = max(bw, bh)
         if square_crop:
-            side = size * (1.0 + 2.0 * expand)
+            # 학습 크롭과 같은 규칙. occupancy 를 주면 얼굴 면적비로 정한다.
+            if occupancy > 0:
+                ox1, oy1, ox2, oy2 = occupancy_crop_bounds((x1, y1, x2, y2), occupancy)
+                side = float(ox2 - ox1)
+            else:
+                side = size * (1.0 + 2.0 * expand)
             center_x, center_y = (x1 + x2) * 0.5, (y1 + y2) * 0.5
             cx1 = int(np.floor(center_x - side * 0.5))
             cy1 = int(np.floor(center_y - side * 0.5))
@@ -257,6 +264,8 @@ def main():
     ap.add_argument("--size", type=int, default=1280)
     ap.add_argument("--cartoon-min", type=int, default=150, dest="cartoon_min", help="이 픽셀 이상 → 카툰, 미만 → 블러")
     ap.add_argument("--blur-mode", default="pixelate", choices=["pixelate", "gaussian", "box"], dest="blur_mode")
+    ap.add_argument("--face-occupancy", type=float, default=0.0, dest="face_occupancy",
+                    help="얼굴 면적 / 크롭 면적. 0=--face-expand 사용. 학습 매니페스트와 같은 값을 쓴다")
     ap.add_argument("--color-match", type=float, default=0.0, dest="color_match", help="원본 색감 매칭 0~1")
     ap.add_argument("--face-expand", type=float, default=0.15, dest="face_expand",
                     help="검출 얼굴 박스 바깥으로 모델 입력 crop을 확장할 비율")
@@ -319,7 +328,7 @@ def main():
         nc, nb = composite(
             frame, boxes, styl, args.cartoon_min, args.blur_mode,
             expand=args.face_expand, color_match=args.color_match,
-            square_crop=args.square_crop, mask_mode=args.mask_mode,
+            square_crop=args.square_crop, mask_mode=args.mask_mode, occupancy=args.face_occupancy,
             mask_scale_x=args.mask_scale_x, mask_scale_y=args.mask_scale_y,
             mask_feather=args.mask_feather,
         )

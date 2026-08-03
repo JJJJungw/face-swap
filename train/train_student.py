@@ -36,6 +36,7 @@ from PIL import Image
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "run"))
 from pair_utils import discover_pairs
+from crop_utils import crop_with_edge_padding
 
 # ============ Generator (animegan2-pytorch 구조 재구현, MIT 귀속 — 런타임 호환) ============
 class ConvNormLReLU(nn.Sequential):
@@ -372,17 +373,6 @@ def load_localize_manifest(path):
     return records
 
 
-def crop_with_reflect(image, bounds):
-    left, top, right, bottom = [int(value) for value in bounds]
-    height, width = image.shape[:2]
-    pad_left, pad_top = max(0, -left), max(0, -top)
-    pad_right, pad_bottom = max(0, right - width), max(0, bottom - height)
-    if pad_left or pad_top or pad_right or pad_bottom:
-        image = cv2.copyMakeBorder(
-            image, pad_top, pad_bottom, pad_left, pad_right, cv2.BORDER_REFLECT_101
-        )
-    return image[top + pad_top:bottom + pad_top, left + pad_left:right + pad_left]
-
 
 def manifest_face_mask(record, output_size):
     left, top, right, bottom = [float(value) for value in record["crop_bounds"]]
@@ -450,16 +440,19 @@ class PairImgs(Dataset):
                 b = cv2.resize(b, (a.shape[1], a.shape[0]), interpolation=cv2.INTER_AREA)
             bounds = record["crop_bounds"]
             a = cv2.resize(
-                crop_with_reflect(a, bounds), (self.size, self.size), interpolation=cv2.INTER_AREA
+                crop_with_edge_padding(a, bounds), (self.size, self.size), interpolation=cv2.INTER_AREA
             )
             b = cv2.resize(
-                crop_with_reflect(b, bounds), (self.size, self.size), interpolation=cv2.INTER_AREA
+                crop_with_edge_padding(b, bounds), (self.size, self.size), interpolation=cv2.INTER_AREA
             )
             mask = manifest_face_mask(record, self.size)
-            alpha = mask.astype(np.float32)[:, :, None] / 255.0
-            b = np.clip(
-                b.astype(np.float32) * alpha + a.astype(np.float32) * (1.0 - alpha), 0, 255
-            ).astype(np.uint8)
+            # 블렌딩 여부는 매니페스트가 정한다. blend=False 면 정답 = teacher crop 그대로이고
+            # 타원 합성은 런타임(deid_cartoon.composite)에서만 한다.
+            if record.get("blend", True):
+                alpha = mask.astype(np.float32)[:, :, None] / 255.0
+                b = np.clip(
+                    b.astype(np.float32) * alpha + a.astype(np.float32) * (1.0 - alpha), 0, 255
+                ).astype(np.uint8)
             if not self.load_masks:
                 mask = None
         elif self.load_masks:
