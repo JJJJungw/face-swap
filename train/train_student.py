@@ -115,9 +115,9 @@ class Generator(nn.Module):
 
 # ============ Discriminator (PatchGAN + spectral norm) ============
 class Discriminator(nn.Module):
-    def __init__(self, ch=48, n=3):
+    def __init__(self, ch=48, n=3, in_channels=3):
         super().__init__()
-        L = [spectral_norm(nn.Conv2d(3, ch, 3, 1, 1)), nn.LeakyReLU(0.2, True)]
+        L = [spectral_norm(nn.Conv2d(in_channels, ch, 3, 1, 1)), nn.LeakyReLU(0.2, True)]
         c = ch
         for _ in range(n):
             L += [spectral_norm(nn.Conv2d(c, c * 2, 3, 2, 1)), nn.LeakyReLU(0.2, True),
@@ -459,6 +459,10 @@ def main():
     ap.add_argument("--w-l1", type=float, default=10.0, dest="w_l1", help="target 직접재현(주력)")
     ap.add_argument("--w-perc", type=float, default=1.0, dest="w_perc", help="다층 perceptual(디테일)")
     ap.add_argument("--w-adv", type=float, default=1.0, dest="w_adv", help="경량 adversarial(선명)")
+    ap.add_argument("--w-edge", type=float, default=0.0, dest="w_edge",
+                    help="target 윤곽 gradient L1. 애니 눈/코/턱선 재현은 2~4 권장")
+    ap.add_argument("--conditional-gan", action="store_true", dest="conditional_gan",
+                    help="PatchGAN이 input+output 쌍을 판별하여 입력과 맞는 선명한 변환을 강제")
     ap.add_argument("--w-tv", type=float, default=0.0, dest="w_tv")
     ap.add_argument("--id-loss", type=float, default=0.0, dest="id_loss", help="신원억제(0=off). input 신원에서 멀어지게")
     ap.add_argument("--id-margin", type=float, default=0.3, dest="id_margin")
@@ -540,7 +544,7 @@ def main():
         return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
 
     G = Generator(args.gen_ch).to(dev)
-    D = Discriminator(args.d_ch, args.d_n).to(dev)
+    D = Discriminator(args.d_ch, args.d_n, 6 if args.conditional_gan else 3).to(dev)
     vgg = VGGPerceptual(allow_random=args.smoke).to(dev)
     idm = load_id(dev) if args.id_loss > 0 else None
     optG = Adam(G.parameters(), args.lr, betas=(0.5, 0.999))
@@ -641,6 +645,13 @@ def main():
             )
         return vgg(fake, tgt)
 
+    def edge_loss(fake, tgt):
+        fake_dx = fake[:, :, :, 1:] - fake[:, :, :, :-1]
+        tgt_dx = tgt[:, :, :, 1:] - tgt[:, :, :, :-1]
+        fake_dy = fake[:, :, 1:, :] - fake[:, :, :-1, :]
+        tgt_dy = tgt[:, :, 1:, :] - tgt[:, :, :-1, :]
+        return 0.5 * (F.l1_loss(fake_dx, tgt_dx) + F.l1_loss(fake_dy, tgt_dy))
+
     def g_losses(inp, tgt, w_adv_eff, face_mask=None):
         with amp_context():
             fake = G(inp)
@@ -653,10 +664,11 @@ def main():
             else:
                 l1 = F.l1_loss(fake, tgt)                # target 직접 재현
                 perc = perceptual_loss(fake, tgt)        # 다층 perceptual
-            g = args.w_l1 * l1 + args.w_perc * perc
+            edge = edge_loss(perceptual_fake if face_mask is not None else fake, tgt)
+            g = args.w_l1 * l1 + args.w_perc * perc + args.w_edge * edge
             adv = torch.tensor(0.0, device=dev)
             if w_adv_eff > 0:
-                df = D(fake)
+                df = D(torch.cat([inp, fake], 1) if args.conditional_gan else fake)
                 adv = F.mse_loss(df, torch.ones_like(df))
                 g = g + w_adv_eff * adv
             if args.w_tv > 0:
@@ -668,12 +680,16 @@ def main():
                 cos = (id_embed(idm, inp) * id_embed(idm, fake)).sum(1)
                 idl = F.relu(cos - args.id_margin).mean()
                 g = g + args.id_loss * idl
-        return fake, g, dict(l1=l1.item(), perc=perc.item(), adv=float(adv.detach()), idl=float(idl.detach()))
+        return fake, g, dict(l1=l1.item(), perc=perc.item(), edge=edge.item(),
+                             adv=float(adv.detach()), idl=float(idl.detach()))
 
     def d_loss(inp, tgt):
         with amp_context():
             fake = G(inp).detach()
-            dr, df = D(tgt), D(fake)                      # 진짜 애니 target →1, 생성물 →0
+            if args.conditional_gan:
+                dr, df = D(torch.cat([inp, tgt], 1)), D(torch.cat([inp, fake], 1))
+            else:
+                dr, df = D(tgt), D(fake)                  # 진짜 애니 target →1, 생성물 →0
             return 0.5 * (F.mse_loss(dr, torch.ones_like(dr)) + F.mse_loss(df, torch.zeros_like(df)))
 
     if args.smoke:
@@ -682,7 +698,8 @@ def main():
         tgt = torch.rand(2, 3, args.size, args.size, device=dev) * 2 - 1
         dl = d_loss(inp, tgt); optD.zero_grad(); dl.backward(); optD.step()
         fake, gl, parts = g_losses(inp, tgt, args.w_adv); optG.zero_grad(); gl.backward(); optG.step()
-        print(f"[smoke] out={tuple(fake.shape)} D_patch={tuple(D(inp).shape)} d={dl.item():.3f} g={gl.item():.3f} {parts}")
+        d_input = torch.cat([inp, fake], 1) if args.conditional_gan else inp
+        print(f"[smoke] out={tuple(fake.shape)} D_patch={tuple(D(d_input).shape)} d={dl.item():.3f} g={gl.item():.3f} {parts}")
         print(f"[smoke] G params={sum(p.numel() for p in G.parameters())/1e6:.2f}M → 배선 OK")
         return
 
@@ -809,7 +826,8 @@ def main():
             elapsed = time.perf_counter() - log_time
             steps_per_second = (step - log_step) / max(elapsed, 1e-9)
             print(f"[{step}/{args.steps}] wadv={w_adv_eff:.2f} D={float(dl):.3f} G={gl.item():.3f} "
-                  f"l1={parts['l1']:.3f} perc={parts['perc']:.3f} adv={parts['adv']:.2f} "
+                  f"l1={parts['l1']:.3f} perc={parts['perc']:.3f} edge={parts['edge']:.3f} "
+                  f"adv={parts['adv']:.2f} "
                   f"id={parts['idl']:.3f} step/s={steps_per_second:.2f}")
             log_time = time.perf_counter()
             log_step = step
