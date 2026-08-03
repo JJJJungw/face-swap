@@ -1,7 +1,13 @@
 # 코퍼스 생성 이후 실행 순서 (2511 teacher)
 
-`out/pairs_2511` 1000쌍 생성이 끝난 뒤부터 학생 확정까지의 순서다.
+`out/pairs_2511` **11,000쌍**(기존 1,000 + 신규 10,000) 생성이 끝난 뒤부터 학생 확정까지.
 각 단계는 **앞 단계가 통과해야 의미가 있다** — 건너뛰면 나중에 원인 분리가 안 된다.
+
+> **이번 라운드가 이전과 다른 점 (세 가지가 동시에 바뀜)**
+> ① 데이터 1,000 → **11,000쌍** ② `--aug-level 3` 도메인 갭 인공 열화
+> ③ 손실 재조정 `w-l1 10 → 3`, `w-perc 1 → 2`
+> 이전(1,000쌍 / 증강 없음 / L1 10) 6,000스텝에서는 카툰화가 거의 안 됐다.
+> 이번에도 안 되면 원인은 학습이 아니라 **teacher 화풍 자체**일 가능성이 크다.
 
 ---
 
@@ -9,23 +15,32 @@
 
 ```bash
 cd ~/face-swap && source .venv/bin/activate
-ls out/pairs_2511/input | wc -l
-ls out/pairs_2511/target | wc -l          # 둘 다 1000이어야 함
-tail -3 out/corpus_2511.log
+echo "input  $(ls out/pairs_2511/input | wc -l)"
+echo "target $(ls out/pairs_2511/target | wc -l)"     # 둘 다 11000 근처
+wc -l < out/pairs_2511/manifest.jsonl
+tail -3 out/corpus_10k.log
+df -h /
 ```
 
-`input`과 `target` 수가 다르면 마지막 장이 중단된 것 — `pair_qc.py`가 공통 파일명만 쓰므로 무해하다.
+input·target 수가 1 차이 나면 마지막 장이 중단된 것 — `pair_qc.py`가 공통 파일명만 쓰므로 무해하다.
+
+**더 뽑고 싶으면** (중복 자동 회피, 번호 이어붙임):
+```bash
+python3 run/qwen2511_pairgen.py --input input/sfhq_t2i/images/images \
+  --out out/pairs_2511 --n 10000 --every 6 --resume --size 768 --prompt "$P"
+# → manifest의 src를 키로 이미 쓴 원본을 제외하고 pair_11000 부터 이어서 생성
+```
 
 ---
 
 ## 1. 자동 QC → 큐레이션
 
-**왜:** Lightning(4step)은 `true_cfg_scale=1.0`이라 negative_prompt가 무시된다.
+**왜:** Lightning(4step)은 `true_cfg_scale=1.0`이라 **negative_prompt가 무시된다.**
 `extra person, deformed` 가드가 없으므로 인물 추가·구도 붕괴가 섞여 있다.
-정답지에 오답이 섞인 채로 학습시키면 학생이 규칙을 못 배운다.
+정답지에 오답이 섞이면 학생이 규칙을 못 배운다.
 
 ```bash
-python3 run/pair_qc.py --dir out/pairs_2511
+python3 run/pair_qc.py --dir out/pairs_2511      # 11,000쌍이면 15~25분
 ```
 
 출력물:
@@ -36,118 +51,131 @@ python3 run/pair_qc.py --dir out/pairs_2511
 **반드시 컨택트시트를 눈으로 확인한 뒤** 제외한다(자동 판정은 참고용):
 
 ```bash
-# 미리보기
-python3 run/pair_curate.py --dir out/pairs_2511 --reject <출력된문자열>
-# 실제 이동 (삭제 아님. rejected/ 로 옮김 → 되돌리기 가능)
-python3 run/pair_curate.py --dir out/pairs_2511 --reject <출력된문자열> --apply
+python3 run/pair_curate.py --dir out/pairs_2511 --reject <문자열>          # 미리보기
+python3 run/pair_curate.py --dir out/pairs_2511 --reject <문자열> --apply  # rejected/ 로 이동
 ```
 
-**판단 기준:** 불량률이 10% 이하면 정상. 30%를 넘으면 프롬프트나 teacher 설정 자체를 의심할 것.
+**기준선(1,000쌍 시점):** ECC 중앙값 0.933 · 불량률 1.5% · CV 평균 0.248
+불량률이 5%를 넘거나 ECC 중앙값이 0.9 아래면 teacher 설정을 의심할 것.
 
 ---
 
 ## 2. 신원 잔존도 측정 (teacher 기준)
 
-**왜:** 학생은 L1으로 target을 따라가므로, `--id-loss 0`일 때 학생의 신원 점수는
-target의 값에서 출발한다. 즉 여기서 나온 값이 **id-loss가 해야 할 일의 양**이다.
-
 ```bash
-# ★ 반드시 --no-deps. 그냥 설치하면 torch 를 2.2.2+cu121 로 끌어내려
-#   onnxruntime(CUDA13 빌드)이 libcudart.so.13 를 못 찾아 죽는다. (2026-07-29 실제 발생)
-pip install --no-deps facenet-pytorch && pip install requests tqdm
-python3 -c "import torch; print(torch.__version__)"   # 2.13.0+cu130 유지 확인
-
-python3 run/measure_id.py --dir out/pairs_2511 --dir out/pairs_fp3 --n 100
+python3 run/measure_id.py --dir out/pairs_2511 --dir out/pairs_fp3 --n 200
 ```
 
-2509(`pairs_fp3`)와 나란히 비교된다. 해석:
+**이미 측정된 값 (1,000쌍 시점):**
 
-| 중앙값 | 의미 | 다음 |
+| 코퍼스 | 중앙값 | >0.5 |
 |---|---|---|
-| > 0.6 | 스타일화만으로 비식별 실패 | id-loss 높게 필요 → 표정 손상 위험 큼 |
-| 0.35~0.6 | 부분 비식별 | id-loss 중간 |
-| < 0.3 | 이미 margin 이하 | id-loss 없이도 충족 |
+| pairs_2511 | **0.799** | 100% |
+| pairs_fp3 (2509) | 0.434 | 38% |
+
+11,000쌍에서도 비슷하게 나오는지만 확인. **2511은 스타일화로 신원을 지우지 못하므로
+비식별화는 전적으로 학생의 id-loss가 책임진다** — 이게 이 프로젝트의 미해결 리스크다.
+`--style-scale` 1.0→2.0 스윕도 0.825→0.739밖에 안 떨어져 레버가 아님이 확인됐다.
 
 ---
 
-## 3. 학습 사전 점검 (스모크)
-
-**왜 건너뛰면 안 되는가:** `train_student.py`는 VGG19 가중치 다운로드가 실패해도
-**랜덤 init으로 조용히 넘어간다**(`[vgg] 가중치 다운로드 실패 → 랜덤init`).
-40000 스텝을 돌린 뒤에 발견하면 전부 날린다.
+## 3. 학습 사전 점검
 
 ```bash
-python3 train/train_student.py --smoke
+python3 train/train_student.py --smoke                 # 배선
+python3 -c "                                           # 증강 경로 (--smoke는 이걸 안 탄다)
+import sys, torch; sys.path.insert(0,'train')
+from train_student import PairImgs
+ds = PairImgs('out/pairs_2511', 512, False, 3)
+for i in range(30):
+    a,b = ds[i%len(ds)]
+    assert a.shape==(3,512,512) and torch.isfinite(a).all()
+print(f'페어 {len(ds)}쌍 | aug_level=3 정상')
+"
 ```
 
-로그에서 확인할 것:
-- `[vgg] 가중치 다운로드 실패` 가 **없어야** 한다
-- 손실이 NaN이 아니어야 한다
-- VRAM이 터지지 않아야 한다
+**⚠️ `[vgg] 가중치 다운로드 실패` 가 뜨면 즉시 중단.**
+랜덤 init으로 조용히 넘어가서 40,000스텝을 통째로 날린다.
 
 ---
 
 ## 4. 본 학습 — 1차는 반드시 `--id-loss 0`
 
-**왜 0인가:** 화풍 재현과 신원 제거를 동시에 켜면, 결과가 나빠도
-원인이 화풍인지 id-loss인지 구분할 수 없다. 먼저 "이 그림체를 학생이 낼 수 있는가"만 본다.
+**왜 0인가:** 화풍 재현과 신원 제거를 동시에 켜면 결과가 나빠도 원인을 구분할 수 없다.
+먼저 "이 그림체를 1.36M 학생이 낼 수 있는가"만 본다.
 
 ```bash
-tmux new -s train2511
+tmux new -s train11k
 cd ~/face-swap && source .venv/bin/activate
+
 python3 train/train_student.py --data out/pairs_2511 \
-  --out train/student_2511_id00 --size 512 --batch 8 \
-  --init-steps 1500 --steps 40000 --id-loss 0 \
-  2>&1 | tee out/train_2511_id00.log
+  --out train/s_aug3 --size 512 --batch 8 --steps 40000 \
+  --aug-level 3 \
+  --w-l1 3.0 --w-perc 2.0 --w-adv 1.0 --init-steps 2000 --adv-ramp 4000 \
+  --id-loss 0 \
+  2>&1 | tee out/train_aug3.log
 ```
 
-중간 샘플이 `train/student_2511_id00/samples/s0*.png`로 500스텝마다 떨어진다.
-**s005000 즈음에 한 번 보고** 뭉개지고 있으면 일찍 끊는다.
+### 지켜볼 것
+
+| 구간 | 정상 | 이상 신호 |
+|---|---|---|
+| ~2,000 (워밍업) | `wadv=0.00`, l1 하락 | l1이 안 내려감 |
+| **2,000~6,000 (adv 램프)** ★ | `D≈0.25` 유지 | **D가 0.05 아래 = 판별자 승리** |
+| 이후 | l1 완만히 하락 | adv 급등, l1 튐 |
+
+**`D=0.25`가 LSGAN 평형점**이다(진짜·가짜 둘 다 0.5로 찍을 때). 이전 라운드에서는
+5,200스텝에서 D가 0.02까지 떨어지고 adv가 4배로 뛰었다 — 그래서 이번엔 램프를 2,000→4,000으로 늘렸다.
+그래도 D가 무너지면 `--w-adv 0.5` 로 재시작.
+
+샘플은 500스텝마다 `train/s_aug3/samples/s0*.png`.
+**행 순서: 1행=입력 / 2행=학생 출력 / 3행=teacher 정답.**
+`s005000` 즈음에 2행이 3행 쪽으로 가고 있는지 확인 — 1행(사진)에 머물러 있으면 일찍 끊는다.
 
 ---
 
 ## 5. 학생 평가
 
 ```bash
-python3 run/eval_student.py \
-  --ckpt train/student_2511_id00/student_final.pt \
-  --data out/pairs_2511 --n 64 --size 512
+python3 run/eval_student.py --data out/pairs_2511 --n 64 --size 512 \
+  --ckpt train/s_aug3/student_final.pt
 ```
-
-3축을 동시에 본다:
 
 | 지표 | 방향 | 의미 |
 |---|---|---|
-| 신원cos | ↓ | 0.3 아래가 목표 (비식별) |
+| 신원cos | ↓ | 0.3(=`--id-margin`) 아래가 목표 |
 | 화풍L1 | ↓ | teacher 화풍 재현도. 높으면 뭉갠 것 |
 | ms/face | ↓ | eager 기준. TensorRT로 ~6.8배 빨라짐 |
 
-**이 시점의 판정:**
-- 화풍L1이 낮고 시트가 선명 → 2511 채택 확정, 6단계로
-- 뭉개짐 → 코퍼스가 아니라 학생 용량 문제 → `--gen-ch 48` 또는 화풍 재검토
+**판정:**
+- 화풍L1 낮고 시트가 선명 → 6단계로
+- 여전히 뭉갬 → **teacher 화풍을 재검토**(2511은 원본에 가까워 학생이 배울 델타가 작다).
+  선택지: ⓐ `--gen-ch 48`로 용량↑ ⓑ 다른 화풍 LoRA ⓒ 2509 복귀
 
 ---
 
 ## 6. id-loss 스윕
 
-화풍 재현이 확인된 뒤에만 착수한다. 3개를 각각 학습해 비교:
+화풍 재현이 확인된 뒤에만. teacher cos 0.80에서 출발하므로 밀어야 할 거리가 멀다.
 
 ```bash
 for W in 0.5 2.0 5.0; do
   python3 train/train_student.py --data out/pairs_2511 \
-    --out train/student_2511_id${W} --size 512 --batch 8 \
-    --steps 20000 --id-loss $W --id-margin 0.3
+    --out train/s_id${W} --size 512 --batch 8 --steps 20000 \
+    --aug-level 3 --w-l1 3.0 --w-perc 2.0 --w-adv 1.0 \
+    --id-loss $W --id-margin 0.3
 done
 
 python3 run/eval_student.py --data out/pairs_2511 --n 64 --size 512 \
-  --ckpt train/student_2511_id00/student_final.pt \
-  --ckpt train/student_2511_id0.5/student_final.pt \
-  --ckpt train/student_2511_id2.0/student_final.pt \
-  --ckpt train/student_2511_id5.0/student_final.pt
+  --ckpt train/s_aug3/student_final.pt \
+  --ckpt train/s_id0.5/student_final.pt \
+  --ckpt train/s_id2.0/student_final.pt \
+  --ckpt train/s_id5.0/student_final.pt
 ```
 
-**최적 지점:** 신원cos가 0.3 아래로 내려가는 것들 중 **화풍L1이 가장 낮은** 설정.
-id-loss는 content-loss와 싸우므로 "충분히 낮추는 최소값"이 정답이지 클수록 좋은 게 아니다.
+**최적점: 신원cos가 0.3 아래로 내려가는 것 중 화풍L1이 가장 낮은 설정.**
+id-loss는 content-loss와 정면으로 싸우므로 "충분히 낮추는 최소값"이 정답이지 클수록 좋은 게 아니다.
+표정·랜드마크가 깨지면 그 가중치는 탈락.
 
 ---
 
@@ -158,8 +186,26 @@ python3 run/export_student_onnx.py --ckpt <최적ckpt> --out gan_ckpt/student.on
 bash run/run_deid.sh --video input/swap4.mp4 --trt --gan-backend onnx --cartoon-min 150
 ```
 
-**속도 재측정 시 주의:** 개발 인스턴스는 L40S 46GB인데 하드 요구사항 기준은 **L4 24GB**다.
-그리고 `faceblur-api` 컨테이너가 GPU를 점유하므로 반드시 내리고 잰다:
+### `--cartoon-min` 재설정 ★
+
+기존 150은 **사전학습 `face_paint_512_v2`가 작은 얼굴에서 무너져서** 막아둔 우회책이다.
+`--aug-level 3`은 학습 샘플의 38%를 150px 미만(최소 62px)으로 넣어 **작은 얼굴을 명시적으로 학습**시킨다.
+따라서 학생이 성공하면 임계값을 낮출 수 있다:
+
+```bash
+for M in 150 100 80 64; do
+  bash run/run_deid.sh --video input/swap4.mp4 --trt --gan-backend onnx --cartoon-min $M
+  mv out/deid_cartoon.mp4 out/deid_min$M.mp4
+done
+```
+
+낮출수록 **카툰화 커버리지↑ = 비식별 커버리지↑**, 그리고 임계값 근처를 오가는 얼굴이 줄어
+**경계 튐(블러↔카툰 깜빡임) 문제 자체가 축소**된다.
+
+### 속도 재측정 주의
+
+기준 GPU는 **L4 24GB**인데 개발 인스턴스는 **L40S 46GB**(3~4배 빠름).
+현재 1.30×가 L40S 값이면 하드 요구사항 미달일 수 있다. 그리고 측정 전 GPU 점유 컨테이너를 내린다:
 
 ```bash
 sudo docker stop ubuntu-faceblur-1
@@ -169,13 +215,23 @@ sudo docker start ubuntu-faceblur-1
 
 ---
 
+## 환경 주의 (2026-07-29 사고)
+
+- `pip install facenet-pytorch` 를 **`--no-deps` 없이** 하면 torch 2.13.0+cu130 → 2.2.2+cu121로 끌어내려
+  onnxruntime이 `libcudart.so.13` 를 못 찾아 죽는다. 자세한 내용: `run/requirements-train.txt`
+- `HF_HUB_OFFLINE=1` 을 쓰면 diffusers `from_pretrained` 가 허브 메타데이터를 못 읽어 실패한다. **쓰지 말 것.**
+- 디스크: 2511 베이스 16G + Q8_0 GGUF 21G + 코퍼스 14G+ 로 빠르게 찬다.
+  안전한 정리 대상은 `.venv.bak.*`, `~/.cache/pip`.
+
+---
+
 ## 요약 체크리스트
 
-- [ ] 1000쌍 생성 완료
+- [ ] 11,000쌍 생성 완료 · 디스크 여유 확인
 - [ ] `pair_qc.py` → 컨택트시트 확인 → `pair_curate.py --apply`
-- [ ] `measure_id.py` — teacher 신원 잔존도 기록 (2509와 비교)
-- [ ] `--smoke` 통과 (VGG 가중치 로드 확인)
-- [ ] `--id-loss 0` 본 학습 → 화풍 재현 확인
+- [ ] `measure_id.py` — 신원 잔존도 기록
+- [ ] `--smoke` + PairImgs(aug_level=3) 배선 확인 · **VGG 가중치 로드 확인**
+- [ ] `--aug-level 3 --id-loss 0` 본 학습 → D=0.25 유지 감시
 - [ ] `eval_student.py` — 화풍L1 판정
 - [ ] id-loss 스윕 → 최적점
-- [ ] ONNX export → L4에서 속도 재측정
+- [ ] ONNX export → `--cartoon-min` 재설정 → L4에서 속도 재측정
