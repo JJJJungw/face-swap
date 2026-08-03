@@ -610,9 +610,17 @@ def main():
         start_step = int(state["step"])
         resume_state = state
         if "torch_rng" in state:
-            torch.set_rng_state(state["torch_rng"].cpu())
+            torch.set_rng_state(state["torch_rng"].detach().cpu().to(torch.uint8))
         if torch.cuda.is_available() and state.get("cuda_rng") is not None:
-            torch.cuda.set_rng_state_all(state["cuda_rng"])
+            cuda_rng = state["cuda_rng"]
+            if torch.is_tensor(cuda_rng):
+                cuda_rng = [cuda_rng]
+            cuda_rng = [
+                rng.detach().cpu().to(torch.uint8) if torch.is_tensor(rng)
+                else torch.as_tensor(rng, dtype=torch.uint8)
+                for rng in cuda_rng
+            ]
+            torch.cuda.set_rng_state_all(cuda_rng)
         if "python_rng" in state:
             random.setstate(state["python_rng"])
         if "numpy_rng" in state:
