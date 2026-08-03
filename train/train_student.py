@@ -20,7 +20,8 @@
   python train/train_student.py --data out/pairs_dataset --out train/student_paired \
     --size 256 --batch 8 --init-steps 1500 --steps 40000 --id-loss 0
 """
-import os, argparse, sys, random
+import os, argparse, sys, random, json, time
+from contextlib import nullcontext
 import cv2
 import numpy as np
 import torch
@@ -274,9 +275,63 @@ def parse_aug_mix(value):
     return [(level, weight / total) for level, weight in mix]
 
 
+def load_localize_manifest(path):
+    records = {}
+    if not path:
+        return records
+    with open(path, encoding="utf-8") as handle:
+        for line_number, raw in enumerate(handle, 1):
+            if not raw.strip():
+                continue
+            try:
+                record = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise SystemExit(f"invalid localize manifest at line {line_number}: {exc}") from exc
+            stem = record.get("stem")
+            if not stem or stem in records:
+                raise SystemExit(f"invalid or duplicate localize manifest stem at line {line_number}: {stem}")
+            if "box" not in record or "crop_bounds" not in record:
+                raise SystemExit(f"localize manifest line {line_number} lacks box/crop_bounds")
+            records[stem] = record
+    return records
+
+
+def crop_with_reflect(image, bounds):
+    left, top, right, bottom = [int(value) for value in bounds]
+    height, width = image.shape[:2]
+    pad_left, pad_top = max(0, -left), max(0, -top)
+    pad_right, pad_bottom = max(0, right - width), max(0, bottom - height)
+    if pad_left or pad_top or pad_right or pad_bottom:
+        image = cv2.copyMakeBorder(
+            image, pad_top, pad_bottom, pad_left, pad_right, cv2.BORDER_REFLECT_101
+        )
+    return image[top + pad_top:bottom + pad_top, left + pad_left:right + pad_left]
+
+
+def manifest_face_mask(record, output_size):
+    left, top, right, bottom = [float(value) for value in record["crop_bounds"]]
+    crop_w, crop_h = right - left, bottom - top
+    if crop_w <= 0 or crop_h <= 0:
+        raise SystemExit(f"invalid crop bounds for {record.get('stem')}: {record['crop_bounds']}")
+    sx, sy = output_size / crop_w, output_size / crop_h
+    x1, y1, x2, y2 = [float(value) for value in record["box"][:4]]
+    scale_x, scale_y = record.get("mask_scale", (0.92, 1.0))
+    cx = ((x1 + x2) * 0.5 - left) * sx
+    cy = ((y1 + y2) * 0.5 - top) * sy
+    ax = max(1, int((x2 - x1) * 0.5 * float(scale_x) * sx))
+    ay = max(1, int((y2 - y1) * 0.5 * float(scale_y) * sy))
+    mask = np.zeros((output_size, output_size), dtype=np.uint8)
+    cv2.ellipse(mask, (int(round(cx)), int(round(cy))), (ax, ay), 0, 0, 360, 255, -1)
+    feather = float(record.get("feather", 0.04))
+    if feather > 0:
+        kernel = max(3, int(round(output_size * feather)) | 1)
+        mask = cv2.GaussianBlur(mask, (kernel, kernel), 0)
+    return mask
+
+
 class PairImgs(Dataset):
     def __init__(self, root, size, aug=False, aug_level=0, pairs=None, aug_mix=None, seed=0,
-                 load_masks=False):
+                 load_masks=False, localize_manifest=None):
         din, dtg = os.path.join(root, "input"), os.path.join(root, "target")
         self.pairs = list(pairs) if pairs is not None else discover_pairs(din, dtg)
         if not self.pairs:
@@ -288,8 +343,15 @@ class PairImgs(Dataset):
         self.seed = seed
         self.rng = None
         self.load_masks = load_masks
+        self.localize_records = load_localize_manifest(localize_manifest)
+        if localize_manifest:
+            missing = [pair.stem for pair in self.pairs if pair.stem not in self.localize_records]
+            if missing:
+                raise SystemExit(
+                    f"localize manifest is missing {len(missing)} selected pairs: {missing[:5]}"
+                )
         self.mask_dir = os.path.join(root, "mask")
-        if self.load_masks and not os.path.isdir(self.mask_dir):
+        if self.load_masks and not self.localize_records and not os.path.isdir(self.mask_dir):
             raise SystemExit(f"face mask directory missing: {self.mask_dir}")
 
     def __len__(self):
@@ -300,7 +362,31 @@ class PairImgs(Dataset):
         a = cv2.cvtColor(np.array(Image.open(pair.input_path).convert("RGB")), cv2.COLOR_RGB2BGR)
         b = cv2.cvtColor(np.array(Image.open(pair.target_path).convert("RGB")), cv2.COLOR_RGB2BGR)
         mask = None
-        if self.load_masks:
+        if self.localize_records:
+            record = self.localize_records[pair.stem]
+            source_size = record.get("source_size")
+            if source_size and list(source_size) != [a.shape[1], a.shape[0]]:
+                raise SystemExit(
+                    f"source size changed after indexing for {pair.stem}: "
+                    f"manifest={source_size} actual={[a.shape[1], a.shape[0]]}"
+                )
+            if a.shape[:2] != b.shape[:2]:
+                b = cv2.resize(b, (a.shape[1], a.shape[0]), interpolation=cv2.INTER_AREA)
+            bounds = record["crop_bounds"]
+            a = cv2.resize(
+                crop_with_reflect(a, bounds), (self.size, self.size), interpolation=cv2.INTER_AREA
+            )
+            b = cv2.resize(
+                crop_with_reflect(b, bounds), (self.size, self.size), interpolation=cv2.INTER_AREA
+            )
+            mask = manifest_face_mask(record, self.size)
+            alpha = mask.astype(np.float32)[:, :, None] / 255.0
+            b = np.clip(
+                b.astype(np.float32) * alpha + a.astype(np.float32) * (1.0 - alpha), 0, 255
+            ).astype(np.uint8)
+            if not self.load_masks:
+                mask = None
+        elif self.load_masks:
             mask_path = os.path.join(self.mask_dir, f"{pair.stem}.png")
             if not os.path.isfile(mask_path):
                 raise SystemExit(f"face mask missing: {mask_path}")
@@ -378,6 +464,12 @@ def main():
     ap.add_argument("--id-margin", type=float, default=0.3, dest="id_margin")
     ap.add_argument("--face-mask-weight", type=float, default=1.0, dest="face_mask_weight",
                     help="mask/ 내부 L1 가중치. 1=마스크 미사용, 얼굴 국소 파인튜닝은 4~8 권장")
+    ap.add_argument("--localize-manifest", default=None, dest="localize_manifest",
+                    help="원본 페어를 즉석 얼굴 crop/합성할 build_localface_pairs manifest.jsonl")
+    ap.add_argument("--amp", choices=("off", "bf16"), default="off",
+                    help="CUDA mixed precision. L40S/Ampere 이상은 bf16 권장")
+    ap.add_argument("--perc-size", type=int, default=0, dest="perc_size",
+                    help="VGG perceptual 계산 해상도. 0=학습 크기, 256=빠른 512 학습 권장")
     ap.add_argument("--gen-ch", type=int, default=32, dest="gen_ch", help="제너레이터 기본채널(용량↑=32→48→64, 속도↓)")
     ap.add_argument("--d-ch", type=int, default=48, dest="d_ch")
     ap.add_argument("--d-n", type=int, default=3, dest="d_n")
@@ -415,6 +507,8 @@ def main():
         ap.error("--val-n must be non-negative")
     if args.face_mask_weight < 1:
         ap.error("--face-mask-weight must be at least 1")
+    if args.perc_size < 0:
+        ap.error("--perc-size must be non-negative")
     try:
         aug_mix = parse_aug_mix(args.aug_mix)
     except (ValueError, TypeError) as exc:
@@ -433,6 +527,18 @@ def main():
         torch.cuda.manual_seed_all(args.seed)
 
     dev = "cuda" if torch.cuda.is_available() else "cpu"
+    if args.amp != "off" and dev != "cuda":
+        ap.error("--amp requires CUDA")
+    if dev == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    amp_enabled = args.amp == "bf16"
+
+    def amp_context():
+        if not amp_enabled:
+            return nullcontext()
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+
     G = Generator(args.gen_ch).to(dev)
     D = Discriminator(args.d_ch, args.d_n).to(dev)
     vgg = VGGPerceptual(allow_random=args.smoke).to(dev)
@@ -517,37 +623,50 @@ def main():
             ))
         print(f"[resume] {resume_path} step={start_step}")
 
+    def perceptual_loss(fake, tgt):
+        if args.perc_size and fake.shape[-1] != args.perc_size:
+            fake = F.interpolate(
+                fake, (args.perc_size, args.perc_size), mode="bilinear", align_corners=False
+            )
+            tgt = F.interpolate(
+                tgt, (args.perc_size, args.perc_size), mode="bilinear", align_corners=False
+            )
+        return vgg(fake, tgt)
+
     def g_losses(inp, tgt, w_adv_eff, face_mask=None):
-        fake = G(inp)
-        if face_mask is not None:
-            weights = 1.0 + (args.face_mask_weight - 1.0) * face_mask
-            l1 = ((fake - tgt).abs() * weights).sum() / (weights.sum() * fake.shape[1])
-            # 바깥을 target으로 치환하면 perceptual gradient가 얼굴 주변에 집중된다.
-            perceptual_fake = fake * face_mask + tgt.detach() * (1.0 - face_mask)
-            perc = vgg(perceptual_fake, tgt)
-        else:
-            l1 = F.l1_loss(fake, tgt)                    # ★ target 직접 재현 → 유화 없이 2.5D 그대로
-            perc = vgg(fake, tgt)                        # 다층 perceptual(디테일·선명)
-        g = args.w_l1 * l1 + args.w_perc * perc
-        adv = torch.tensor(0.0, device=dev)
-        if w_adv_eff > 0:
-            df = D(fake)
-            adv = F.mse_loss(df, torch.ones_like(df))
-            g = g + w_adv_eff * adv
-        if args.w_tv > 0:
-            tv = (fake[:, :, 1:] - fake[:, :, :-1]).abs().mean() + (fake[:, :, :, 1:] - fake[:, :, :, :-1]).abs().mean()
-            g = g + args.w_tv * tv
-        idl = torch.tensor(0.0, device=dev)
-        if idm is not None:                              # 신원: fake를 input 신원에서 멀어지게
-            cos = (id_embed(idm, inp) * id_embed(idm, fake)).sum(1)
-            idl = F.relu(cos - args.id_margin).mean()
-            g = g + args.id_loss * idl
+        with amp_context():
+            fake = G(inp)
+            if face_mask is not None:
+                weights = 1.0 + (args.face_mask_weight - 1.0) * face_mask
+                l1 = ((fake - tgt).abs() * weights).sum() / (weights.sum() * fake.shape[1])
+                # 바깥을 target으로 치환하면 perceptual gradient가 얼굴 주변에 집중된다.
+                perceptual_fake = fake * face_mask + tgt.detach() * (1.0 - face_mask)
+                perc = perceptual_loss(perceptual_fake, tgt)
+            else:
+                l1 = F.l1_loss(fake, tgt)                # target 직접 재현
+                perc = perceptual_loss(fake, tgt)        # 다층 perceptual
+            g = args.w_l1 * l1 + args.w_perc * perc
+            adv = torch.tensor(0.0, device=dev)
+            if w_adv_eff > 0:
+                df = D(fake)
+                adv = F.mse_loss(df, torch.ones_like(df))
+                g = g + w_adv_eff * adv
+            if args.w_tv > 0:
+                tv = ((fake[:, :, 1:] - fake[:, :, :-1]).abs().mean()
+                      + (fake[:, :, :, 1:] - fake[:, :, :, :-1]).abs().mean())
+                g = g + args.w_tv * tv
+            idl = torch.tensor(0.0, device=dev)
+            if idm is not None:                          # 신원: fake를 input 신원에서 멀어지게
+                cos = (id_embed(idm, inp) * id_embed(idm, fake)).sum(1)
+                idl = F.relu(cos - args.id_margin).mean()
+                g = g + args.id_loss * idl
         return fake, g, dict(l1=l1.item(), perc=perc.item(), adv=float(adv.detach()), idl=float(idl.detach()))
 
     def d_loss(inp, tgt):
-        fake = G(inp).detach()
-        dr, df = D(tgt), D(fake)                          # 진짜 애니 target →1, 생성물 →0
-        return 0.5 * (F.mse_loss(dr, torch.ones_like(dr)) + F.mse_loss(df, torch.zeros_like(df)))
+        with amp_context():
+            fake = G(inp).detach()
+            dr, df = D(tgt), D(fake)                      # 진짜 애니 target →1, 생성물 →0
+            return 0.5 * (F.mse_loss(dr, torch.ones_like(dr)) + F.mse_loss(df, torch.zeros_like(df)))
 
     if args.smoke:
         print(f"[smoke] dev={dev} size={args.size}")
@@ -561,6 +680,15 @@ def main():
 
     os.makedirs(os.path.join(args.out, "samples"), exist_ok=True)
     all_pairs = discover_pairs(os.path.join(args.data, "input"), os.path.join(args.data, "target"))
+    if args.localize_manifest:
+        localized_stems = set(load_localize_manifest(args.localize_manifest))
+        before = len(all_pairs)
+        all_pairs = [pair for pair in all_pairs if pair.stem in localized_stems]
+        print(
+            f"[localize] indexed={len(all_pairs)} excluded_without_face={before - len(all_pairs)}"
+        )
+        if not all_pairs:
+            raise SystemExit("localize manifest has no stems matching the paired corpus")
     pair_by_stem = {pair.stem: pair for pair in all_pairs}
     saved_split = resume_state.get("split") if resume_state else None
     if saved_split:
@@ -594,10 +722,13 @@ def main():
     use_face_masks = args.face_mask_weight > 1
     ds = PairImgs(
         args.data, args.size, args.aug, args.aug_level, train_pairs, aug_mix, args.seed,
-        load_masks=use_face_masks,
+        load_masks=use_face_masks, localize_manifest=args.localize_manifest,
     )
     val_ds = (
-        PairImgs(args.data, args.size, pairs=val_pairs, seed=args.seed, load_masks=use_face_masks)
+        PairImgs(
+            args.data, args.size, pairs=val_pairs, seed=args.seed,
+            load_masks=use_face_masks, localize_manifest=args.localize_manifest,
+        )
         if val_pairs else None
     )
     generator = torch.Generator().manual_seed(args.seed)
@@ -606,7 +737,9 @@ def main():
         pin_memory=(dev == "cuda"), persistent_workers=(args.workers > 0), generator=generator,
     ))
     print(f"[data] train={len(ds)} val={len(val_ds) if val_ds else 0} "
-          f"aug_mix={aug_mix} face_mask_weight={args.face_mask_weight:g}")
+          f"aug_mix={aug_mix} face_mask_weight={args.face_mask_weight:g} "
+          f"localize_manifest={args.localize_manifest or 'none'}")
+    print(f"[speed] amp={args.amp} perc_size={args.perc_size or args.size} tf32={dev == 'cuda'}")
 
     for name, pairs in (("train_stems.txt", train_pairs), ("val_stems.txt", val_pairs)):
         path = os.path.join(args.out, name)
@@ -625,7 +758,8 @@ def main():
     def save_eval(step):
         G.eval()
         with torch.no_grad():
-            fk = G(ev_in).clamp(-1, 1)
+            with amp_context():
+                fk = G(ev_in).clamp(-1, 1)
             grid = torch.cat([ev_in, fk, ev_tg], 0) * 0.5 + 0.5   # 입력 / 학생출력 / 정답target
             save_image(grid, os.path.join(args.out, "samples", f"s{step:06d}.png"), nrow=ne)
             if val_ds is not None and args.val_n:
@@ -635,7 +769,8 @@ def main():
                     batch = [val_ds[i] for i in range(begin, min(begin + args.batch, len(val_ds), args.val_n))]
                     va = torch.stack([item[0] for item in batch]).to(dev)
                     vt = torch.stack([item[1] for item in batch]).to(dev)
-                    vf = G(va).clamp(-1, 1)
+                    with amp_context():
+                        vf = G(va).clamp(-1, 1)
                     losses.extend(F.l1_loss(vf, vt, reduction="none").mean((1, 2, 3)).cpu().tolist())
                     if len(batch[0]) == 3:
                         vm = torch.stack([item[2] for item in batch]).to(dev)
@@ -646,6 +781,8 @@ def main():
                 print(f"[val:{step}] n={len(losses)} l1={np.mean(losses):.4f}{suffix}")
         G.train()
 
+    log_time = time.perf_counter()
+    log_step = start_step
     for step in range(start_step + 1, args.steps + 1):
         train_batch = next(loader)
         inp, tgt = train_batch[:2]
@@ -661,8 +798,13 @@ def main():
             dl = torch.tensor(0.0)
         fake, gl, parts = g_losses(inp, tgt, w_adv_eff, face_mask); optG.zero_grad(); gl.backward(); optG.step()
         if step % 100 == 0:
+            elapsed = time.perf_counter() - log_time
+            steps_per_second = (step - log_step) / max(elapsed, 1e-9)
             print(f"[{step}/{args.steps}] wadv={w_adv_eff:.2f} D={float(dl):.3f} G={gl.item():.3f} "
-                  f"l1={parts['l1']:.3f} perc={parts['perc']:.3f} adv={parts['adv']:.2f} id={parts['idl']:.3f}")
+                  f"l1={parts['l1']:.3f} perc={parts['perc']:.3f} adv={parts['adv']:.2f} "
+                  f"id={parts['idl']:.3f} step/s={steps_per_second:.2f}")
+            log_time = time.perf_counter()
+            log_step = step
         if step % args.sample_every == 0:
             save_eval(step)
         if step % args.ckpt_every == 0:

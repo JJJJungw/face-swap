@@ -117,6 +117,10 @@ def main():
     parser.add_argument("--n", type=int, default=0, help="0 means all selected pairs")
     parser.add_argument("--trt", action="store_true")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--manifest-only", action="store_true",
+        help="Detect and save crop metadata only; do not duplicate input/target PNG files",
+    )
     args = parser.parse_args()
 
     if args.crop_expand < 0:
@@ -140,9 +144,24 @@ def main():
         pairs = pairs[:args.n]
 
     output_root = Path(args.out)
-    for directory in ("input", "target", "mask"):
-        (output_root / directory).mkdir(parents=True, exist_ok=True)
+    output_root.mkdir(parents=True, exist_ok=True)
+    if not args.manifest_only:
+        for directory in ("input", "target", "mask"):
+            (output_root / directory).mkdir(parents=True, exist_ok=True)
     manifest_path = output_root / "manifest.jsonl"
+    indexed_stems = set()
+    if args.resume and manifest_path.is_file():
+        for line_number, raw in enumerate(manifest_path.read_text(encoding="utf-8").splitlines(), 1):
+            if not raw.strip():
+                continue
+            try:
+                record = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise SystemExit(f"invalid manifest JSON at line {line_number}: {exc}") from exc
+            stem = record.get("stem")
+            if not stem or stem in indexed_stems:
+                raise SystemExit(f"invalid or duplicate manifest stem at line {line_number}: {stem}")
+            indexed_stems.add(stem)
     detector = Detector(args.model, size=args.det_size, use_trt=args.trt)
     completed = skipped = rejected = 0
 
@@ -151,14 +170,15 @@ def main():
             input_out = output_root / "input" / f"{pair.stem}.png"
             target_out = output_root / "target" / f"{pair.stem}.png"
             mask_out = output_root / "mask" / f"{pair.stem}.png"
-            if args.resume and input_out.is_file() and target_out.is_file() and mask_out.is_file():
+            outputs_ready = (
+                args.manifest_only
+                or (input_out.is_file() and target_out.is_file() and mask_out.is_file())
+            )
+            if args.resume and pair.stem in indexed_stems and outputs_ready:
                 skipped += 1
                 continue
 
             real = load_bgr(pair.input_path)
-            teacher = load_bgr(pair.target_path)
-            if teacher.shape[:2] != real.shape[:2]:
-                teacher = cv2.resize(teacher, (real.shape[1], real.shape[0]), interpolation=cv2.INTER_AREA)
             height, width = real.shape[:2]
             box = largest_face(detector.detect(real, width, height))
             if box is None:
@@ -167,46 +187,56 @@ def main():
                 continue
 
             bounds = square_crop_bounds(box, width, height, args.crop_expand)
-            real_crop = cv2.resize(
-                crop_with_reflect(real, bounds), (args.output_size, args.output_size),
-                interpolation=cv2.INTER_AREA,
-            )
-            teacher_crop = cv2.resize(
-                crop_with_reflect(teacher, bounds), (args.output_size, args.output_size),
-                interpolation=cv2.INTER_AREA,
-            )
-            mask = face_oval_mask(
-                box, bounds, args.output_size, args.mask_scale_x,
-                args.mask_scale_y, args.feather,
-            )
-            alpha = mask.astype(np.float32)[:, :, None] / 255.0
-            localized = np.clip(
-                teacher_crop.astype(np.float32) * alpha + real_crop.astype(np.float32) * (1.0 - alpha),
-                0, 255,
-            ).astype(np.uint8)
+            if not args.manifest_only:
+                teacher = load_bgr(pair.target_path)
+                if teacher.shape[:2] != real.shape[:2]:
+                    teacher = cv2.resize(
+                        teacher, (width, height), interpolation=cv2.INTER_AREA
+                    )
+                real_crop = cv2.resize(
+                    crop_with_reflect(real, bounds), (args.output_size, args.output_size),
+                    interpolation=cv2.INTER_AREA,
+                )
+                teacher_crop = cv2.resize(
+                    crop_with_reflect(teacher, bounds), (args.output_size, args.output_size),
+                    interpolation=cv2.INTER_AREA,
+                )
+                mask = face_oval_mask(
+                    box, bounds, args.output_size, args.mask_scale_x,
+                    args.mask_scale_y, args.feather,
+                )
+                alpha = mask.astype(np.float32)[:, :, None] / 255.0
+                localized = np.clip(
+                    teacher_crop.astype(np.float32) * alpha
+                    + real_crop.astype(np.float32) * (1.0 - alpha),
+                    0, 255,
+                ).astype(np.uint8)
 
-            atomic_write_image(input_out, real_crop)
-            atomic_write_image(target_out, localized)
-            atomic_write_image(mask_out, mask)
+                atomic_write_image(input_out, real_crop)
+                atomic_write_image(target_out, localized)
+                atomic_write_image(mask_out, mask)
             record = {
                 "stem": pair.stem,
                 "input": str(pair.input_path),
                 "target": str(pair.target_path),
+                "source_size": [width, height],
                 "box": [round(float(value), 3) for value in box],
                 "crop_bounds": bounds,
                 "crop_expand": args.crop_expand,
                 "mask_scale": [args.mask_scale_x, args.mask_scale_y],
                 "feather": args.feather,
             }
-            manifest.write(json.dumps(record, ensure_ascii=False) + "\n")
-            manifest.flush()
+            if pair.stem not in indexed_stems:
+                manifest.write(json.dumps(record, ensure_ascii=False) + "\n")
+                manifest.flush()
+                indexed_stems.add(pair.stem)
             completed += 1
             if completed % 25 == 0 or index == len(pairs):
                 print(f"[done {index}/{len(pairs)}] completed={completed} rejected={rejected}")
 
     print(
         f"[complete] selected={len(pairs)} completed={completed} "
-        f"skipped={skipped} rejected={rejected} out={args.out}"
+        f"skipped={skipped} rejected={rejected} manifest_only={args.manifest_only} out={args.out}"
     )
 
 

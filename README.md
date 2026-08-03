@@ -485,6 +485,23 @@ python3 -u train/train_student.py --data out/pairs_anime12_13500 --out train/s_c
   --w-l1 3.0 --w-perc 2.0 --w-adv 0 --id-loss 0 \
   --sample-every 500 --ckpt-every 5000
 
+# 얼굴 좌표만 인덱싱 (teacher 재실행·PNG 복제 없음, 중단 후 같은 명령으로 재개)
+NVIDIA_LIBS="$(find .venv/lib/python3.12/site-packages/nvidia -type d -name lib -print | paste -sd: -)"
+LD_LIBRARY_PATH="$NVIDIA_LIBS:${LD_LIBRARY_PATH:-}" \
+python3 -u run/build_localface_pairs.py \
+  --data out/pairs_anime12_13500 --out out/localface_index_13500 \
+  --crop-expand 0.5 --mask-scale-x 0.92 --mask-scale-y 1.0 --feather 0.04 \
+  --manifest-only --resume
+
+# 얼굴 전용 본학습: 원본 페어를 manifest 좌표로 즉석 crop·합성
+python3 -u train/train_student.py \
+  --data out/pairs_anime12_13500 \
+  --localize-manifest out/localface_index_13500/manifest.jsonl \
+  --out train/s_localface48 --size 512 --batch 8 --steps 40000 --gen-ch 48 \
+  --lr 2e-4 --aug-level 0 --val-ratio 0.05 --val-n 64 --workers 4 \
+  --w-l1 3.0 --w-perc 2.0 --w-adv 0 --id-loss 0 --face-mask-weight 4 \
+  --amp bf16 --perc-size 256 --sample-every 250 --ckpt-every 2500
+
 # 고정 validation 평가
 python3 -u run/eval_student.py --data out/pairs_anime12_13500 --n 64 --size 512 \
   --include-file train/s_clean48/val_stems.txt --ckpt train/s_clean48/student_final.pt \
@@ -502,6 +519,10 @@ python3 -u run/eval_student.py --data out/pairs_anime12_13500 --n 64 --size 512 
 - `--resume`은 위 상태 전체를 복원하며, DataLoader worker마다 독립 RNG를 사용한다.
 - `eval_student.py`와 ONNX export는 checkpoint에서 `gen-ch`를 자동 판별한다.
 - 모든 구조 변경은 먼저 `--overfit-n 32` 진단을 통과해야 한다.
+- `--localize-manifest`는 검출 좌표만 읽어 원본 input/target을 즉석 crop한다. 13,500장의
+  localized PNG를 별도로 만들지 않으므로 teacher 재실행과 대규모 디스크 복제가 없다.
+- `--amp bf16`과 `--perc-size 256`은 속도 옵션이다. L1은 계속 512에서 계산되며 VGG만 256으로
+  줄어든다. 본학습 전 동일 100~500스텝 A/B에서 `step/s`와 샘플 화질을 확인한다.
 
 ### 스크립트 목록 (`run/`)
 | 스크립트 | 용도 |
@@ -514,7 +535,7 @@ python3 -u run/eval_student.py --data out/pairs_anime12_13500 --n 64 --size 512 
 | `test_space_exact.py` | 공개 Space 모델 경로 재현 · INT8 transformer · 배치/scale 비교 · resume |
 | `select_sfhq_sources.py` | SFHQ-T2I 메타데이터 필터 · 연령/생성모델/질감 비율 통제 |
 | `generate_anime_13500.sh` | 현재 13,500쌍 코퍼스 선택+생성 진입점. 중단 후 재실행 가능 |
-| `build_localface_pairs.py` | 기존 페어를 재사용해 확장 정사각 crop + 얼굴 한정 target 생성(teacher 재실행 없음) |
+| `build_localface_pairs.py` | 기존 페어의 얼굴 crop/target 생성 또는 `--manifest-only` 좌표 인덱싱(teacher 재실행 없음) |
 | `pair_utils.py` | 확장자 독립 stem 페어 매칭 · 중복/미지 파일 검증 공통 로직 |
 | `qwen_pairgen.py` | teacher(구) — 2509 + autoweeb LoRA. 재현용 보존 |
 | `ab_2511.sh` | 화풍×프롬프트 교차 A/B |
