@@ -199,8 +199,27 @@ def lowpass(image, sigma):
     return cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
 
 
+def lowpass_masked(image, sigma, mask):
+    """마스크 안쪽 픽셀만으로 저주파를 계산한다(normalized convolution).
+
+    ■ 왜 필요한가 (2026-08-04)
+      크롭에는 배경이 크게 들어 있다. 저주파를 크롭 전체에서 구하면 배경색이
+      번져 얼굴 안으로 들어온다. 실제로 분홍 배경 영상에서 얼굴에 보라 기운이
+      생겼고, --vivid-chroma 로 채도를 올리면 그 오염된 색이 같이 증폭됐다.
+      색을 맞추려던 보정이 색을 망치고 있었다.
+
+      가중치를 같이 블러해서 나눠주면 마스크 밖 픽셀이 기여하지 않는다.
+    """
+    w = mask.astype(np.float32)
+    if w.ndim == 2:
+        w = w[:, :, None]
+    num = lowpass(image * w, sigma)
+    den = lowpass(np.repeat(w, image.shape[2], axis=2) if image.ndim == 3 else w, sigma)
+    return num / np.maximum(den, 1e-3)
+
+
 def color_transfer_lowfreq(src, ref, strength=1.0, sigma_ratio=0.10, luma=0.5,
-                           vivid_chroma=1.0, vivid_luma=1.0):
+                           vivid_chroma=1.0, vivid_luma=1.0, mask=None):
     """저주파(조명·색조)는 원본에서, 고주파(선·화풍)는 스타일 결과에서 가져온다.
 
     ■ 왜 전역 전이로는 안 되는가
@@ -221,8 +240,12 @@ def color_transfer_lowfreq(src, ref, strength=1.0, sigma_ratio=0.10, luma=0.5,
     s = cv2.cvtColor(src, cv2.COLOR_BGR2LAB).astype(np.float32)
     r = cv2.cvtColor(ref, cv2.COLOR_BGR2LAB).astype(np.float32)
     sigma = max(3.0, min(src.shape[:2]) * sigma_ratio)
-    s_lo = lowpass(s, sigma)
-    r_lo = lowpass(r, sigma)
+    if mask is not None:
+        s_lo = lowpass_masked(s, sigma, mask)
+        r_lo = lowpass_masked(r, sigma, mask)
+    else:
+        s_lo = lowpass(s, sigma)
+        r_lo = lowpass(r, sigma)
     weights = (float(luma), 1.0, 1.0)          # L, a, b
     out = s + np.stack([(r_lo[:, :, i] - s_lo[:, :, i]) * weights[i] for i in range(3)], 2)
 
@@ -407,6 +430,12 @@ def composite(frame, boxes, stylizer, cartoon_min, blur_mode="pixelate", expand=
             ox1 = oy1 = 0
             ox2, oy2 = cx2-cx1, cy2-cy1
         if crop.size == 0: continue
+        # 색 통계를 뽑을 영역: 얼굴 박스 안쪽 타원. 배경·머리카락을 제외해야
+        # 저주파 색 전이가 배경색을 얼굴로 끌어오지 않는다.
+        color_mask = np.zeros(crop.shape[:2], np.uint8)
+        cv2.ellipse(color_mask,
+                    (int(round((x1 + x2) * 0.5 - cx1)), int(round((y1 + y2) * 0.5 - cy1))),
+                    (max(1, int(bw * 0.40)), max(1, int(bh * 0.46))), 0, 0, 360, 255, -1)
         if size >= cartoon_min:
             gan_in = crop
             if input_temporal > 0 and prev_raw is not None:
@@ -424,7 +453,8 @@ def composite(frame, boxes, stylizer, cartoon_min, blur_mode="pixelate", expand=
             if color_mode == "lowfreq":
                 proc = color_transfer_lowfreq(styl, crop, color_match,
                                               color_sigma, color_luma,
-                                              vivid_chroma, vivid_luma)
+                                              vivid_chroma, vivid_luma,
+                                              mask=color_mask if color_mask.any() else None)
             else:
                 proc = color_transfer(styl, crop, color_match)
             proc = flatten_skin(proc, flatten)
