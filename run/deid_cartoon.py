@@ -332,6 +332,35 @@ def color_from_input(styl, ref, mix=1.0, align_sigma=3.0):
     return cv2.cvtColor(np.clip(s, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
 
 
+def despeckle(image, strength, kernel=5, smooth_thresh=0.25):
+    """피부 위의 고립된 작은 점(주근깨·잡티)만 지운다. 선은 남긴다.
+
+    ■ 왜 median 인가 (2026-08-04)
+      --flatten(bilateral) 은 실패했다. bilateral 은 대비가 큰 화소를 '엣지'로 보고
+      **보존**하기 때문에 점이 그대로 남고, 대신 주변 면을 뭉개서 전체가 뿌예졌다.
+      median 은 반대다. 고립된 이상치를 이웃 중앙값으로 치환하므로 점은 사라지고,
+      이어진 선(윤곽·머리카락)은 이웃이 같은 값이라 보존된다.
+
+      teacher 화풍이 실제 점·잡티를 성실히 그리는데, 증강 학습으로 입력 충실도가
+      올라가면서 그게 더 도드라졌다. 클로즈업에서는 손해라 런타임에서 지운다.
+
+    ■ 적용 범위
+      기울기가 낮은(평탄한) 곳에만 건다. 눈·입·머리카락 경계는 기울기가 높아 제외된다.
+    """
+    if strength <= 0:
+        return image
+    k = int(kernel) | 1
+    med = cv2.medianBlur(image, k)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    grad = cv2.magnitude(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3),
+                         cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3))
+    # 국소 최대 기울기로 '선 근처'를 판정 → 점 하나만 튀는 곳은 평탄으로 남는다
+    band = cv2.dilate(grad, np.ones((k, k), np.float32))
+    flat = np.clip(1.0 - band / (band.max() * smooth_thresh + 1e-6), 0, 1)[:, :, None]
+    w = strength * flat
+    return (image * (1 - w) + med * w).astype(np.uint8)
+
+
 def blur_crop(crop, mode="pixelate", cap=12):
     h, w = crop.shape[:2]
     if mode == "box": return np.zeros_like(crop)
@@ -421,7 +450,8 @@ def composite(frame, boxes, stylizer, cartoon_min, blur_mode="pixelate", expand=
               sharpen=0.0, temporal=0.0, prev_frame=None,
               color_mode="global", color_sigma=0.10, color_luma=0.5, color_align=3.0,
               vivid_chroma=1.0, vivid_luma=1.0,
-              input_denoise=0.0, input_temporal=0.0, prev_raw=None, flatten=0.0):
+              input_denoise=0.0, input_temporal=0.0, prev_raw=None, flatten=0.0,
+              despeckle_strength=0.0, despeckle_kernel=5):
     H, W = frame.shape[:2]; nc = nb = 0
     for x1, y1, x2, y2, sc in boxes:
         bw, bh = x2-x1, y2-y1; size = max(bw, bh)
@@ -486,6 +516,7 @@ def composite(frame, boxes, stylizer, cartoon_min, blur_mode="pixelate", expand=
                                               mask=color_mask if color_mask.any() else None)
             else:
                 proc = color_transfer(styl, crop, color_match)
+            proc = despeckle(proc, despeckle_strength, despeckle_kernel)
             proc = flatten_skin(proc, flatten)
             nc += 1
         else:
@@ -563,6 +594,10 @@ def main():
                     help="스타일화 전 입력 잡음 제거(0=끔, 0.5~1.5). 붓질 자국을 줄인다")
     ap.add_argument("--input-temporal", type=float, default=0.0, dest="input_temporal",
                     help="스타일화 전 이전 프레임 입력과 혼합(0=끔, 0.2~0.4). 흔들림의 원인을 줄인다")
+    ap.add_argument("--despeckle", type=float, default=0.0, dest="despeckle_strength",
+                    help="피부 위 고립된 점(주근깨·잡티) 제거 강도(0=끔, 0.6~1.0). median 이라 선은 남는다")
+    ap.add_argument("--despeckle-kernel", type=int, default=5, dest="despeckle_kernel",
+                    help="점 크기에 맞춘 커널(3=아주 작은 점, 5=기본, 7=큰 점)")
     ap.add_argument("--flatten", type=float, default=0.0,
                     help="스타일화 후 피부 평탄화(0=끔, 0.3~0.7). 점·얼룩을 지우고 선은 남긴다")
     ap.add_argument("--temporal", type=float, default=0.0,
@@ -634,6 +669,7 @@ def main():
             vivid_chroma=args.vivid_chroma, vivid_luma=args.vivid_luma,
             input_denoise=args.input_denoise, input_temporal=args.input_temporal,
             prev_raw=prev_raw, flatten=args.flatten,
+            despeckle_strength=args.despeckle_strength, despeckle_kernel=args.despeckle_kernel,
             mask_scale_x=args.mask_scale_x, mask_scale_y=args.mask_scale_y,
             mask_feather=args.mask_feather,
         )
