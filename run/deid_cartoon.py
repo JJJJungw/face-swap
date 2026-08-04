@@ -305,6 +305,33 @@ def flatten_skin(image, strength, edge_keep=0.35):
     return (image * (1 - blend) + smooth * blend).astype(np.uint8)
 
 
+def color_from_input(styl, ref, mix=1.0, align_sigma=3.0):
+    """밝기는 스타일 결과에서, 색(a·b)은 입력에서 픽셀 단위로 가져온다.
+
+    ■ 왜 이 방식인가 (2026-08-04)
+      전역 평균/표준편차 전이도, 저주파 전이도 결국 "대략 맞추는" 근사다.
+      전자는 채도를 깎고, 후자는 배경색이 얼굴로 번졌다.
+      Lab 에서 밝기와 색은 분리되므로, 색만 입력에서 그대로 가져오면
+      **픽셀 단위로 정확히 같은 색**이 되어 색이 뜰 여지가 없다.
+
+      대가는 화풍의 색 결정(진한 입술, 볼 홍조)을 잃는다는 것이다.
+      mix 로 절충한다: 1.0=입력 색 그대로, 0.0=화풍 색 그대로.
+
+    ■ align_sigma
+      GAN 이 선을 조금 옮기므로 색을 픽셀 단위로 그대로 얹으면 입술 색과
+      그려진 입술 선이 어긋날 수 있다. 색만 살짝 번지게 해서 그 어긋남을 흡수한다.
+      저주파 전이의 sigma(수십 px)와 달리 3px 수준이라 공간 정밀도는 유지된다.
+    """
+    if mix <= 0:
+        return styl
+    s = cv2.cvtColor(styl, cv2.COLOR_BGR2LAB).astype(np.float32)
+    r = cv2.cvtColor(ref, cv2.COLOR_BGR2LAB).astype(np.float32)
+    if align_sigma > 0:
+        r[:, :, 1:] = cv2.GaussianBlur(r[:, :, 1:], (0, 0), align_sigma)
+    s[:, :, 1:] = s[:, :, 1:] * (1.0 - mix) + r[:, :, 1:] * mix
+    return cv2.cvtColor(np.clip(s, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
+
+
 def blur_crop(crop, mode="pixelate", cap=12):
     h, w = crop.shape[:2]
     if mode == "box": return np.zeros_like(crop)
@@ -392,7 +419,7 @@ def composite(frame, boxes, stylizer, cartoon_min, blur_mode="pixelate", expand=
               color_match=0.0, square_crop=False, mask_mode="crop-ellipse",
               mask_scale_x=0.92, mask_scale_y=1.0, mask_feather=0.04, occupancy=0.0,
               sharpen=0.0, temporal=0.0, prev_frame=None,
-              color_mode="global", color_sigma=0.10, color_luma=0.5,
+              color_mode="global", color_sigma=0.10, color_luma=0.5, color_align=3.0,
               vivid_chroma=1.0, vivid_luma=1.0,
               input_denoise=0.0, input_temporal=0.0, prev_raw=None, flatten=0.0):
     H, W = frame.shape[:2]; nc = nb = 0
@@ -450,7 +477,9 @@ def composite(frame, boxes, stylizer, cartoon_min, blur_mode="pixelate", expand=
             gan_in = denoise_crop(gan_in, input_denoise)
             styl = cv2.resize(stylizer.stylize(gan_in), (cx2-cx1, cy2-cy1), interpolation=cv2.INTER_LANCZOS4)
             styl = sharpen_crop(styl, sharpen)
-            if color_mode == "lowfreq":
+            if color_mode == "chroma":
+                proc = color_from_input(styl, crop, color_match, color_align)
+            elif color_mode == "lowfreq":
                 proc = color_transfer_lowfreq(styl, crop, color_match,
                                               color_sigma, color_luma,
                                               vivid_chroma, vivid_luma,
@@ -517,9 +546,11 @@ def main():
     ap.add_argument("--mask-scale-x", type=float, default=0.92, dest="mask_scale_x")
     ap.add_argument("--mask-scale-y", type=float, default=1.0, dest="mask_scale_y")
     ap.add_argument("--mask-feather", type=float, default=0.04, dest="mask_feather")
-    ap.add_argument("--color-mode", default="global", choices=["global", "lowfreq"],
+    ap.add_argument("--color-mode", default="global", choices=["global", "lowfreq", "chroma"],
                     dest="color_mode",
                     help="global=전역 평균/표준편차, lowfreq=저주파 교체(공간적으로 변하는 조명 대응)")
+    ap.add_argument("--color-align", type=float, default=3.0, dest="color_align",
+                    help="chroma 모드에서 입력 색을 살짝 번지게 해 선과의 어긋남을 흡수(px)")
     ap.add_argument("--color-sigma", type=float, default=0.10, dest="color_sigma",
                     help="lowfreq 의 저주파 경계. 크롭 크기 대비 비율. 작을수록 사진 명암이 더 돌아온다")
     ap.add_argument("--color-luma", type=float, default=0.5, dest="color_luma",
@@ -599,6 +630,7 @@ def main():
             square_crop=args.square_crop, mask_mode=args.mask_mode, occupancy=args.face_occupancy,
             sharpen=args.sharpen, temporal=args.temporal, prev_frame=prev_out,
             color_mode=args.color_mode, color_sigma=args.color_sigma, color_luma=args.color_luma,
+            color_align=args.color_align,
             vivid_chroma=args.vivid_chroma, vivid_luma=args.vivid_luma,
             input_denoise=args.input_denoise, input_temporal=args.input_temporal,
             prev_raw=prev_raw, flatten=args.flatten,
