@@ -39,13 +39,56 @@ from pair_utils import discover_pairs
 from crop_utils import crop_with_edge_padding
 
 # ============ Generator (animegan2-pytorch 구조 재구현, MIT 귀속 — 런타임 호환) ============
+class BlurPool2d(nn.Module):
+    """저역통과 후 stride 2. stride-2 conv 의 앨리어싱을 없앤다.
+
+    ■ 왜 필요한가 (2026-08-04 측정)
+      입력을 1px 옮기면 출력이 1.30배로 변했다(밝기 +2 → 1.01배, JPEG → 0.93배).
+      즉 이 네트워크는 **공간 이동에만** 과민하다. 원인은 stride 2 가 두 픽셀 중
+      하나를 그냥 버리는 것이라, 얼굴이 1px 움직이면 살아남는 픽셀이 통째로 바뀌기
+      때문이다. 가는 선·머리카락이 있다 없다 하고, 그 위에서 계산된 특징이 흔들려
+      최종 출력의 선이 프레임마다 튄다(영상 깜빡임).
+
+      줄이기 전에 이항 커널로 흐리면 버려질 고주파가 미리 제거되어 어느 픽셀이
+      살아남든 결과가 비슷해진다. 근거: Zhang, ICML 2019 — 증강 없이 학습한 모델의
+      shift consistency 88.1% → 98.1% (우리와 같은 --aug-level 0 조건).
+      커널은 고정값이라 학습 파라미터가 늘지 않는다.
+    """
+
+    def __init__(self, channels, filt_size=3, stride=2):
+        super().__init__()
+        if filt_size == 3:
+            base = torch.tensor([1.0, 2.0, 1.0])
+        elif filt_size == 5:
+            base = torch.tensor([1.0, 4.0, 6.0, 4.0, 1.0])
+        else:
+            raise ValueError(f"filt_size must be 3 or 5: {filt_size}")
+        kernel = torch.outer(base, base)
+        kernel = kernel / kernel.sum()
+        self.register_buffer("kernel", kernel[None, None].repeat(channels, 1, 1, 1))
+        self.channels, self.stride = channels, stride
+        self.pad = nn.ReflectionPad2d(filt_size // 2)
+
+    def forward(self, x):
+        return F.conv2d(self.pad(x), self.kernel, stride=self.stride, groups=self.channels)
+
+
 class ConvNormLReLU(nn.Sequential):
-    def __init__(self, i, o, k=3, s=1, p=1):
-        super().__init__(
-            nn.ReflectionPad2d(p),
-            nn.Conv2d(i, o, k, s, 0, bias=False),
-            nn.GroupNorm(1, o, affine=True),
-            nn.LeakyReLU(0.2, inplace=True))
+    def __init__(self, i, o, k=3, s=1, p=1, antialias=0):
+        # antialias>0 이고 stride 2 이면 conv 는 stride 1 로 두고 BlurPool 로 줄인다.
+        if s == 2 and antialias:
+            super().__init__(
+                nn.ReflectionPad2d(p),
+                nn.Conv2d(i, o, k, 1, 0, bias=False),
+                nn.GroupNorm(1, o, affine=True),
+                nn.LeakyReLU(0.2, inplace=True),
+                BlurPool2d(o, filt_size=antialias, stride=2))
+        else:
+            super().__init__(
+                nn.ReflectionPad2d(p),
+                nn.Conv2d(i, o, k, s, 0, bias=False),
+                nn.GroupNorm(1, o, affine=True),
+                nn.LeakyReLU(0.2, inplace=True))
 
 
 class InvertedResidual(nn.Module):
@@ -86,12 +129,12 @@ class Generator(nn.Module):
     """animegan2 인코더-디코더 + U-Net skip + PixelShuffle 업샘플.
     skip이 인코더의 고해상도 선/경계를 디코더로 넘겨 '부드럽지만 깔끔한' 2.5D 유지(유화 방지).
     입력 크기는 4의 배수(256/512 OK). ONNX/런타임 슬롯 시그니처(x[-1,1]→y[-1,1]) 동일."""
-    def __init__(self, ch=32):
+    def __init__(self, ch=32, antialias=0):
         super().__init__()
         c1, c2, c3 = ch, ch * 2, ch * 4                     # 32,64,128
         self.in_conv = ConvNormLReLU(3, c1, k=7, p=3)       # /1, c1   → skip1
-        self.down1 = nn.Sequential(ConvNormLReLU(c1, c2, s=2), ConvNormLReLU(c2, c2))   # /2, c2 → skip2
-        self.down2 = nn.Sequential(ConvNormLReLU(c2, c3, s=2), ConvNormLReLU(c3, c3))   # /4, c3
+        self.down1 = nn.Sequential(ConvNormLReLU(c1, c2, s=2, antialias=antialias), ConvNormLReLU(c2, c2))   # /2, c2 → skip2
+        self.down2 = nn.Sequential(ConvNormLReLU(c2, c3, s=2, antialias=antialias), ConvNormLReLU(c3, c3))   # /4, c3
         self.mid = nn.Sequential(ConvNormLReLU(c3, c3),
                                  InvertedResidual(c3, c3), InvertedResidual(c3, c3),
                                  InvertedResidual(c3, c3), InvertedResidual(c3, c3),
@@ -129,23 +172,23 @@ class GatedSkip(nn.Module):
 class GeneratorDeep8(nn.Module):
     """Redraw-oriented generator with a /8 bottleneck and weak low-resolution skips."""
 
-    def __init__(self, ch=32):
+    def __init__(self, ch=32, skip2_init=0.1, skip4_init=0.1, antialias=0):
         super().__init__()
         c1, c2, c3, c4 = ch, ch * 2, ch * 4, ch * 6
         self.in_conv = ConvNormLReLU(3, c1, k=7, p=3)
-        self.down1 = nn.Sequential(ConvNormLReLU(c1, c2, s=2), ConvNormLReLU(c2, c2))
-        self.down2 = nn.Sequential(ConvNormLReLU(c2, c3, s=2), ConvNormLReLU(c3, c3))
-        self.down3 = nn.Sequential(ConvNormLReLU(c3, c4, s=2), ConvNormLReLU(c4, c4))
+        self.down1 = nn.Sequential(ConvNormLReLU(c1, c2, s=2, antialias=antialias), ConvNormLReLU(c2, c2))
+        self.down2 = nn.Sequential(ConvNormLReLU(c2, c3, s=2, antialias=antialias), ConvNormLReLU(c3, c3))
+        self.down3 = nn.Sequential(ConvNormLReLU(c3, c4, s=2, antialias=antialias), ConvNormLReLU(c4, c4))
         self.mid = nn.Sequential(
             ConvNormLReLU(c4, c4),
             *[InvertedResidual(c4, c4) for _ in range(6)],
             ConvNormLReLU(c4, c4),
         )
         self.up1 = UpPixelShuffle(c4, c3)
-        self.skip4 = GatedSkip(0.1)
+        self.skip4 = GatedSkip(skip4_init)
         self.dec1 = nn.Sequential(ConvNormLReLU(c3, c3), ConvNormLReLU(c3, c3))
         self.up2 = UpPixelShuffle(c3, c2)
-        self.skip2 = GatedSkip(0.1)
+        self.skip2 = GatedSkip(skip2_init)
         self.dec2 = nn.Sequential(ConvNormLReLU(c2, c2), ConvNormLReLU(c2, c2))
         # No full-resolution skip: the output must redraw facial features instead of copying pixels.
         self.up3 = UpPixelShuffle(c2, c1)
@@ -163,11 +206,31 @@ class GeneratorDeep8(nn.Module):
         return self.out(h)
 
 
-def build_generator(ch=32, arch="legacy"):
+def random_affine_theta(n, device, shift_px, scale, rot_deg, size):
+    """합성 모션용 미세 아핀 파라미터. 프레임 간 얼굴 흔들림을 흉내낸다."""
+    ang = (torch.rand(n, device=device) * 2 - 1) * (rot_deg * math.pi / 180.0)
+    sc = 1.0 + (torch.rand(n, device=device) * 2 - 1) * scale
+    tx = (torch.rand(n, device=device) * 2 - 1) * (2.0 * shift_px / max(size, 1))
+    ty = (torch.rand(n, device=device) * 2 - 1) * (2.0 * shift_px / max(size, 1))
+    cos, sin = torch.cos(ang) / sc, torch.sin(ang) / sc
+    theta = torch.zeros(n, 2, 3, device=device)
+    theta[:, 0, 0], theta[:, 0, 1], theta[:, 0, 2] = cos, -sin, tx
+    theta[:, 1, 0], theta[:, 1, 1], theta[:, 1, 2] = sin, cos, ty
+    return theta
+
+
+def warp_affine(x, theta):
+    grid = F.affine_grid(theta, list(x.shape), align_corners=False)
+    return F.grid_sample(x, grid, mode="bilinear", padding_mode="reflection",
+                         align_corners=False)
+
+
+def build_generator(ch=32, arch="legacy", skip2_init=0.1, skip4_init=0.1, antialias=0):
     if arch == "legacy":
-        return Generator(ch)
+        return Generator(ch, antialias=antialias)
     if arch == "deep8":
-        return GeneratorDeep8(ch)
+        return GeneratorDeep8(ch, skip2_init=skip2_init, skip4_init=skip4_init,
+                              antialias=antialias)
     raise ValueError(f"unknown generator architecture: {arch}")
 
 
@@ -181,6 +244,29 @@ def checkpoint_generator_arch(checkpoint, weights=None):
     if isinstance(weights, dict) and any(key.startswith("down3.") for key in weights):
         return "deep8"
     return "legacy"
+
+
+def checkpoint_generator_kwargs(checkpoint, weights=None):
+    """체크포인트만 보고 생성기를 그대로 복원하기 위한 인자를 뽑는다.
+
+    BlurPool 을 켜면 state_dict 에 고정 커널 버퍼(.kernel)가 생기므로,
+    구조를 모르고 만들면 strict 로딩이 실패한다. 저장된 args 를 우선 쓰고,
+    없으면 가중치에서 역추론한다(구 체크포인트 호환).
+    """
+    if weights is None:
+        weights = checkpoint.get("G") if isinstance(checkpoint, dict) else checkpoint
+    saved = (checkpoint.get("args") or {}) if isinstance(checkpoint, dict) else {}
+    antialias = saved.get("antialias")
+    if antialias is None:
+        kernels = [v for k, v in weights.items() if k.endswith(".kernel") and v.dim() == 4]
+        antialias = int(kernels[0].shape[-1]) if kernels else 0
+    return dict(
+        ch=int(weights["in_conv.1.weight"].shape[0]),
+        arch=checkpoint_generator_arch(checkpoint, weights),
+        antialias=int(antialias),
+        skip2_init=float(saved.get("skip2_init", 0.1)),
+        skip4_init=float(saved.get("skip4_init", 0.1)),
+    )
 
 
 # ============ Discriminator (PatchGAN + spectral norm) ============
@@ -552,6 +638,22 @@ def main():
     ap.add_argument("--perc-size", type=int, default=0, dest="perc_size",
                     help="VGG perceptual 계산 해상도. 0=학습 크기, 256=빠른 512 학습 권장")
     ap.add_argument("--gen-ch", type=int, default=32, dest="gen_ch", help="제너레이터 기본채널(용량↑=32→48→64, 속도↓)")
+    ap.add_argument("--antialias", type=int, default=0, choices=[0, 3, 5],
+                    help="stride-2 다운샘플을 BlurPool 로 교체(0=끔, 3=[1,2,1], 5=[1,4,6,4,1]). 이동 민감도를 낮춘다")
+    ap.add_argument("--w-equiv", type=float, default=0.0, dest="w_equiv",
+                    help="equivariance 손실 가중치. L1(G(warp x), warp G(x)). 0=끔, 시작값 20")
+    ap.add_argument("--equiv-shift", type=float, default=4.0, dest="equiv_shift",
+                    help="합성 모션 최대 이동(px)")
+    ap.add_argument("--equiv-scale", type=float, default=0.02, dest="equiv_scale",
+                    help="합성 모션 최대 스케일 변화(비율)")
+    ap.add_argument("--equiv-rot", type=float, default=2.0, dest="equiv_rot",
+                    help="합성 모션 최대 회전(도)")
+    ap.add_argument("--equiv-border", type=int, default=16, dest="equiv_border",
+                    help="warp 경계 제외 픽셀")
+    ap.add_argument("--skip2-init", type=float, default=0.1, dest="skip2_init",
+                    help="deep8 /2 게이트 초기 게인. 올리면 중주파 윤곽이 통과해 선명해지고 기하 자유도는 준다")
+    ap.add_argument("--skip4-init", type=float, default=0.1, dest="skip4_init",
+                    help="deep8 /4 게이트 초기 게인. 해상도가 낮아 위치 구속이 약하다")
     ap.add_argument("--gen-arch", choices=("legacy", "deep8"), default="legacy", dest="gen_arch",
                     help="legacy=/4 U-Net, deep8=/8 병목+약한 skip의 얼굴 redraw 구조")
     ap.add_argument("--d-ch", type=int, default=48, dest="d_ch")
@@ -628,7 +730,9 @@ def main():
             return nullcontext()
         return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
 
-    G = build_generator(args.gen_ch, args.gen_arch).to(dev)
+    G = build_generator(args.gen_ch, args.gen_arch,
+                        skip2_init=args.skip2_init, skip4_init=args.skip4_init,
+                        antialias=args.antialias).to(dev)
     D = Discriminator(args.d_ch, args.d_n, 6 if args.conditional_gan else 3).to(dev)
     vgg = VGGPerceptual(allow_random=args.smoke).to(dev)
     idm = load_id(dev) if args.id_loss > 0 else None
@@ -810,6 +914,21 @@ def main():
                     # Introduce feature matching on the same ramp as adversarial training.
                     fm_ramp = min(1.0, w_adv_eff / max(args.w_adv, 1e-12))
                     g = g + args.w_fm * fm_ramp * fm
+            equiv = torch.tensor(0.0, device=dev)
+            if args.w_equiv > 0:
+                # [시간적 안정성] "옮기고 그리기" == "그리고 옮기기" 를 강제한다.
+                # 정지 이미지만으로 프레임 간 안정성을 학습시키는 방법
+                # (StableLLVE, CVPR 2021, MIT). 실사 영상이 필요 없어 저작권 제약을 우회한다.
+                # 추론 비용은 0이고 학습 forward 만 1회 늘어난다.
+                theta = random_affine_theta(inp.shape[0], dev, args.equiv_shift,
+                                            args.equiv_scale, args.equiv_rot, inp.shape[-1])
+                fake_of_warped = G(warp_affine(inp, theta))
+                warped_fake = warp_affine(fake, theta)
+                b = max(1, int(args.equiv_border))
+                # 경계는 warp 로 생긴 인공 픽셀이라 손실에서 제외한다.
+                equiv = F.l1_loss(fake_of_warped[:, :, b:-b, b:-b],
+                                  warped_fake[:, :, b:-b, b:-b])
+                g = g + args.w_equiv * equiv
             if args.w_tv > 0:
                 tv = ((fake[:, :, 1:] - fake[:, :, :-1]).abs().mean()
                       + (fake[:, :, :, 1:] - fake[:, :, :, :-1]).abs().mean())
@@ -820,7 +939,8 @@ def main():
                 idl = F.relu(cos - args.id_margin).mean()
                 g = g + args.id_loss * idl
         return fake, g, dict(l1=l1.item(), perc=perc.item(), edge=edge.item(),
-                             adv=float(adv.detach()), fm=float(fm.detach()), idl=float(idl.detach()))
+                             adv=float(adv.detach()), fm=float(fm.detach()),
+                             equiv=float(equiv.detach()), idl=float(idl.detach()))
 
     def d_loss(inp, tgt):
         with amp_context():
@@ -974,7 +1094,7 @@ def main():
             steps_per_second = (step - log_step) / max(elapsed, 1e-9)
             print(f"[{step}/{args.steps}] wadv={w_adv_eff:.2f} D={float(dl):.3f} G={gl.item():.3f} "
                   f"l1={parts['l1']:.3f} perc={parts['perc']:.3f} edge={parts['edge']:.3f} "
-                  f"adv={parts['adv']:.2f} fm={parts['fm']:.3f} "
+                  f"adv={parts['adv']:.2f} fm={parts['fm']:.3f} eqv={parts['equiv']:.4f} "
                   f"id={parts['idl']:.3f} step/s={steps_per_second:.2f}")
             log_time = time.perf_counter()
             log_step = step

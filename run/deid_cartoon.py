@@ -268,7 +268,7 @@ def sharpen_crop(image, amount, radius_ratio=0.006):
 def composite(frame, boxes, stylizer, cartoon_min, blur_mode="pixelate", expand=0.15,
               color_match=0.0, square_crop=False, mask_mode="crop-ellipse",
               mask_scale_x=0.92, mask_scale_y=1.0, mask_feather=0.04, occupancy=0.0,
-              sharpen=0.0):
+              sharpen=0.0, temporal=0.0, prev_frame=None):
     H, W = frame.shape[:2]; nc = nb = 0
     for x1, y1, x2, y2, sc in boxes:
         bw, bh = x2-x1, y2-y1; size = max(bw, bh)
@@ -333,8 +333,14 @@ def composite(frame, boxes, stylizer, cartoon_min, blur_mode="pixelate", expand=
             fk = min(151, fk)
         m = cv2.GaussianBlur(mask, (fk, fk), 0).astype(np.float32)/255.0
         original = frame[py1:py2, px1:px2]
-        proc_roi = proc[oy1:oy2, ox1:ox2]
+        proc_roi = proc[oy1:oy2, ox1:ox2].astype(np.float32)
         mask_roi = m[oy1:oy2, ox1:ox2, None]
+        if temporal > 0 and prev_frame is not None:
+            # 스타일러는 실제 움직임을 1.3배 증폭한다(선이 프레임마다 튄다).
+            # 같은 화면 좌표의 직전 출력과 섞어 그 진동을 눌러준다.
+            # 얼굴이 빠르게 움직이면 잔상이 생기므로 0.3~0.5 가 실용 범위다.
+            proc_roi = temporal * prev_frame[py1:py2, px1:px2].astype(np.float32) \
+                       + (1.0 - temporal) * proc_roi
         frame[py1:py2, px1:px2] = (
             original*(1-mask_roi) + proc_roi*mask_roi
         ).astype(np.uint8)
@@ -359,6 +365,8 @@ def main():
     ap.add_argument("--mask-scale-x", type=float, default=0.92, dest="mask_scale_x")
     ap.add_argument("--mask-scale-y", type=float, default=1.0, dest="mask_scale_y")
     ap.add_argument("--mask-feather", type=float, default=0.04, dest="mask_feather")
+    ap.add_argument("--temporal", type=float, default=0.0,
+                    help="직전 출력 프레임과의 블렌딩 비율(0=끔, 0.3~0.5 권장). 선 튐을 줄이나 잔상이 생긴다")
     ap.add_argument("--box-smooth", type=float, default=0.0, dest="box_smooth",
                     help="검출 박스 EMA 계수(0=끔, 0.5~0.8 권장). 프레임 간 번쩍임을 줄인다")
     ap.add_argument("--sharpen", type=float, default=0.0,
@@ -405,6 +413,7 @@ def main():
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
 
     smoother = BoxSmoother(args.box_smooth)
+    prev_out = None
     i = 0; tot_c = tot_b = 0; t_det = t_comp = t_write = 0.0; t0 = time.perf_counter()
     while True:
         ok, frame = cap.read()
@@ -417,11 +426,13 @@ def main():
             frame, boxes, styl, args.cartoon_min, args.blur_mode,
             expand=args.face_expand, color_match=args.color_match,
             square_crop=args.square_crop, mask_mode=args.mask_mode, occupancy=args.face_occupancy,
-            sharpen=args.sharpen,
+            sharpen=args.sharpen, temporal=args.temporal, prev_frame=prev_out,
             mask_scale_x=args.mask_scale_x, mask_scale_y=args.mask_scale_y,
             mask_feather=args.mask_feather,
         )
         c = time.perf_counter()
+        if args.temporal > 0:
+            prev_out = frame.copy()      # 다음 프레임의 시간 블렌딩 기준
         proc.stdin.write(frame.tobytes())
         d = time.perf_counter()
         t_det += b-a; t_comp += c-b; t_write += d-c; tot_c += nc; tot_b += nb
