@@ -31,6 +31,42 @@ NOSE_TIP = 1
 MOUTH = [61, 291]                    # 입꼬리 양쪽
 
 
+MODEL_URL = ("https://storage.googleapis.com/mediapipe-models/face_landmarker/"
+             "face_landmarker/float16/1/face_landmarker.task")
+
+
+def build_landmarker(model_path):
+    """MediaPipe 1.0 Tasks API. 구 mp.solutions 는 제거됐다.
+
+    VIDEO 모드는 내부에 트래킹을 두어 프레임 간 랜드마크가 더 안정적이다
+    (매 프레임 독립 검출하는 IMAGE 모드보다 우리 목적에 맞다).
+    """
+    import mediapipe as mp
+    from mediapipe.tasks import python as mp_python
+    from mediapipe.tasks.python import vision
+
+    if not os.path.isfile(model_path):
+        import urllib.request
+        os.makedirs(os.path.dirname(model_path) or ".", exist_ok=True)
+        print(f"[model] 내려받는 중 → {model_path}")
+        urllib.request.urlretrieve(MODEL_URL, model_path)
+
+    options = vision.FaceLandmarkerOptions(
+        base_options=mp_python.BaseOptions(model_asset_path=model_path),
+        running_mode=vision.RunningMode.VIDEO,
+        num_faces=1,
+        min_face_detection_confidence=0.4,
+        min_tracking_confidence=0.4,
+    )
+    landmarker = vision.FaceLandmarker.create_from_options(options)
+
+    def to_mp(bgr):
+        return mp.Image(image_format=mp.ImageFormat.SRGB,
+                        data=cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+
+    return landmarker, to_mp
+
+
 def five_points(landmarks, w, h):
     pt = lambda i: np.array([landmarks[i].x * w, landmarks[i].y * h], np.float32)
     le = np.mean([pt(i) for i in LEFT_EYE], 0)
@@ -52,12 +88,10 @@ def main():
     ap.add_argument("--n", type=int, default=200, help="측정할 프레임 수")
     ap.add_argument("--start", type=int, default=0)
     ap.add_argument("--out", default="out/landmark_probe.png")
+    ap.add_argument("--model", default="models/face_landmarker.task")
     args = ap.parse_args()
 
-    import mediapipe as mp
-    mesh = mp.solutions.face_mesh.FaceMesh(
-        static_image_mode=False, max_num_faces=1,
-        refine_landmarks=True, min_detection_confidence=0.5, min_tracking_confidence=0.5)
+    landmarker, to_mp = build_landmarker(args.model)
 
     cap = cv2.VideoCapture(args.video)
     if not cap.isOpened():
@@ -73,13 +107,13 @@ def main():
         total += 1
         h, w = frame.shape[:2]
         t0 = time.perf_counter()
-        res = mesh.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        res = landmarker.detect_for_video(to_mp(frame), int(total * 1000 / 30))
         times.append((time.perf_counter() - t0) * 1000)
-        if not res.multi_face_landmarks:
+        if not res.face_landmarks:
             params.append(None)
             continue
         hits += 1
-        p5 = five_points(res.multi_face_landmarks[0].landmark, w, h)
+        p5 = five_points(res.face_landmarks[0], w, h)
         params.append(similarity_params(p5))
         if len(frames) < 4 and total % 40 == 1:
             vis = frame.copy()
