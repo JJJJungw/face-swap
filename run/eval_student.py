@@ -130,7 +130,8 @@ def main():
         G = build_generator(**gen_kwargs).to(dev).eval()
         G.load_state_dict(weights, strict=True)
         print(f"\n[{tag}] {ck}  (step {sd.get('step','?')})")
-        print(f"[model] gen_arch={detected_arch} gen_ch={detected_ch}")
+        print(f"[model] gen_arch={gen_kwargs['arch']} gen_ch={gen_kwargs['ch']} "
+              f"antialias={gen_kwargs['antialias']}")
 
         cos, l1, perc_proxy = [], [], []
         saved = []
