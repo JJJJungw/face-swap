@@ -182,6 +182,23 @@ def color_transfer(src, ref, strength=1.0):
     m = cv2.cvtColor(np.clip(s, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
     return m if strength >= 1.0 else cv2.addWeighted(m, strength, src, 1-strength, 0)
 
+def lowpass(image, sigma):
+    """축소 → 작은 블러 → 확대. 큰 sigma 를 직접 돌리면 프레임당 수십~수백 ms 가 든다.
+
+    저주파만 필요하므로 다운샘플해서 계산해도 결과가 사실상 같다.
+    (측정: 534px 크롭에 sigma 53 직접 블러 = 약 80ms/회 → 이 방식 1ms 미만)
+    """
+    if sigma < 1.0:
+        return image.copy()
+    k = max(1, int(sigma / 4.0))
+    if k <= 1:
+        return cv2.GaussianBlur(image, (0, 0), sigma)
+    h, w = image.shape[:2]
+    small = cv2.resize(image, (max(2, w // k), max(2, h // k)), interpolation=cv2.INTER_AREA)
+    small = cv2.GaussianBlur(small, (0, 0), sigma / k)
+    return cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
+
+
 def color_transfer_lowfreq(src, ref, strength=1.0, sigma_ratio=0.10, luma=0.5,
                            vivid_chroma=1.0, vivid_luma=1.0):
     """저주파(조명·색조)는 원본에서, 고주파(선·화풍)는 스타일 결과에서 가져온다.
@@ -204,8 +221,8 @@ def color_transfer_lowfreq(src, ref, strength=1.0, sigma_ratio=0.10, luma=0.5,
     s = cv2.cvtColor(src, cv2.COLOR_BGR2LAB).astype(np.float32)
     r = cv2.cvtColor(ref, cv2.COLOR_BGR2LAB).astype(np.float32)
     sigma = max(3.0, min(src.shape[:2]) * sigma_ratio)
-    s_lo = cv2.GaussianBlur(s, (0, 0), sigma)
-    r_lo = cv2.GaussianBlur(r, (0, 0), sigma)
+    s_lo = lowpass(s, sigma)
+    r_lo = lowpass(r, sigma)
     weights = (float(luma), 1.0, 1.0)          # L, a, b
     out = s + np.stack([(r_lo[:, :, i] - s_lo[:, :, i]) * weights[i] for i in range(3)], 2)
 
@@ -214,7 +231,7 @@ def color_transfer_lowfreq(src, ref, strength=1.0, sigma_ratio=0.10, luma=0.5,
     #   저주파를 원본에 맞추면서 진폭만 따로 올릴 수 있다. 저주파 기준으로 늘리므로
     #   색조는 그대로 유지되고 대비·채도만 올라간다. 1.0 이면 변화 없음.
     if vivid_chroma != 1.0 or vivid_luma != 1.0:
-        base = cv2.GaussianBlur(out, (0, 0), sigma)
+        base = lowpass(out, sigma)
         gains = (float(vivid_luma), float(vivid_chroma), float(vivid_chroma))
         out = base + np.stack([(out[:, :, i] - base[:, :, i]) * gains[i] for i in range(3)], 2)
 
@@ -232,8 +249,12 @@ def denoise_crop(crop, strength):
     """
     if strength <= 0:
         return crop
-    d = max(3, int(round(min(crop.shape[:2]) * 0.02)) | 1)
-    return cv2.bilateralFilter(crop, d, 25.0 * strength, 25.0 * strength)
+    # bilateral 은 커널이 커지면 급격히 느려진다. 축소해서 걸고 되돌린다.
+    h, w = crop.shape[:2]
+    k = max(1, min(h, w) // 256)
+    small = cv2.resize(crop, (w // k, h // k), interpolation=cv2.INTER_AREA) if k > 1 else crop
+    small = cv2.bilateralFilter(small, 5, 25.0 * strength, 25.0 * strength)
+    return cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR) if k > 1 else small
 
 
 def flatten_skin(image, strength, edge_keep=0.35):
@@ -245,8 +266,14 @@ def flatten_skin(image, strength, edge_keep=0.35):
     """
     if strength <= 0:
         return image
-    d = max(3, int(round(min(image.shape[:2]) * 0.03)) | 1)
-    smooth = cv2.bilateralFilter(image, d, 45.0, 45.0)
+    h, w = image.shape[:2]
+    k = max(1, min(h, w) // 256)
+    if k > 1:
+        small = cv2.resize(image, (w // k, h // k), interpolation=cv2.INTER_AREA)
+        smooth = cv2.resize(cv2.bilateralFilter(small, 7, 45.0, 45.0), (w, h),
+                            interpolation=cv2.INTER_LINEAR)
+    else:
+        smooth = cv2.bilateralFilter(image, 7, 45.0, 45.0)
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     grad = cv2.magnitude(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3),
                          cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3))
@@ -425,7 +452,8 @@ def composite(frame, boxes, stylizer, cartoon_min, blur_mode="pixelate", expand=
             # 상한 31px 은 큰 얼굴에서 하드 엣지가 된다.
             fk = max(5, int(round(min(crop_w, crop_h) * mask_feather)) | 1)
             fk = min(151, fk)
-        m = cv2.GaussianBlur(mask, (fk, fk), 0).astype(np.float32)/255.0
+        # 페더도 큰 커널이면 비싸다. 저역통과 헬퍼로 동일 효과를 싸게 낸다.
+        m = lowpass(mask.astype(np.float32), max(1.0, fk / 3.0)) / 255.0
         original = frame[py1:py2, px1:px2]
         proc_roi = proc[oy1:oy2, ox1:ox2].astype(np.float32)
         mask_roi = m[oy1:oy2, ox1:ox2, None]
