@@ -191,6 +191,66 @@ def blur_crop(crop, mode="pixelate", cap=12):
     blocks = max(1, min(min(w, h)//10, cap))
     return cv2.resize(cv2.resize(crop, (blocks, blocks)), (w, h), interpolation=cv2.INTER_NEAREST)
 
+class BoxSmoother:
+    """검출 박스를 프레임 간 EMA 로 안정화한다.
+
+    프레임마다 독립 검출하면 박스가 수 px 씩 떨리고, 크롭 좌표가 떨리면
+    GAN 입력 샘플링이 달라져 출력 화풍·색이 프레임마다 튄다(번쩍임).
+    IoU 로 직전 프레임의 같은 얼굴을 찾아 좌표를 지수평활한다.
+    alpha=0 이면 평활 없음(원래 동작), 클수록 직전 프레임을 더 따른다.
+    """
+
+    def __init__(self, alpha=0.0, iou_threshold=0.3, max_missing=5):
+        self.alpha = float(alpha)
+        self.iou_threshold = float(iou_threshold)
+        self.max_missing = int(max_missing)
+        self.tracks = []            # [[x1,y1,x2,y2,score], missing]
+
+    @staticmethod
+    def _iou(a, b):
+        ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+        ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+        iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+        inter = iw * ih
+        if inter <= 0:
+            return 0.0
+        area_a = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
+        area_b = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+        return inter / (area_a + area_b - inter + 1e-6)
+
+    def __call__(self, boxes):
+        if self.alpha <= 0:
+            return boxes
+        used, out = set(), []
+        for box in boxes:
+            best, best_iou = -1, self.iou_threshold
+            for idx, (prev, _) in enumerate(self.tracks):
+                if idx in used:
+                    continue
+                iou = self._iou(box, prev)
+                if iou > best_iou:
+                    best, best_iou = idx, iou
+            if best >= 0:
+                prev = self.tracks[best][0]
+                a = self.alpha
+                smoothed = [a * prev[k] + (1.0 - a) * box[k] for k in range(4)] + [box[4]]
+                self.tracks[best] = [smoothed, 0]
+                used.add(best)
+                out.append(tuple(smoothed))
+            else:
+                self.tracks.append([list(box), 0])
+                used.add(len(self.tracks) - 1)
+                out.append(tuple(box))
+        kept = []
+        for idx, (prev, missing) in enumerate(self.tracks):
+            if idx in used:
+                kept.append([prev, 0])
+            elif missing + 1 <= self.max_missing:
+                kept.append([prev, missing + 1])
+        self.tracks = kept
+        return out
+
+
 def sharpen_crop(image, amount, radius_ratio=0.006):
     """언샤프 마스크. 스타일화 결과의 선을 세운다.
 
@@ -299,6 +359,8 @@ def main():
     ap.add_argument("--mask-scale-x", type=float, default=0.92, dest="mask_scale_x")
     ap.add_argument("--mask-scale-y", type=float, default=1.0, dest="mask_scale_y")
     ap.add_argument("--mask-feather", type=float, default=0.04, dest="mask_feather")
+    ap.add_argument("--box-smooth", type=float, default=0.0, dest="box_smooth",
+                    help="검출 박스 EMA 계수(0=끔, 0.5~0.8 권장). 프레임 간 번쩍임을 줄인다")
     ap.add_argument("--sharpen", type=float, default=0.0,
                     help="스타일화 결과 언샤프 마스크 강도. 0=끔, 0.3~0.8 권장")
     ap.add_argument("--trt", action="store_true", help="TensorRT 검출(첫 실행은 엔진 빌드로 느림)")
@@ -342,13 +404,14 @@ def main():
           ["-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", args.out]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
 
+    smoother = BoxSmoother(args.box_smooth)
     i = 0; tot_c = tot_b = 0; t_det = t_comp = t_write = 0.0; t0 = time.perf_counter()
     while True:
         ok, frame = cap.read()
         if not ok: break
         i += 1
         a = time.perf_counter()
-        boxes = det.detect(frame, W, H)
+        boxes = smoother(det.detect(frame, W, H))
         b = time.perf_counter()
         nc, nb = composite(
             frame, boxes, styl, args.cartoon_min, args.blur_mode,
