@@ -305,7 +305,8 @@ def flatten_skin(image, strength, edge_keep=0.35):
     return (image * (1 - blend) + smooth * blend).astype(np.uint8)
 
 
-def color_from_input(styl, ref, mix=1.0, align_sigma=3.0):
+def color_from_input(styl, ref, mix=1.0, align_sigma=3.0,
+                    luma_match=0.0, luma_sigma=0.12):
     """밝기는 스타일 결과에서, 색(a·b)은 입력에서 픽셀 단위로 가져온다.
 
     ■ 왜 이 방식인가 (2026-08-04)
@@ -321,14 +322,33 @@ def color_from_input(styl, ref, mix=1.0, align_sigma=3.0):
       GAN 이 선을 조금 옮기므로 색을 픽셀 단위로 그대로 얹으면 입술 색과
       그려진 입술 선이 어긋날 수 있다. 색만 살짝 번지게 해서 그 어긋남을 흡수한다.
       저주파 전이의 sigma(수십 px)와 달리 3px 수준이라 공간 정밀도는 유지된다.
+
+    ■ luma_match — 크롭 경계가 티 나는 문제 (2026-08-04)
+      chroma 는 a·b 를 픽셀 단위로 입력에서 가져오므로 경계에서 '색' 단차는 없다.
+      그런데도 경계가 보이는 이유는 남은 축, 즉 **밝기(L)** 다. 화풍은 평평한
+      셀 셰이딩이라 저주파 밝기 분포가 실사와 다르고, 그 차이가 타원 경계에서
+      단차로 드러난다. feather 를 키우면 단차 대신 흐릿한 띠가 생길 뿐이다.
+
+      그래서 L 을 저주파/고주파로 나눠 **저주파만** 입력 것으로 갈아끼운다.
+          L' = L + luma_match * (lowpass(L_ref) - lowpass(L_styl))
+      고주파(=그려진 선과 음영 대비)는 건드리지 않으므로 선명도 손실이 없고,
+      밝기 봉투만 입력을 따라가 경계 단차가 사라진다.
+
+      luma_sigma 는 크롭 짧은 변에 대한 비율이다. 너무 작으면 화풍의 셰이딩까지
+      지워지고, 너무 크면 전역 밝기만 맞춰 경계 단차가 남는다.
     """
-    if mix <= 0:
+    if mix <= 0 and luma_match <= 0:
         return styl
     s = cv2.cvtColor(styl, cv2.COLOR_BGR2LAB).astype(np.float32)
     r = cv2.cvtColor(ref, cv2.COLOR_BGR2LAB).astype(np.float32)
-    if align_sigma > 0:
-        r[:, :, 1:] = cv2.GaussianBlur(r[:, :, 1:], (0, 0), align_sigma)
-    s[:, :, 1:] = s[:, :, 1:] * (1.0 - mix) + r[:, :, 1:] * mix
+    if luma_match > 0:
+        sigma = max(1.0, luma_sigma * min(s.shape[0], s.shape[1]))
+        s[:, :, 0] += luma_match * (lowpass(r[:, :, 0], sigma)
+                                    - lowpass(s[:, :, 0], sigma))
+    if mix > 0:
+        if align_sigma > 0:
+            r[:, :, 1:] = cv2.GaussianBlur(r[:, :, 1:], (0, 0), align_sigma)
+        s[:, :, 1:] = s[:, :, 1:] * (1.0 - mix) + r[:, :, 1:] * mix
     return cv2.cvtColor(np.clip(s, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
 
 
@@ -450,6 +470,7 @@ def composite(frame, boxes, stylizer, cartoon_min, blur_mode="pixelate", expand=
               sharpen=0.0, temporal=0.0, prev_frame=None,
               color_mode="global", color_sigma=0.10, color_luma=0.5, color_align=3.0,
               vivid_chroma=1.0, vivid_luma=1.0,
+              luma_match=0.0, luma_sigma=0.12,
               input_denoise=0.0, input_temporal=0.0, prev_raw=None, flatten=0.0,
               despeckle_strength=0.0, despeckle_kernel=5):
     H, W = frame.shape[:2]; nc = nb = 0
@@ -508,7 +529,8 @@ def composite(frame, boxes, stylizer, cartoon_min, blur_mode="pixelate", expand=
             styl = cv2.resize(stylizer.stylize(gan_in), (cx2-cx1, cy2-cy1), interpolation=cv2.INTER_LANCZOS4)
             styl = sharpen_crop(styl, sharpen)
             if color_mode == "chroma":
-                proc = color_from_input(styl, crop, color_match, color_align)
+                proc = color_from_input(styl, crop, color_match, color_align,
+                                        luma_match, luma_sigma)
             elif color_mode == "lowfreq":
                 proc = color_transfer_lowfreq(styl, crop, color_match,
                                               color_sigma, color_luma,
@@ -594,6 +616,10 @@ def main():
                     help="스타일화 전 입력 잡음 제거(0=끔, 0.5~1.5). 붓질 자국을 줄인다")
     ap.add_argument("--input-temporal", type=float, default=0.0, dest="input_temporal",
                     help="스타일화 전 이전 프레임 입력과 혼합(0=끔, 0.2~0.4). 흔들림의 원인을 줄인다")
+    ap.add_argument("--luma-match", type=float, default=0.0, dest="luma_match",
+                    help="chroma 모드에서 저주파 밝기를 입력에 맞춘다(0~1). 크롭 경계 단차 제거")
+    ap.add_argument("--luma-sigma", type=float, default=0.12, dest="luma_sigma",
+                    help="저주파 밝기 sigma, 크롭 짧은 변 대비 비율")
     ap.add_argument("--despeckle", type=float, default=0.0, dest="despeckle_strength",
                     help="피부 위 고립된 점(주근깨·잡티) 제거 강도(0=끔, 0.6~1.0). median 이라 선은 남는다")
     ap.add_argument("--despeckle-kernel", type=int, default=5, dest="despeckle_kernel",
@@ -669,6 +695,7 @@ def main():
             vivid_chroma=args.vivid_chroma, vivid_luma=args.vivid_luma,
             input_denoise=args.input_denoise, input_temporal=args.input_temporal,
             prev_raw=prev_raw, flatten=args.flatten,
+            luma_match=args.luma_match, luma_sigma=args.luma_sigma,
             despeckle_strength=args.despeckle_strength, despeckle_kernel=args.despeckle_kernel,
             mask_scale_x=args.mask_scale_x, mask_scale_y=args.mask_scale_y,
             mask_feather=args.mask_feather,
