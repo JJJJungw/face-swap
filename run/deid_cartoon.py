@@ -182,7 +182,8 @@ def color_transfer(src, ref, strength=1.0):
     m = cv2.cvtColor(np.clip(s, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
     return m if strength >= 1.0 else cv2.addWeighted(m, strength, src, 1-strength, 0)
 
-def color_transfer_lowfreq(src, ref, strength=1.0, sigma_ratio=0.10, luma=0.5):
+def color_transfer_lowfreq(src, ref, strength=1.0, sigma_ratio=0.10, luma=0.5,
+                           vivid_chroma=1.0, vivid_luma=1.0):
     """저주파(조명·색조)는 원본에서, 고주파(선·화풍)는 스타일 결과에서 가져온다.
 
     ■ 왜 전역 전이로는 안 되는가
@@ -207,8 +208,51 @@ def color_transfer_lowfreq(src, ref, strength=1.0, sigma_ratio=0.10, luma=0.5):
     r_lo = cv2.GaussianBlur(r, (0, 0), sigma)
     weights = (float(luma), 1.0, 1.0)          # L, a, b
     out = s + np.stack([(r_lo[:, :, i] - s_lo[:, :, i]) * weights[i] for i in range(3)], 2)
+
+    # [쨍함] 저주파 주위의 국소 진폭을 키운다.
+    #   "둥둥 뜬다"(저주파 색조 불일치)와 "쨍하다"(국소 진폭)는 서로 다른 성분이라
+    #   저주파를 원본에 맞추면서 진폭만 따로 올릴 수 있다. 저주파 기준으로 늘리므로
+    #   색조는 그대로 유지되고 대비·채도만 올라간다. 1.0 이면 변화 없음.
+    if vivid_chroma != 1.0 or vivid_luma != 1.0:
+        base = cv2.GaussianBlur(out, (0, 0), sigma)
+        gains = (float(vivid_luma), float(vivid_chroma), float(vivid_chroma))
+        out = base + np.stack([(out[:, :, i] - base[:, :, i]) * gains[i] for i in range(3)], 2)
+
     m = cv2.cvtColor(np.clip(out, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
     return m if strength >= 1.0 else cv2.addWeighted(m, strength, src, 1 - strength, 0)
+
+
+def denoise_crop(crop, strength):
+    """스타일화 **전에** 입력의 압축 잡음·센서 노이즈를 지운다.
+
+    학생은 h.264 블록과 피부 잡음을 '그려야 할 선'으로 오인해 붓질 자국을 만든다
+    (영상 크롭에서 선 밀도가 teacher 대비 1.30배로 측정됨).
+    입력에서 미리 지우면 증강 재학습과 같은 이득을 얻으면서 **출력 대비는 안 올라가므로**
+    흔들림이 새로 드러나지 않는다. edge-preserving 이라 눈·입 윤곽은 남는다.
+    """
+    if strength <= 0:
+        return crop
+    d = max(3, int(round(min(crop.shape[:2]) * 0.02)) | 1)
+    return cv2.bilateralFilter(crop, d, 25.0 * strength, 25.0 * strength)
+
+
+def flatten_skin(image, strength, edge_keep=0.35):
+    """스타일화 **후에** 저대비 영역(피부)만 고르게 편다. 선은 남긴다.
+
+    눈 밑 주근깨 점, 뺨 얼룩처럼 작고 대비 높은 요소가 프레임마다 나타났다 사라지는 것이
+    체감 불안정의 큰 부분이다. 고주파를 **줄이는** 방향이라 --sharpen 과 반대로
+    흔들림을 키우지 않는다.
+    """
+    if strength <= 0:
+        return image
+    d = max(3, int(round(min(image.shape[:2]) * 0.03)) | 1)
+    smooth = cv2.bilateralFilter(image, d, 45.0, 45.0)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    grad = cv2.magnitude(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3),
+                         cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3))
+    keep = np.clip(grad / (grad.max() * edge_keep + 1e-6), 0, 1)[:, :, None]
+    blend = strength * (1.0 - keep)
+    return (image * (1 - blend) + smooth * blend).astype(np.uint8)
 
 
 def blur_crop(crop, mode="pixelate", cap=12):
@@ -298,7 +342,9 @@ def composite(frame, boxes, stylizer, cartoon_min, blur_mode="pixelate", expand=
               color_match=0.0, square_crop=False, mask_mode="crop-ellipse",
               mask_scale_x=0.92, mask_scale_y=1.0, mask_feather=0.04, occupancy=0.0,
               sharpen=0.0, temporal=0.0, prev_frame=None,
-              color_mode="global", color_sigma=0.10, color_luma=0.5):
+              color_mode="global", color_sigma=0.10, color_luma=0.5,
+              vivid_chroma=1.0, vivid_luma=1.0,
+              input_denoise=0.0, input_temporal=0.0, prev_raw=None, flatten=0.0):
     H, W = frame.shape[:2]; nc = nb = 0
     for x1, y1, x2, y2, sc in boxes:
         bw, bh = x2-x1, y2-y1; size = max(bw, bh)
@@ -335,13 +381,26 @@ def composite(frame, boxes, stylizer, cartoon_min, blur_mode="pixelate", expand=
             ox2, oy2 = cx2-cx1, cy2-cy1
         if crop.size == 0: continue
         if size >= cartoon_min:
-            styl = cv2.resize(stylizer.stylize(crop), (cx2-cx1, cy2-cy1), interpolation=cv2.INTER_LANCZOS4)
+            gan_in = crop
+            if input_temporal > 0 and prev_raw is not None:
+                # 입력끼리 섞는다. 출력 블렌딩과 달리 사진끼리라 잔상이 아니라
+                # 자연스러운 모션블러로 보이고, GAN 은 안정된 입력 하나만 본다.
+                prev_crop = prev_raw[py1:py2, px1:px2]
+                if prev_crop.shape == crop[oy1:oy2, ox1:ox2].shape:
+                    gan_in = crop.copy()
+                    gan_in[oy1:oy2, ox1:ox2] = cv2.addWeighted(
+                        prev_crop, input_temporal,
+                        crop[oy1:oy2, ox1:ox2], 1.0 - input_temporal, 0)
+            gan_in = denoise_crop(gan_in, input_denoise)
+            styl = cv2.resize(stylizer.stylize(gan_in), (cx2-cx1, cy2-cy1), interpolation=cv2.INTER_LANCZOS4)
             styl = sharpen_crop(styl, sharpen)
             if color_mode == "lowfreq":
                 proc = color_transfer_lowfreq(styl, crop, color_match,
-                                              color_sigma, color_luma)
+                                              color_sigma, color_luma,
+                                              vivid_chroma, vivid_luma)
             else:
                 proc = color_transfer(styl, crop, color_match)
+            proc = flatten_skin(proc, flatten)
             nc += 1
         else:
             proc = blur_crop(crop, blur_mode); nb += 1
@@ -407,6 +466,16 @@ def main():
                     help="lowfreq 의 저주파 경계. 크롭 크기 대비 비율. 작을수록 사진 명암이 더 돌아온다")
     ap.add_argument("--color-luma", type=float, default=0.5, dest="color_luma",
                     help="밝기(L) 저주파를 원본에서 가져오는 비율. 0=화풍 명암 유지, 1=원본 조명 그대로")
+    ap.add_argument("--vivid-chroma", type=float, default=1.0, dest="vivid_chroma",
+                    help="lowfreq 모드에서 채도 국소 진폭 배율. 1.2~1.5 로 올리면 색이 쨍해진다")
+    ap.add_argument("--vivid-luma", type=float, default=1.0, dest="vivid_luma",
+                    help="lowfreq 모드에서 명암 국소 진폭 배율. 올리면 대비가 강해지나 노이즈도 커진다")
+    ap.add_argument("--input-denoise", type=float, default=0.0, dest="input_denoise",
+                    help="스타일화 전 입력 잡음 제거(0=끔, 0.5~1.5). 붓질 자국을 줄인다")
+    ap.add_argument("--input-temporal", type=float, default=0.0, dest="input_temporal",
+                    help="스타일화 전 이전 프레임 입력과 혼합(0=끔, 0.2~0.4). 흔들림의 원인을 줄인다")
+    ap.add_argument("--flatten", type=float, default=0.0,
+                    help="스타일화 후 피부 평탄화(0=끔, 0.3~0.7). 점·얼룩을 지우고 선은 남긴다")
     ap.add_argument("--temporal", type=float, default=0.0,
                     help="직전 출력 프레임과의 블렌딩 비율(0=끔, 0.3~0.5 권장). 선 튐을 줄이나 잔상이 생긴다")
     ap.add_argument("--box-smooth", type=float, default=0.0, dest="box_smooth",
@@ -456,12 +525,14 @@ def main():
 
     smoother = BoxSmoother(args.box_smooth)
     prev_out = None
+    prev_raw = None
     i = 0; tot_c = tot_b = 0; t_det = t_comp = t_write = 0.0; t0 = time.perf_counter()
     while True:
         ok, frame = cap.read()
         if not ok: break
         i += 1
         a = time.perf_counter()
+        raw = frame.copy() if args.input_temporal > 0 else None
         boxes = smoother(det.detect(frame, W, H))
         b = time.perf_counter()
         nc, nb = composite(
@@ -470,12 +541,16 @@ def main():
             square_crop=args.square_crop, mask_mode=args.mask_mode, occupancy=args.face_occupancy,
             sharpen=args.sharpen, temporal=args.temporal, prev_frame=prev_out,
             color_mode=args.color_mode, color_sigma=args.color_sigma, color_luma=args.color_luma,
+            vivid_chroma=args.vivid_chroma, vivid_luma=args.vivid_luma,
+            input_denoise=args.input_denoise, input_temporal=args.input_temporal,
+            prev_raw=prev_raw, flatten=args.flatten,
             mask_scale_x=args.mask_scale_x, mask_scale_y=args.mask_scale_y,
             mask_feather=args.mask_feather,
         )
         c = time.perf_counter()
         if args.temporal > 0:
             prev_out = frame.copy()      # 다음 프레임의 시간 블렌딩 기준
+        prev_raw = raw               # 입력 시간 평활 기준(스타일화 전 원본)
         proc.stdin.write(frame.tobytes())
         d = time.perf_counter()
         t_det += b-a; t_comp += c-b; t_write += d-c; tot_c += nc; tot_b += nb
