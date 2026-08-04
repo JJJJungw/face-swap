@@ -243,11 +243,18 @@ def composite(frame, boxes, stylizer, cartoon_min, blur_mode="pixelate", expand=
             eay = max(1, int(round(bh * 0.5 * mask_scale_y)))
             cv2.ellipse(mask, (ecx, ecy), (eax, eay), 0, 0, 360, 255, -1)
             fk = max(3, int(round(min(crop_w, crop_h) * mask_feather)) | 1)
-            fk = min(31, fk)
+            fk = min(151, fk)
         else:
             ecx, ecy = crop_w//2, crop_h//2
-            cv2.ellipse(mask, (ecx, ecy), (max(1, ecx-2), max(1, ecy-2)), 0, 0, 360, 255, -1)
-            fk = min(31, max(5, (min(crop_w, crop_h)//8) | 1))
+            # 타원을 크롭보다 조금 작게 잡아 페더가 크롭 안에서 끝나게 한다.
+            # 경계에 닿으면 블러가 잘려 직선 이음매(머리카락을 가로지르는 선)가 보인다.
+            eax = max(1, int(round(ecx * 0.90)))
+            eay = max(1, int(round(ecy * 0.90)))
+            cv2.ellipse(mask, (ecx, ecy), (eax, eay), 0, 0, 360, 255, -1)
+            # 페더는 고정 상한이 아니라 크롭 크기에 비례해야 한다.
+            # 상한 31px 은 큰 얼굴에서 하드 엣지가 된다.
+            fk = max(5, int(round(min(crop_w, crop_h) * mask_feather)) | 1)
+            fk = min(151, fk)
         m = cv2.GaussianBlur(mask, (fk, fk), 0).astype(np.float32)/255.0
         original = frame[py1:py2, px1:px2]
         proc_roi = proc[oy1:oy2, ox1:ox2]
