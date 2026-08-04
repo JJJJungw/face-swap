@@ -17,7 +17,9 @@ import cv2
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from build_localface_pairs import crop_with_reflect, largest_face, square_crop_bounds
+from build_localface_pairs import largest_face
+from crop_utils import (crop_with_edge_padding, occupancy_crop_bounds,
+                        square_crop_bounds)
 from deid_cartoon import Detector
 
 
@@ -71,8 +73,11 @@ def prepare(args):
             print(f"[reject] no face frame={frame_index}")
             continue
 
-        bounds = square_crop_bounds(box, width, height, args.crop_expand)
-        crop = crop_with_reflect(frame, bounds)
+        if args.face_occupancy > 0:
+            bounds = occupancy_crop_bounds(box, args.face_occupancy)
+        else:
+            bounds = square_crop_bounds(box, width, height, args.crop_expand)
+        crop = crop_with_edge_padding(frame, bounds)
         stem = f"f{frame_index:06d}"
         frame_path = frame_dir / f"{stem}.png"
         crop_path = crop_dir / f"{stem}.png"
@@ -100,6 +105,7 @@ def prepare(args):
             "box": [round(float(value), 3) for value in box],
             "crop_bounds": list(bounds),
             "crop_expand": args.crop_expand,
+            "face_occupancy": args.face_occupancy,
             "frame": str(frame_path),
             "crop": str(crop_path),
         }
@@ -228,6 +234,8 @@ def main():
     parser.add_argument("--n", type=int, default=12)
     parser.add_argument("--edge-fraction", type=float, default=0.05)
     parser.add_argument("--crop-expand", type=float, default=0.5)
+    parser.add_argument("--face-occupancy", type=float, default=0.0,
+                        help="0 means use --crop-expand; otherwise face area / crop area")
     parser.add_argument("--trt", action="store_true")
     parser.add_argument("--teacher-dir")
     parser.add_argument("--mask-scale-x", type=float, default=0.92)
@@ -241,6 +249,8 @@ def main():
         parser.error("--edge-fraction must be in [0, 0.5)")
     if args.crop_expand < 0:
         parser.error("--crop-expand must be non-negative")
+    if args.face_occupancy and not 0.0 < args.face_occupancy < 1.0:
+        parser.error("--face-occupancy must be in (0,1)")
     if args.stage == "prepare":
         prepare(args)
     else:
