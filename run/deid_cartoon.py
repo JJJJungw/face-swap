@@ -191,9 +191,24 @@ def blur_crop(crop, mode="pixelate", cap=12):
     blocks = max(1, min(min(w, h)//10, cap))
     return cv2.resize(cv2.resize(crop, (blocks, blocks)), (w, h), interpolation=cv2.INTER_NEAREST)
 
+def sharpen_crop(image, amount, radius_ratio=0.006):
+    """언샤프 마스크. 스타일화 결과의 선을 세운다.
+
+    512 로 스타일화한 뒤 크롭 크기로 되돌리는 과정에서 선이 뭉개진다.
+    radius 는 크롭 크기에 비례해야 얼굴 크기가 달라져도 같은 세기로 보인다.
+    amount 가 크면 아티팩트·노이즈도 같이 증폭되므로 0.3~0.8 이 실용 범위다.
+    """
+    if amount <= 0:
+        return image
+    sigma = max(0.8, min(image.shape[:2]) * radius_ratio)
+    blurred = cv2.GaussianBlur(image, (0, 0), sigma)
+    return cv2.addWeighted(image, 1.0 + amount, blurred, -amount, 0)
+
+
 def composite(frame, boxes, stylizer, cartoon_min, blur_mode="pixelate", expand=0.15,
               color_match=0.0, square_crop=False, mask_mode="crop-ellipse",
-              mask_scale_x=0.92, mask_scale_y=1.0, mask_feather=0.04, occupancy=0.0):
+              mask_scale_x=0.92, mask_scale_y=1.0, mask_feather=0.04, occupancy=0.0,
+              sharpen=0.0):
     H, W = frame.shape[:2]; nc = nb = 0
     for x1, y1, x2, y2, sc in boxes:
         bw, bh = x2-x1, y2-y1; size = max(bw, bh)
@@ -231,6 +246,7 @@ def composite(frame, boxes, stylizer, cartoon_min, blur_mode="pixelate", expand=
         if crop.size == 0: continue
         if size >= cartoon_min:
             styl = cv2.resize(stylizer.stylize(crop), (cx2-cx1, cy2-cy1), interpolation=cv2.INTER_LANCZOS4)
+            styl = sharpen_crop(styl, sharpen)
             proc = color_transfer(styl, crop, color_match); nc += 1
         else:
             proc = blur_crop(crop, blur_mode); nb += 1
@@ -283,6 +299,8 @@ def main():
     ap.add_argument("--mask-scale-x", type=float, default=0.92, dest="mask_scale_x")
     ap.add_argument("--mask-scale-y", type=float, default=1.0, dest="mask_scale_y")
     ap.add_argument("--mask-feather", type=float, default=0.04, dest="mask_feather")
+    ap.add_argument("--sharpen", type=float, default=0.0,
+                    help="스타일화 결과 언샤프 마스크 강도. 0=끔, 0.3~0.8 권장")
     ap.add_argument("--trt", action="store_true", help="TensorRT 검출(첫 실행은 엔진 빌드로 느림)")
     ap.add_argument("--encoder", default="nvenc", choices=["nvenc", "x264"], help="영상 인코더")
     ap.add_argument("--half", action="store_true", help="카툰 GAN fp16(torch 백엔드)")
@@ -336,6 +354,7 @@ def main():
             frame, boxes, styl, args.cartoon_min, args.blur_mode,
             expand=args.face_expand, color_match=args.color_match,
             square_crop=args.square_crop, mask_mode=args.mask_mode, occupancy=args.face_occupancy,
+            sharpen=args.sharpen,
             mask_scale_x=args.mask_scale_x, mask_scale_y=args.mask_scale_y,
             mask_feather=args.mask_feather,
         )
