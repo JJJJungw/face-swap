@@ -182,6 +182,35 @@ def color_transfer(src, ref, strength=1.0):
     m = cv2.cvtColor(np.clip(s, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
     return m if strength >= 1.0 else cv2.addWeighted(m, strength, src, 1-strength, 0)
 
+def color_transfer_lowfreq(src, ref, strength=1.0, sigma_ratio=0.10, luma=0.5):
+    """저주파(조명·색조)는 원본에서, 고주파(선·화풍)는 스타일 결과에서 가져온다.
+
+    ■ 왜 전역 전이로는 안 되는가
+      color_transfer 는 크롭 전체의 평균/표준편차만 맞춘다. 그런데 실제 장면에서는
+      조명이 얼굴을 가로질러 변한다(한쪽만 분홍 조명, 역광 윤곽, 그림자).
+      전역 보정은 그 기울기를 못 따라가서 얼굴 색이 주변과 따로 노는 이질감이 남는다.
+      --color-match 를 1.0 까지 올려도 해소되지 않는 이유다.
+
+      저주파를 통째로 갈아끼우면 조명·색 캐스트가 **공간적으로** 따라온다.
+
+    ■ luma 를 왜 나눠 쓰는가
+      밝기(L)의 저주파까지 원본에서 다 가져오면 사진의 명암 그라데이션이 되돌아와
+      평평한 색면이 깨진다(= 화풍 손실). 색(a,b)은 전부 가져오되 밝기는 일부만 가져온다.
+      luma=0 이면 화풍의 명암을 완전히 지키고, 1 이면 원본 조명을 그대로 따른다.
+    """
+    if strength <= 0:
+        return src
+    s = cv2.cvtColor(src, cv2.COLOR_BGR2LAB).astype(np.float32)
+    r = cv2.cvtColor(ref, cv2.COLOR_BGR2LAB).astype(np.float32)
+    sigma = max(3.0, min(src.shape[:2]) * sigma_ratio)
+    s_lo = cv2.GaussianBlur(s, (0, 0), sigma)
+    r_lo = cv2.GaussianBlur(r, (0, 0), sigma)
+    weights = (float(luma), 1.0, 1.0)          # L, a, b
+    out = s + np.stack([(r_lo[:, :, i] - s_lo[:, :, i]) * weights[i] for i in range(3)], 2)
+    m = cv2.cvtColor(np.clip(out, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
+    return m if strength >= 1.0 else cv2.addWeighted(m, strength, src, 1 - strength, 0)
+
+
 def blur_crop(crop, mode="pixelate", cap=12):
     h, w = crop.shape[:2]
     if mode == "box": return np.zeros_like(crop)
@@ -268,7 +297,8 @@ def sharpen_crop(image, amount, radius_ratio=0.006):
 def composite(frame, boxes, stylizer, cartoon_min, blur_mode="pixelate", expand=0.15,
               color_match=0.0, square_crop=False, mask_mode="crop-ellipse",
               mask_scale_x=0.92, mask_scale_y=1.0, mask_feather=0.04, occupancy=0.0,
-              sharpen=0.0, temporal=0.0, prev_frame=None):
+              sharpen=0.0, temporal=0.0, prev_frame=None,
+              color_mode="global", color_sigma=0.10, color_luma=0.5):
     H, W = frame.shape[:2]; nc = nb = 0
     for x1, y1, x2, y2, sc in boxes:
         bw, bh = x2-x1, y2-y1; size = max(bw, bh)
@@ -307,7 +337,12 @@ def composite(frame, boxes, stylizer, cartoon_min, blur_mode="pixelate", expand=
         if size >= cartoon_min:
             styl = cv2.resize(stylizer.stylize(crop), (cx2-cx1, cy2-cy1), interpolation=cv2.INTER_LANCZOS4)
             styl = sharpen_crop(styl, sharpen)
-            proc = color_transfer(styl, crop, color_match); nc += 1
+            if color_mode == "lowfreq":
+                proc = color_transfer_lowfreq(styl, crop, color_match,
+                                              color_sigma, color_luma)
+            else:
+                proc = color_transfer(styl, crop, color_match)
+            nc += 1
         else:
             proc = blur_crop(crop, blur_mode); nb += 1
         crop_h, crop_w = crop.shape[:2]
@@ -365,6 +400,13 @@ def main():
     ap.add_argument("--mask-scale-x", type=float, default=0.92, dest="mask_scale_x")
     ap.add_argument("--mask-scale-y", type=float, default=1.0, dest="mask_scale_y")
     ap.add_argument("--mask-feather", type=float, default=0.04, dest="mask_feather")
+    ap.add_argument("--color-mode", default="global", choices=["global", "lowfreq"],
+                    dest="color_mode",
+                    help="global=전역 평균/표준편차, lowfreq=저주파 교체(공간적으로 변하는 조명 대응)")
+    ap.add_argument("--color-sigma", type=float, default=0.10, dest="color_sigma",
+                    help="lowfreq 의 저주파 경계. 크롭 크기 대비 비율. 작을수록 사진 명암이 더 돌아온다")
+    ap.add_argument("--color-luma", type=float, default=0.5, dest="color_luma",
+                    help="밝기(L) 저주파를 원본에서 가져오는 비율. 0=화풍 명암 유지, 1=원본 조명 그대로")
     ap.add_argument("--temporal", type=float, default=0.0,
                     help="직전 출력 프레임과의 블렌딩 비율(0=끔, 0.3~0.5 권장). 선 튐을 줄이나 잔상이 생긴다")
     ap.add_argument("--box-smooth", type=float, default=0.0, dest="box_smooth",
@@ -427,6 +469,7 @@ def main():
             expand=args.face_expand, color_match=args.color_match,
             square_crop=args.square_crop, mask_mode=args.mask_mode, occupancy=args.face_occupancy,
             sharpen=args.sharpen, temporal=args.temporal, prev_frame=prev_out,
+            color_mode=args.color_mode, color_sigma=args.color_sigma, color_luma=args.color_luma,
             mask_scale_x=args.mask_scale_x, mask_scale_y=args.mask_scale_y,
             mask_feather=args.mask_feather,
         )
