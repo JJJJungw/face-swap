@@ -90,6 +90,8 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--min-per-cell", type=int, default=6, dest="min_per_cell",
                     help="희소 카테고리(수염·안경 등)의 최소 확보 수")
+    ap.add_argument("--exclude-file", action="append", default=None, dest="exclude_files",
+                    help="이 stem 목록은 제외한다(반복 지정 가능). ★ 학습에 쓸 코퍼스를 반드시 제외할 것")
     ap.add_argument("--no-ita", action="store_true", help="ITA 계산 생략(빠름)")
     args = ap.parse_args()
 
@@ -99,6 +101,16 @@ def main():
             records.append(json.loads(line))
     by_stem = {r["stem"]: r for r in records}
     print(f"[pool] manifest stems={len(by_stem)}")
+
+    # ★ 학습에 쓰일 stem 은 홀드아웃에서 빼야 한다. 안 그러면 그 데이터로 학습한 모델이
+    #    유리해져서 A/B 비교가 성립하지 않는다.
+    for path in (args.exclude_files or []):
+        drop = {line.strip() for line in Path(path).read_text(encoding="utf-8").splitlines() if line.strip()}
+        before = len(by_stem)
+        by_stem = {k: v for k, v in by_stem.items() if k not in drop}
+        print(f"[exclude] {path}: {before} → {len(by_stem)} ({before - len(by_stem)}장 제외)")
+    if not by_stem:
+        raise SystemExit("제외 후 남은 stem 이 없다")
 
     prompts = {}
     with open(args.csv, newline="", encoding="utf-8") as handle:
@@ -185,6 +197,7 @@ def main():
 
     report = {
         "n": len(selected), "seed": args.seed, "manifest": args.manifest,
+        "excluded": args.exclude_files or [],
         "age": dict(Counter(r["age"] for r in selected)),
         "size": dict(Counter(r["size"] for r in selected)),
         "skin": dict(Counter(r["skin"] for r in selected)),
@@ -201,6 +214,8 @@ def main():
     print(f"  수염={report['facial_hair']} 안경={report['eyewear']} 머리가림={report['head_cover']}")
     print(f"  리포트 → {args.report}")
     print("\n※ 이 목록은 고정한다. 실험마다 새로 뽑으면 비교가 성립하지 않는다.")
+    if not args.exclude_files:
+        print("※ 경고: --exclude-file 없이 뽑았다. 학습 코퍼스와 겹치면 A/B 가 편향된다.")
 
 
 if __name__ == "__main__":
