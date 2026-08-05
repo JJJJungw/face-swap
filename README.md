@@ -17,58 +17,49 @@
 
 ---
 
-## 현재 상태 (2026-08-04)
+## 현재 상태 (2026-08-05)
 
 | 항목 | 상태 | 비고 |
 |---|---|---|
 | 얼굴 검출 | ✅ | YOLOX ONNX(`base_v2f2_1280`) 독립 재현 · TensorRT(fp16) |
 | 영상 파이프라인 | ✅ | 검출→카툰/블러→합성→NVENC(+오디오) |
-| 속도 | ✅ | L40S 기준 1.02× 실시간. 한때 5.55×까지 퇴행했다 ([원인·복구](#속도-퇴행-사고-2026-08-03)) |
-| teacher 모델 | ✅ | 공개 Space Anime-V2 재현. INT8 transformer, 4 step, scale 1.2 |
-| **teacher 화풍** | ✅ | 타이트 크롭에서도 굵은 선·평면 셰이딩으로 잘 그린다 ([oracle 감사](#teacher-oracle-감사-2026-08-04)) |
-| 페어 코퍼스 | ✅ | `out/pairs_anime12_13500` 13,500쌍 + occupancy 0.65 localize 인덱스 13,291쌍 |
-| 학생 구조 | ✅ | `deep8` (/8 bottleneck, residual 6, gated skip /2·/4, /1 skip 없음) |
-| 학생 화풍 재현 | ⚠️ | 코퍼스 L1 0.1513. **타겟보다 일관되게 무르다**(저양식화) — 현재 최우선 과제 |
-| 런타임 색 이질감 | ✅ | Lab chroma 전이로 해결 ([색 처리 계보](#색-처리-계보-global--lowfreq--masked--chroma)) |
-| 크롭 경계 단차 | ✅ | 저주파 밝기 정합(`--luma-match`)으로 해결 |
-| 시간적 흔들림 | ⚠️ | 1px 이동 → 출력 1.30× 변화. equivariance loss 미검증 |
-| **비식별화** | ❌ | **미해결.** 학생 신원 cos 0.595 (목표 0.3). `id-loss` 여전히 미사용 |
-| 작은 얼굴 | ⚠️ | `--cartoon-min 150`. swap3의 절반이 150px 미만 → 모자이크 처리됨 |
+| 속도 | ✅ | L40S 기준 1.02× 실시간 (darken 포함 시 ~1.1×). **L4 재측정 필요** |
+| teacher | ✅ | 공개 Space Anime-V2 재현. INT8, 4 step, scale 1.2 |
+| 코퍼스 | ✅ | `pairs_anime12_13500` 13,500쌍 + occupancy 0.65 인덱스 13,291쌍 |
+| 학생 구조 | ✅ | `deep8` — /8 bottleneck, residual 6, gated skip /2·/4, /1 skip 없음, 4.06M |
+| 선 선명도 | ✅ | `w_edge` 복구 + 런타임 `--darken` |
+| 시간적 안정성 | ✅ | equivariance loss로 비등변 1.10 → 0.57 |
+| 색·경계 이질감 | ✅ | Lab chroma 전이 + 저주파 밝기 정합 |
+| 수염·머리 가닥 누락 | 🔬 | 타겟 생성 순서를 바꿔 재학습 중 ([아래](#타겟-생성-순서-그리고-자른다--자르고-그린다-2026-08-05)) |
+| **비식별화** | ❌ | **미해결.** 학생 신원 cos 0.595, 목표 0.3. `id-loss` 여전히 미사용 |
+| 작은 얼굴 | ⚠️ | `--cartoon-min 150`. swap3의 절반이 150px 미만 → 모자이크 |
 
-### 프로덕션 기준선 (2026-08-04 확정)
+### 프로덕션 기준선 (2026-08-05)
 
-모델 `gan_ckpt/keep/student_d8_occ65.onnx` (읽기 전용 보관, `chmod -w`)
+모델 `gan_ckpt/keep/student_d8_edge3_eq.onnx` (읽기 전용 보관)
 
 ```bash
 bash run/run_deid.sh --video input/swap2.mp4 --trt --encoder nvenc \
-  --gan-backend onnx --gan-onnx gan_ckpt/keep/student_d8_occ65.onnx --gan-onnx-size 512 \
+  --gan-backend onnx --gan-onnx gan_ckpt/keep/student_d8_edge3_eq.onnx --gan-onnx-size 512 \
   --square-crop --face-occupancy 0.65 --cartoon-min 150 \
   --mask-feather 0.16 --color-mode chroma --color-match 1.0 --luma-match 0.7 \
-  --sharpen 0 --flatten 0 --despeckle 0
+  --darken 1.8 --sharpen 0 --flatten 0 --despeckle 0
 ```
 
-학습 인자(위 체크포인트 재현용):
-
-```
-gen_arch=deep8  gen_ch=32  size=512  batch=8  steps=30000  lr=2e-4  amp=bf16
-w_l1=1.0  w_perc=2.5  w_adv=1.5  w_edge=0.0  w_fm=0  w_tv=0  id_loss=0
-init_steps=1500  adv_ramp=3000  d_ch=48  d_n=3  aug_level=0  face_mask_weight=1.0
-data=out/pairs_anime12_13500
-localize_manifest=out/localface_idx_occ65/manifest.jsonl
-```
+`gan_ckpt/keep/`에는 세 세대가 모두 보존돼 있다(`occ65` → `edge3` → `edge3_eq`).
+각 단계가 단일 변수 대조군이므로 지우지 않는다.
 
 ### 이번 라운드에서 확정된 것
 
-1. **코퍼스와 런타임의 프레이밍을 일치시켰다.** 둘 다 occupancy 0.65 정사각 크롭이다.
-   `side = sqrt(bw*bh/occupancy)` — 고정 배율(`--crop-expand`)이 아니라 **얼굴 면적비 규격**이다.
-   얼굴 크기가 달라도 프레임 안 얼굴 비율이 같아진다. 13,500쌍 중 13,291쌍이 통과했다
-   (occupancy 0.62~0.65, 이미지 밖 합성 픽셀 비율 ≤ 0.019).
-2. **타겟에서 타원 블렌딩을 뺐다**(`--no-blend`). 예전에는 타원 밖을 실사로 되돌린 타겟을 썼는데,
-   그러면 학생이 "타원 경계를 그리는 법"까지 배운다. 지금은 teacher 크롭이 그대로 타겟이다.
-3. **런타임 색 이질감을 해결했다.** Lab에서 밝기는 학생, 색(a·b)은 입력에서 픽셀 단위로 가져온다.
-4. **크롭 경계 단차를 해결했다.** 색이 아니라 **저주파 밝기**가 원인이었다.
-5. **증강(`--aug-level 1`)을 기각했다.** 모든 지표가 좋아졌는데 영상은 나빠졌다. 육안 판정을 따랐다.
-6. **teacher는 병목이 아니라는 것을 직접 확인했다.** 남은 병목은 학생의 저양식화 하나다.
+1. **선이 흐렸던 원인은 `w_edge = 0`이었다.** 코퍼스를 occupancy 규격으로 갈아엎는 과정에서
+   그 전까지 켜져 있던 손실이 빠진 채 30,000스텝이 돌았다.
+2. **흔들림의 정체는 비등변성이었다.** 입력이 1px 움직이면 출력이 "같이 움직이는" 게 아니라
+   다시 그려졌다. equivariance loss로 1.103 → 0.569.
+3. **선명함과 안정성은 순서가 있다.** 흔들림은 모델 성질이라 후처리로 못 고치고,
+   선 굵기는 후처리로 얹을 수 있다. **안정성을 학습으로 먼저, 선명도를 후처리로 나중에.**
+4. **색·경계 이질감은 전부 런타임에서 풀렸다.** 색은 Lab a·b 픽셀 복사, 경계는 저주파 밝기 정합.
+5. **타겟 생성 순서가 학습·런타임 정렬의 나머지 절반이었다.** 입력만 occupancy로 맞췄고
+   타겟은 여전히 넓은 구도의 산물이었다.
 
 ---
 
@@ -113,6 +104,9 @@ localize_manifest=out/localface_idx_occ65/manifest.jsonl
 | JPEG q90 | 0.93× |
 
 **공간 이동만 증폭된다.** 밝기·압축 노이즈는 그대로 통과한다.
+
+> 위 1.30은 초기 임시 측정이다. 이후 `run/shift_probe.py`로 표본·경계를 고정해 재측정하니
+> 같은 모델이 1.826으로 나왔다. **과거 값과 섞어 비교하지 말고 이 스크립트 값끼리만 비교한다.**
 stride-2 conv의 에일리어싱이 원인이다. 이것은 런타임 후처리로 못 고치는 **모델 성질**이다.
 
 기각된 런타임 대응:
@@ -141,14 +135,27 @@ stride-2 conv의 에일리어싱이 원인이다. 이것은 런타임 후처리�
 라이선스 주의: Adobe 공식 구현은 **CC BY-NC**다. timm(Apache 2.0)을 쓰거나 직접 30줄 짜야 한다.
 현재 `train/train_student.py`의 `BlurPool2d`는 자체 구현(binomial kernel, depthwise, buffer 등록)이다.
 
-### equivariance loss (미검증, 코드만 있음)
+### equivariance loss — 흔들림의 해답이었다
 
 StableLLVE(CVPR 2021, MIT)의 방식. `L1(G(warp(x)), warp(G(x)))`.
-**정지 이미지만으로 시간적 안정성을 배운다** — 영상 학습 데이터가 없는(저작권상 못 쓰는) 우리에게 맞다.
+**정지 이미지만으로 시간적 안정성을 배운다** — 저작권상 영상으로 학습할 수 없는 우리에게 맞는다.
 
-`--w-equiv` / `--equiv-shift` / `--equiv-scale` / `--equiv-rot` / `--equiv-border`로 구현돼 있다.
-`--aug-level 1` 위에 얹어 20,000스텝을 돌리다가, 증강 자체가 기각되면서 같이 중단했다.
-**증강 없이(`--aug-level 0`) 단독으로 다시 검증해야 한다.**
+첫 시도는 `--aug-level 1` 위에 얹었다가 증강이 기각되면서 같이 중단했다.
+증강 없이(`--aug-level 0`) `--w-equiv 10`으로 단독 검증한 결과:
+
+| | 이동(증폭) | **이동(비등변)** | 밝기 | JPEG |
+|---|---|---|---|---|
+| edge3 (equiv 없음) | 1.546 | **1.103** | 0.625 | 1.792 |
+| edge3_eq @4,000 | 1.415 | **0.569** | 0.808 | 1.293 |
+
+**비등변 48% 감소.** val L1은 0.1448 → 0.1472로 유지 — 화풍을 내주고 산 안정성이 아니다.
+덤으로 JPEG 민감도도 28% 떨어졌다(`w_edge`가 올려놓은 압축 취약성을 상쇄).
+
+손실값과 지표가 같은 양을 잰다는 것도 확인했다. 학습 로그의 `eqv≈0.009`는
+probe의 비등변 잔차(입력 변화량 0.008 × 1.103 ≈ 0.0088)와 일치한다.
+
+**주의:** equivariance는 **출력을 상수로 만들면 완벽히 만족된다.** 가중치를 계속 올리면
+어느 지점에서 화풍이 뭉개진다. val L1을 같이 봐야 한다.
 
 ### 랜드마크 정렬은 답이 아니었다 (MediaPipe)
 
@@ -290,7 +297,8 @@ CPU 합성이 7.8ms → **167.1ms**로 뛰고 5.55× 실시간이 됐다.
 *"target 윤곽 gradient L1. 애니 눈/코/턱선 재현은 2~4 권장"*이라고 적혀 있는데
 30,000스텝을 0으로 돌렸다. 선이 문제인데 선을 직접 감독하는 손실을 끄고 있었다.
 
-현재 진행 중인 실험 (`--init-ckpt`로 기존 가중치에서 이어서, 단일 변수):
+복구 실험 (`--init-ckpt`로 기존 가중치에서 이어서, 단일 변수). **결과: val L1 0.1611 → 0.1448,
+선이 눈에 띄게 굵어졌다.** 다만 굵어진 만큼 원래 있던 흔들림이 드러나 equivariance로 이어졌다.
 
 ```bash
 python3 -u train/train_student.py \
@@ -306,18 +314,172 @@ python3 -u train/train_student.py \
   --val-n 128 --sample-every 500 --ckpt-every 2000
 ```
 
-### 다음 후보: 타겟을 더 굵게
+### 여기서 나온 다음 실험
 
-현재 학생의 타겟은 **teacher가 전체 이미지를 그린 결과를 잘라낸 것**이다.
-그런데 oracle 시트가 보여주듯 teacher는 **타이트 크롭을 직접 받으면 훨씬 굵게 그린다.**
-코퍼스 일부(3~4천 장)를 occupancy 0.65로 잘라 teacher를 재실행하고, 그 타겟으로 파인튜닝하는 안이다.
-`w_edge` 결과를 보고 판단한다.
+teacher가 타이트 크롭을 다르게 그린다는 관측이 타겟 생성 순서 실험으로 이어졌다
+→ [타겟 생성 순서](#타겟-생성-순서-그리고-자른다--자르고-그린다-2026-08-05)
 
 ### 프레이밍과 비식별화의 충돌 (미해결 트레이드오프)
 
 영상 wide의 신원 cos가 **0.823**이다. 넓게 잡으면 화질은 좋지만 **비식별화가 거의 안 된다.**
 occ65는 0.605다. **화질을 위해 프레이밍을 넓히는 것은 제품 목적과 정면으로 충돌한다.**
 이 선택은 지표가 아니라 제품 결정이다.
+
+---
+
+## 런타임 후처리 조사 (2026-08-04)
+
+`--sharpen`이 실패한 뒤 "선명하게 만드는 다른 수단"을 조사했다.
+제약은 **Apache 2.0 / MIT** 와 **실시간 예산(현재 16ms, 2× 한도)** 이다.
+
+### 채택: Anime4K Line Darkening (`--darken`)
+
+핵심은 한 줄이다.
+
+```
+D = min(luma - blur(luma), 0)      # 단측 클램프. 어두워지기만 한다
+```
+
+**unsharp가 실패한 이유가 여기서 제거된다.** unsharp는 양방향 오버슈트라 경계 양쪽에
+밝은 halo와 어두운 halo를 동시에 만들고, 그 halo가 프레임마다 흔들린다.
+선명해진 게 아니라 **깜빡임을 새로 만든 것**이었다. 단측 클램프는 밝아지는 픽셀이 0개다.
+
+출처는 [bloc97/Anime4K](https://github.com/bloc97/Anime4K)(MIT)의 Line Darkening 셰이더이며
+알고리즘만 OpenCV로 재구현했다. 비용 약 4ms.
+
+측정(얼굴 영역, DIS 광학흐름으로 모션 보정한 프레임간 잔차 / Canny 엣지 위 gradient 평균):
+
+| 설정 | 흔들림↓ | 선명도↑ |
+|---|---|---|
+| base | 5.757 | 174.8 |
+| edge3 | 4.868 | 176.3 |
+| edge3_eq | 3.299 | 167.5 |
+| **edge3_eq + darken 1.8** | **3.848** | **181.0** |
+| edge3_eq + darken 2.5 | 4.131 | 185.3 |
+
+**`edge3_eq + darken 1.8`이 두 축 모두에서 `edge3`를 이긴다** — 더 선명하고(+2.7%) 덜 흔들린다(-21%).
+"안정성은 학습으로, 선명도는 후처리로"라는 순서가 맞았다는 증거다.
+
+### 기각: 크롭 side 양자화 (`--crop-quant`)
+
+가설은 이랬다. occupancy 크롭은 `side = sqrt(bw*bh/occupancy)` 이므로 검출 박스가 1px만 흔들려도
+side가 바뀌고, 512로 리사이즈하는 배율이 매 프레임 달라져 **입력이 다른 위상으로 재샘플링된다.**
+
+측정 결과 흔들림이 **3.305 / 3.294 / 3.312** (quant 0 / 8 / 16). 차이가 0.5% 미만, 노이즈다.
+**기각.** 코드는 기본값 0으로 남긴다.
+
+### 기각된 다른 후보들
+
+| 후보 | 사유 |
+|---|---|
+| CAS (FidelityFX) | 고립 잡티를 "저대비 영역"으로 분류해 **더 강하게** 샤프닝한다. 방향이 반대 |
+| XDoG | 임계 기반이라 프레임마다 on/off로 튀어 unsharp보다 플리커가 심하다 |
+| `l0Smooth` · `rollingGuidanceFilter` | 카툰룩의 정석이지만 550px에서 1,300~2,700ms |
+| ffmpeg `deflicker` | **이름만 맞다.** 프레임 전체 평균 휘도 하나로 보정하는 타임랩스 노출 보정 |
+| ffmpeg `tmix` · `hqdn3d` | 모션 보상 없는 시간 평균 = 우리가 실패한 EMA와 동일. `hqdn3d`는 GPL |
+
+`--flatten`(bilateral, 45ms) 대체 후보는 **guidedFilter(fast) 3.3ms** 또는 **dtFilter(RF) 5.75ms**.
+
+### 미구현: DIS 광학흐름 + TAA 분산 클리핑
+
+우리가 `--temporal`(EMA)로 실패한 것의 정석 해법이다. 실패 원인이 EMA가 아니라 **모션 보상 부재**였다.
+이전 출력을 광학흐름으로 현재 위치에 워핑한 뒤, 워핑된 이력 픽셀을 **현재 프레임 3×3 이웃의
+색 분포 안으로 클램프**한다. 흐름이 틀린 픽셀은 클램프에 잘려 트레일이 원천 차단된다.
+
+합성 시퀀스 검증:
+
+| | 고스팅↓ | 선명도↑ |
+|---|---|---|
+| 후처리 없음 | 8.86 | 1081 |
+| naive EMA (실패했던 것) | **16.16** | **193** |
+| 흐름 + 클램프 (γ=1.75) | **8.20** | 427 |
+
+`cv2.DISOpticalFlow`는 BSD다. **원저자 구현(`tikroeger/OF_DIS`)은 GPLv3이므로 쓰지 않는다.**
+비용 약 7ms. equivariance 학습으로 흔들림이 충분히 잡히면 불필요할 수 있어 보류 중이다.
+
+### 후처리 모델 조사 — 라이선스로 대부분 전멸
+
+애니 도메인의 좋은 가중치는 거의 다 비상업이다.
+**실격:** Sketch Simplification(CC-NC) · APISR(GPL-3.0) · AnimeJaNai 계열(CC-BY-NC-SA) ·
+CodeFormer(S-Lab, 게다가 얼굴 prior라 신원 환각) · SRFormer(CC-BY-NC) · OpenModelDB 애니 모델 대다수.
+
+살아남은 것은 둘뿐이다.
+
+- **Anime4K `Restore_CNN_M`** — 7K 파라미터, 해상도 1:1, **잔차 출력**(원본에 델타만 더하므로
+  신원 환각 위험이 구조적으로 최소), MIT, 512에서 0.1ms 미만. 가중치가 GLSL에 하드코딩돼 있어 파싱 필요.
+- **SRVGGNetCompact(BSD)를 scale=1로 자체 학습** — 순수 3×3 conv 스택이라 TensorRT 효율 최상.
+  `1x SuperUltraCompact Pretrain`(WTFPL)을 초기화로 쓸 수 있다.
+
+속도로 실격: Real-ESRGAN anime6B(4.47M, 2,992 GFLOP) · SwinIR-light(윈도우 어텐션은 TRT 최악) ·
+NAFNet/Restormer/FFTformer(256²에 40~130ms).
+
+---
+
+## 타겟 생성 순서: "그리고 자른다" → "자르고 그린다" (2026-08-05)
+
+### 문제
+
+base 코퍼스는 이렇게 만들어졌다.
+
+```
+SFHQ 전체 사진(1024) → teacher 애니화 → 애니 전체 사진(1024) → occ 0.65 크롭 → 512 타겟
+```
+
+**학습·런타임 정렬이 절반만 돼 있었다.** occupancy 0.65는 학생이 받는 *입력*에만 적용됐고,
+*타겟*은 여전히 teacher가 넓은 구도에서 내린 결정의 산물이었다.
+
+결과가 두 가지다.
+
+1. **얼굴 실효 해상도.** 크롭 한 변 중앙값이 534px이다. 즉 타겟에 담긴 얼굴 디테일은
+   teacher가 534px 상당 안에 그린 것이 전부다.
+2. **넓은 구도에서는 teacher가 단순화를 택한다.** 얼굴이 작으면 그게 최적이기 때문이다.
+
+### 파일럿 (120장, 2026-08-05)
+
+같은 입력에 대해 **기존 타겟 vs 타이트 크롭 직접 teacher** 를 대조했다.
+teacher는 512 크롭을 받아 **1024로 출력**한다 — 얼굴 실효 해상도가 약 2배가 된다.
+
+관측된 것은 "더 굵게"가 **아니라** "더 성실하게"였다.
+
+| 관측 | 기존 타겟 | 새 타겟 |
+|---|---|---|
+| 수염 있는 남성 | 말끔히 제거 | **남김** |
+| 중년 여성 이마 | 주름 제거, 젊은 얼굴 | **주름 남김** |
+| 머리카락 | 덩어리 | **개별 가닥** |
+| 눈 크기 | 더 크고 애니틱 | 상대적으로 작음(painterly 쪽) |
+
+**이것이 사용자가 지적한 두 문제와 직접 맞물린다.**
+"턱수염이 안 잡힌다"와 "앞머리가 뭉개진다"는 학생이 못 그리는 게 아니라
+**타겟에 없어서 안 그리도록 배운 것**이다. 학생은 타겟을 초과할 수 없다.
+
+### 대가와 게이트
+
+성실해진다 = **신원 단서도 남는다.** 학생 신원 cos가 이미 0.595(목표 0.3)이므로
+제품의 존재 이유를 깎을 수 있다. 따라서 3,000장을 굽기 전에
+`run/measure_id.py`로 기존 타겟 대비 새 타겟의 cos 증가폭을 먼저 잰다.
+
+- 증가폭이 작으면 그대로 진행
+- 크면 파인튜닝에서 **`--id-loss`를 처음으로 켜는 것**으로 계획을 바꾼다
+
+### 절차
+
+```bash
+# 3,000장 균등 추출 → 크롭 → teacher 재실행 (약 10.5시간, 12.6초/장)
+python3 run/build_localface_pairs.py \
+  --data out/pairs_anime12_13500 --out out/occ65_crops3k \
+  --include-file out/occ65_3000.txt \
+  --face-occupancy 0.65 --max-pad 0.02 --no-blend --output-size 512 --resume
+
+python3 -u run/test_space_exact.py \
+  --input out/occ65_crops3k/input --out out/occ65_teacher3k --n 0 \
+  --prompt "Transform into anime." --seed 0 --seed-mode fixed \
+  --steps 4 --cfg 1.0 --style-scale 1.2 --int8-transformer --resume \
+  --space-revision 7ebfd54af78db89c60188434122c57863780abd0
+```
+
+`test_space_exact.py`의 `--n N --sample-mode uniform`이 균등 인덱스 추출을 내장하고 있다.
+새 이미지를 뽑지 않고 **같은 입력**을 쓰는 이유는, 그래야 "타겟이 바뀌어서 좋아진 것"과
+"얼굴이 달라져서 좋아진 것"을 구분할 수 있기 때문이다. 단일 변수 규칙이다.
 
 ---
 
@@ -387,50 +549,21 @@ Transform into anime. flat cel shading
 
 ---
 
-## 학생 구조 진단: 표현력 vs 일반화
+## 학생 구조 진단 (2026-07-31)
 
-`train/train_student.py`의 `Generator`가 공식 예시 수준의 형태 변형을 할 수 있는지
-32쌍 clean 과적합으로 직접 검증했다.
-
-**검증 전 구조상 우려:**
-
-```python
-h = self.dec1(torch.cat([h, s2], 1))   # skip2  (/2)
-h = self.dec2(torch.cat([h, s1], 1))   # skip1  (/1 = 원본 해상도)  ← 문제
-```
-
-- **전체 해상도 skip**이 인코더 첫 층 출력을 디코더 마지막에 직결한다(유화 방지 목적으로 의도적으로 넣음).
-  이것이 출력을 입력 구조에 과도하게 고정할 가능성이 있었다.
-- **수용영역 부족** — 병목이 /4 하나, 3×3 컨볼루션만. 512 입력에서 유효 수용영역 100~150px 추정.
-  얼굴 전체 비율을 처음 보는 샘플에 일관되게 적용하기에는 불리할 수 있다.
-
-**참고:** CycleGAN·AnimeGAN 계열은 "질감·색은 바꾸되 형태는 못 바꾼다"가 정설이며,
-그 한계 때문에 [U-GAT-IT](https://github.com/taki0112/UGATIT)(NCSOFT, **MIT**)이 나왔다 —
-CAM 어텐션 + AdaLIN으로 형태 변화량을 학습으로 조절, 목적이 문자 그대로 selfie2anime다.
-
-### 32쌍 과적합 결과
-
-`gen-ch=48`, clean pair, `L1=3`, `perceptual=2`, `adv=0`, `id-loss=0`으로 5,000스텝 학습했다.
-최종 train batch L1은 약 0.035였고, 학습에 사용한 정확한 32쌍 평가 결과는 다음과 같다.
+`Generator`가 teacher 수준의 형태 변형을 할 수 있는지 32쌍 clean 과적합으로 직접 검증했다.
 
 | 신원 cos | >0.3 | 화풍 L1 | 톤 L1 |
 |---:|---:|---:|---:|
 | 0.600 | 94% | **0.0386** | **0.0215** |
 
-비교 시트에서 학생은 teacher의 눈 크기·턱선·코 단순화·머리 형태를 거의 그대로 재현했다.
-차이는 잔주름, 속눈썹, 수염, 하이라이트 같은 고주파 디테일에 집중됐다.
-따라서 **현재 Generator가 형태를 바꿀 수 없다는 가설은 반증됐다.**
+학생은 teacher의 눈 크기·턱선·코 단순화·머리 형태를 거의 그대로 재현했다.
+차이는 잔주름·속눈썹·수염·하이라이트 같은 고주파에 집중됐다.
+→ **"구조가 형태를 못 바꾼다"는 가설은 반증됐다.** animegan2 계열이라도 공식 예시 수준의
+양식화(눈 확대, 코 단순화)는 가능하다. selfie2anime 급 전면 재구성은 여전히 불가.
 
-| 변형 규모 | animegan2 계열 |
-|---|---|
-| 채색·선만 | ✅ |
-| **공식 예시 수준** (눈 확대, 코 단순화) | ✅ **학습 샘플에서 확인** |
-| selfie2anime 전면 재구성 | ❌ |
-
-**현재 해석:** 과적합 화풍 L1 0.0386과 `s_clean48` 15k val L1 0.1146의 차이가 크다.
-즉 병목은 우선 **미관측 얼굴에서 teacher의 변환 규칙을 예측하는 일반화**다.
-full-resolution skip과 /4 병목은 일반화를 방해하는 후보지만, 지금 당장 제거해야 할 확정 원인은 아니다.
-구조 변경은 clean48 최종 결과를 기준선으로 확보한 뒤 한 번에 하나씩 비교한다.
+당시 우려했던 `/1` 전체 해상도 skip과 `/4` 병목은 이후 `deep8`로 해소했다
+(/8 bottleneck + residual 6, `/1` skip 제거, `/2`·`/4`만 학습형 gate).
 
 ---
 
@@ -456,7 +589,9 @@ full-resolution skip과 /4 병목은 일반화를 방해하는 후보지만, 지
 | 08-03 17:08 | `localface_full13k_v2` | 얼굴 크롭 13,475 | deep8 | 0 | 켬 | 5k | 0.1252 | mask_weight 4→1, manifest 교체 |
 | **08-03 21:35** | **`occ65_deep8`** | **occupancy 0.65 · 블렌딩 없음** 13,291 | deep8 | **1.5** | **0** | **30k** | **0.1611** | **프로덕션 채택** |
 | 08-04 06:06 | `d8_aug1` | 동일 | deep8 | 1.5 | 0 | 26.7k/30k | 0.1663 | 증강 1. **아침에 카툰화 확인** → 이후 정밀 비교에서 육안 기각 |
-| 08-04 진행 중 | `occ65_edge3` | 동일 | deep8 (init-ckpt) | 1.5 | **3.0** | 8k | — | edge 복구 실험 |
+| **08-04** | **`occ65_edge3`** | 동일 | deep8 (init-ckpt) | 1.5 | **3.0** | 8k | **0.1448** | **선 굵어짐.** 대신 흔들림이 눈에 띔 |
+| **08-04** | **`occ65_edge3_eq`** | 동일 | deep8 (init-ckpt) | 1.5 | 3.0 + **w_equiv 10** | 8k | 0.1472 | **비등변 1.10 → 0.57.** 화풍 유지 |
+| 08-05 예정 | `occ65_tgt3k` | occ65 크롭에 **teacher 재실행**한 3,000쌍 | deep8 (init-ckpt) | 1.5 | 3.0 + 10 | 8k | — | 타겟 생성 순서 실험 |
 
 ### 왜 계속 흐렸고, 08-03에 무엇이 바뀌었나
 
@@ -543,93 +678,61 @@ LSGAN D는 0.20~0.26에서 안정적으로 유지됐다(평형점 0.25).
   학생은 거기 안착해 움직이지 않는다. **화풍을 배울 기회 자체가 없었다.**
   → 실험 순서가 틀렸다. **깨끗한 입력으로 "화풍을 배울 수 있는가"를 먼저 확인했어야 한다.**
 
-### 속도 여유는 크다
+### 속도 여유
 
-`run/eval_student.py` 측정: **33.3 ms/face (eager, ch=32)**. animegan2가 113ms였으므로 **3.4배 빠르다.**
-
-| gen-ch | 파라미터 | eager | TRT 추정 | vs animegan2(TRT 16.6ms) |
-|---|---|---|---|---|
-| 32 | 1.36M | 33ms | ~5ms | 3.4배 빠름 |
-| **48** | ~3M | ~75ms | ~11ms | **여전히 1.5배 빠름** |
-| 64 | ~5.4M | ~133ms | ~20ms | 1.2배 느림 (예산 내 추정) |
-
-**용량을 올릴 여유가 충분하다.** 1.36M은 속도 예산을 크게 남기고 있다.
-
-### clean48 진행 판정
-
-- 데이터 분할: train 12,825 / val 675, 고정 seed와 고정 split 사용.
-- val L1: 500스텝 0.1599 → 5k 0.1302 → 10k 0.1211 → 15k **0.1146**.
-- 10k 이후 개선폭은 작아졌지만 아직 붕괴나 명확한 과적합은 없다.
-- clean48은 **일반화 기준선**이다. `adv=0`, `id-loss=0`, 증강 0이므로 이 결과만으로
-  비식별화나 작은 얼굴 강건성을 판정하지 않는다.
-- 40k 완료 전에는 중간 샘플의 육안 품질과 고정 validation 비교 시트를 함께 본다.
+`ch=32`는 1.36M / 33ms eager로 animegan2(113ms)보다 3.4배 빠르다.
+**용량을 올릴 여유가 있다** — ch 48(~3M)까지는 예산 안이고 64는 경계선이다.
+다만 지금까지 병목은 용량이 아니라 손실·타겟이었으므로 아직 올리지 않았다.
 
 ---
 
-## 비식별화 측정
+## 비식별화 — 미해결 (최우선 부채)
 
-`run/measure_id.py` — facenet(vggface2) 임베딩의 `cos(input, target)`.
-전처리를 `train_student.py`의 `id_embed()`와 동일하게 맞춰 **학습 중 id-loss가 보는 값과 일치**시켰다.
+`run/measure_id.py` — facenet(vggface2) 임베딩의 `cos(input, output)`.
+전처리를 `train_student.py`의 `id_embed()`와 맞춰 **학습 중 id-loss가 보는 값과 일치**시켰다.
 
-> 아래 수치는 **폐기 대상인 기존 `pairs_2511` painterly 코퍼스**에서 측정한 과거 기준이다.
-> 새 `pairs_anime12_13500`과 clean48의 비식별화 최종 평가는 아직 하지 않았다.
-
-| 대상(구 코퍼스) | 중앙값 | >0.5 |
+| 대상 | cos | 비고 |
 |---|---|---|
-| teacher target (2511, 구 painterly 프롬프트) | **0.799** | **100%** |
-| 학생 출력 (id-loss 0) | **0.826** | **100%** |
-| 참고: 2509 코퍼스 | 0.434 | 38% |
+| 학생 (occ65, id-loss 0) | **0.595** | 현재 값. 목표 0.3 |
+| 학생 (영상 wide 프레이밍) | 0.823 | 넓게 잡으면 비식별화가 거의 안 된다 |
+| 구 painterly teacher | 0.799 | 10,987장 100% 동일인 판정 |
 
-**구 painterly 화풍만으로는 비식별화가 전혀 안 됐다.** 10,987장 전부 동일인 판정.
-2509가 0.434였던 것은 화풍이 얼굴을 다시 그렸기 때문이다.
+**핵심 발견 두 가지.**
 
-### 구 코퍼스에서 `--style-scale`만으로는 부족했다
+1. **구조 보존형 LoRA는 원리적으로 신원을 못 지운다.** `--style-scale`을 1.0→2.0으로 올려도
+   cos가 0.086밖에 안 떨어진다(0.825 → 0.739). 목표 0.3에 닿으려면 scale 7~8이 필요한데
+   그 전에 그림이 붕괴한다. prithiv LoRA의 셀링포인트가 "preserves pose, proportions"이고
+   **얼굴인식이 보는 것이 바로 그 구조**다.
+2. **화질과 정면 충돌한다.** 프레이밍을 넓히면 화질은 좋아지지만 cos가 0.823까지 오른다.
+   타겟을 성실하게 만들어도 같은 방향으로 움직인다. 화질 개선은 전부 이 축을 밀어 올린다.
 
-| scale | 신원 cos |
-|---|---|
-| 1.0 | 0.825 |
-| 1.3 | 0.806 |
-| 1.6 | 0.798 |
-| 2.0 | 0.739 |
-
-강도를 2배로 올려도 0.086밖에 안 떨어진다. 목표(0.3)에 닿으려면 scale 7~8이 필요한데
-그 전에 그림이 붕괴한다. **이유: prithiv LoRA의 셀링포인트가 "preserves pose, proportions"이고,
-얼굴인식이 보는 것이 바로 그 구조다.** 구조를 보존하는 한 강도로는 신원이 안 지워진다.
-
-이 실험은 현재 Anime-V2의 1.0/1.2/1.4 비교와 대상이 다르다. 새 코퍼스의 1.2는
-비식별화 수치를 맞추기 위한 값이 아니라 teacher 화풍의 육안 균형점으로 선택했다.
-
-### 남은 수단: id-loss (미검증)
-
-`train_student.py --id-loss <w> --id-margin 0.3` — facenet 코사인을 margin 아래로 밀어낸다.
-**아직 한 번도 켜보지 않았다.** 0.83 → 0.30은 거리가 멀고, id-loss는 L1/perceptual과 정면으로 싸운다.
+**남은 수단: `--id-loss` (여전히 미사용).** facenet 코사인을 `--id-margin` 아래로 밀어낸다.
+L1/perceptual과 정면으로 싸우므로, 화풍이 안정된 checkpoint에서 작은 값부터 스윕해야 한다.
+**이 프로젝트의 존재 이유인데 가장 오래 방치돼 있다.**
 
 ---
 
-## 피부톤 편향 검사
+## 피부톤 편향 검사 (구 코퍼스 기준)
 
-`run/skin_tone_check.py` — ITA(Individual Typology Angle) 기반 전수 측정.
+`run/skin_tone_check.py` — ITA(Individual Typology Angle) 전수 측정.
 QC 시트에서 갈색 피부 여성이 금발 백인으로 바뀐 사례(`#6543`)가 발견돼 착수했다.
 
-| 입력 구간 | n | ITA_in | ΔITA | → ITA_out |
-|---|---|---|---|---|
-| dark | 3342 | −49.8 | +72.3 | **+22.5** |
-| brown | 3792 | −10.7 | +51.6 | **+40.9** |
-| tan | 1264 | +18.4 | +31.9 | **+50.3** |
-| intermediate | 593 | +33.9 | +21.4 | **+55.3** |
-| light | 325 | +47.2 | +12.3 | **+59.5** |
-| very light | 132 | +61.6 | +2.7 | **+64.3** |
+| 입력 구간 | n | ITA_in | → ITA_out |
+|---|---|---|---|
+| dark | 3342 | −49.8 | +22.5 |
+| brown | 3792 | −10.7 | +40.9 |
+| tan | 1264 | +18.4 | +50.3 |
+| light | 325 | +47.2 | +59.5 |
+| very light | 132 | +61.6 | +64.3 |
 
-**해석 주의 — 스크립트의 자동 판정("체계적 편향")은 과하다.**
-ΔITA = 출력 − 입력이므로 압축만 일어나도 음의 상관(−0.729)이 자동으로 나온다.
-실제로 봐야 할 것은 **출력 ITA인데, 여전히 단조증가(22.5 → 64.3)** 한다 = 상대 순서는 보존된다.
-다만 범위가 111 → 42로 **62% 압축**되며 밝은 쪽으로 이동한다.
+**출력 ITA가 단조증가하므로 상대 순서는 보존된다.** 다만 범위가 111 → 42로 **62% 압축**되며
+밝은 쪽으로 이동한다. 스크립트의 자동 판정("체계적 편향")은 과하다 —
+ΔITA는 압축만 일어나도 음의 상관이 자동으로 나온다.
 
-**또한 ITA는 "어두운 피부"와 "어두운 조명"을 분리하지 못한다.** SFHQ-T2I는 역광·저조도 인물이 많아
-`dark` 구간 35%가 실제 피부톤이라고 보기 어렵다. **판정은 육안이 최종이다** —
-`#6543`처럼 인물 자체가 바뀌는 것은 노출 보정으로 설명되지 않으므로 명백한 실패로 본다.
+**ITA는 "어두운 피부"와 "어두운 조명"을 분리하지 못한다.** SFHQ-T2I는 역광·저조도가 많다.
+`#6543`처럼 인물 자체가 바뀌는 것은 노출로 설명되지 않으므로 명백한 실패로 본다.
 
-→ **`pairs_anime12_13500` 기준으로 재측정할 것.** 현재 수치는 폐기 대상 코퍼스 기준이다.
+→ **`pairs_anime12_13500` 기준 재측정 필요.**
 
 ---
 
@@ -671,58 +774,36 @@ sudo docker stop ubuntu-faceblur-1      # 측정 후 docker start
 
 ---
 
-## 화풍 결정 경위 (구 기록 — 두 차례 정정됨)
+## 화풍 결정 경위 (구 기록 — 결론은 폐기됨)
 
-> ⚠️ 이 절의 결론("flat 카툰 확정")은 **폐기**됐다. 정정 내역:
-> 1차 — [화풍 재검토(지표 오류)](#화풍-재검토-1차-2026-07-29--laplacian은-이-판단에-쓸-수-없다)
-> 2차 — [A/B 판정 오류](#ab-판정-오류-2026-07-31) · [표정 유지 재해석](#표정-유지의-재해석-2026-07-31)
-> 아래는 경위 기록으로 남긴다.
-
-**근본 제약:** 실시간(≤2×)이 학생 크기를 제한한다(~1.4M feed-forward CNN).
-디테일 많은 화풍일수록 학생이 평균내어 뭉갠다 — 용량의 벽.
-
-| 화풍 | 학생 재현 | 비식별화 | 당시 판정 |
-|---|---|---|---|
-| painterly 반실사 2.5D (Chroma) | 소프트/유화화 | 약 | ✗ |
-| flat 애니(왕눈이) | 기하 변형 → 랜드마크 깨짐 | — | ✗ → **재해석으로 부활** |
-| 매끈 2.5D 렌더 | 제일 심하게 소프트 | 약 | ✗ |
-| flat 카툰 | 크리스프 | 강 | ~~✓~~ → 폐기 |
+> 이 절의 결론("flat 카툰 확정")은 폐기됐다.
+> 정정: [A/B 판정 오류](#ab-판정-오류-2026-07-31) · [표정 유지 재해석](#표정-유지의-재해석-2026-07-31)
 
 ### 시행착오 타임라인
 
-1. **초기 — painterly 반실사 (Chroma teacher).** 페어 생성, 타겟은 양호.
-2. **unpaired AnimeGAN 시행착오:** color 과대 → 사진같음 · adv 과강 → 붕괴 · gram 정규화 버그 ·
-   **진짜 뿌리 = 워밍업이 VGG-only라 평균색으로 붕괴** → 픽셀 L1 워밍업으로 수정. 결과: 유화.
-3. **paired(pix2pix) 전환** — L1+perceptual → 더 깔끔하나 여전히 소프트.
-4. **진단 — 알고리즘이 아니라 용량+해상도.** U-Net skip + PixelShuffle @512 도입.
-5. **화풍 재정의:** flat 애니 → 왕눈이 · 카툰 프롬프트 → 제각각 · 카툰 필터 → 포스터 사진필터.
-6. **(구)결론 — flat 카툰.** → 정정됨.
+1. **painterly 반실사 (Chroma teacher)** — 페어 생성, 타겟은 양호
+2. **unpaired AnimeGAN** — color 과대 → 사진같음 · adv 과강 → 붕괴 · gram 정규화 버그 ·
+   **진짜 뿌리는 워밍업이 VGG-only라 평균색으로 붕괴** → 픽셀 L1 워밍업으로 수정. 결과는 유화
+3. **paired(pix2pix) 전환** — L1+perceptual, 더 깔끔하나 여전히 소프트
+4. **U-Net skip + PixelShuffle @512** 도입
+5. **(구)결론 flat 카툰** → 정정됨
 
-### 라이선스 리서치
-- semi-realistic/2.5D 초상 파인튠은 대부분 Flux.1-dev(비상업) 또는 SDXL/Illustrious(Fair AI) 기반 → 탈락.
-- **클린 베이스 = Apache 뿐:** Chroma1-HD, Qwen-Image-Edit-2509/2511, FLUX.1-schnell.
-- **animegan2 가중치 주의:** `bryandlee/animegan2-pytorch` **코드는 MIT**지만
-  `face_paint_512_v2` 등 **가중치의 출처가 불명확**하다. 원본 `TachibanaYoshino/AnimeGANv2`는
-  **비상업 전용**이며, 파생 여부에 대해 [이슈 #25](https://github.com/bryandlee/animegan2-pytorch/issues/25)에서
-  논쟁이 있었고 저자의 명확한 답변이 없다.
-  → **파인튜닝을 하지 않고 밑바닥부터 학습하는 이유가 이것이다.** 지금 런타임에 실려 있는
-  `face_paint_512_v2`도 미해결 리스크이며, 학생 모델이 그것을 대체하는 것이 목적이다.
+당시 Laplacian 분산을 "디테일 밀도"로 썼다가 순위가 뒤집혔다 — 2509는 넓은 색면+굵은 선인데
+하드 엣지 때문에 **높게(0.032)**, 2511은 주름·머리카락 한 올까지 그리는데 부드러워 **낮게(0.014)** 나왔다.
+같은 실수를 2026-08-03에 또 했다 → [Laplacian 재발](#laplacian-재발-같은-실수를-두-번)
 
----
+문서와 실행이 어긋나 있기도 했다. README는 "flat 카툰 확정"인데 실제 생성 명령의 프롬프트는
+`soft anime, hand-painted, smooth painterly, muted colors` 즉 **정반대**였다.
 
-## 화풍 재검토 1차 (2026-07-29) — Laplacian은 이 판단에 쓸 수 없다
+### 라이선스 리서치 (여전히 유효)
 
-처음엔 Laplacian 분산을 "디테일 밀도"로 썼으나 **네이티브 해상도 육안 확인 시 순위가 뒤집혔다.**
-
-- **2509** — 넓은 평면 색면 + 굵은 선. 시각적으로 단순한데 하드 엣지 때문에 Laplacian **높다(0.032)**
-- **2511** — 주름마다 그라데이션, 머리카락 한 올씩. 시각적으로 복잡한데 다 부드러워 Laplacian **낮다(0.014)**
-
-**Laplacian은 "하드 엣지"와 "디테일 양"을 구분하지 못한다.** 대체 지표: **PNG 압축 크기**(정보량),
-**내부 평탄도**(엣지 제외 영역의 국소 표준편차), 총변동(TV), 그리고 각 지표의 **CV**(일관성).
-
-또한 문서와 실행이 어긋나 있었다 — README는 "flat 카툰 확정"인데 실제 코퍼스 생성 명령
-(`out/corpus_fp3.log`)의 프롬프트는 `soft anime, hand-painted, smooth painterly, muted colors`,
-즉 **정반대인 painterly를 요청**하고 있었다.
+- semi-realistic/2.5D 초상 파인튠은 대부분 Flux.1-dev(비상업) 또는 SDXL/Illustrious(Fair AI) → 탈락
+- **클린 베이스 = Apache 뿐:** Chroma1-HD, Qwen-Image-Edit-2509/2511, FLUX.1-schnell
+- **animegan2 가중치 주의:** `bryandlee/animegan2-pytorch` **코드는 MIT**지만 `face_paint_512_v2` 등
+  **가중치 출처가 불명확**하다. 원본 `TachibanaYoshino/AnimeGANv2`는 **비상업 전용**이고,
+  파생 여부는 [이슈 #25](https://github.com/bryandlee/animegan2-pytorch/issues/25)에서 미해결이다.
+  → **파인튜닝하지 않고 밑바닥부터 학습하는 이유가 이것이다.** 런타임의 `face_paint_512_v2`도
+  미해결 리스크이며, 학생 모델이 그것을 대체하는 것이 목적이다.
 
 ---
 
@@ -845,17 +926,31 @@ python3 -u run/pair_qc.py --dir out/pairs_anime12_13500
 python3 run/pair_curate.py --dir out/pairs_anime12_13500 \
   --reject-file out/pairs_anime12_13500/qc_reject.txt --apply
 
-# clean 일반화 기준선 학습
-python3 -u train/train_student.py --data out/pairs_anime12_13500 --out train/s_clean48 \
-  --size 512 --batch 8 --steps 40000 --gen-ch 48 --lr 2e-4 --aug-level 0 \
-  --val-ratio 0.05 --val-n 64 --seed 0 --split-seed 0 --workers 4 \
-  --w-l1 3.0 --w-perc 2.0 --w-adv 0 --id-loss 0 \
-  --sample-every 500 --ckpt-every 5000
-
 # occupancy 규격 인덱싱 (현재 기준. 얼굴 면적비 0.65, 블렌딩 없음, 패딩 과다 페어 거부)
 python3 -u run/build_localface_pairs.py \
   --data out/pairs_anime12_13500 --out out/localface_idx_occ65 \
   --face-occupancy 0.65 --max-pad 0.02 --no-blend --manifest-only --resume
+
+# 학생 학습 (occ65 기준선 30k)
+python3 -u train/train_student.py \
+  --data out/pairs_anime12_13500 \
+  --localize-manifest out/localface_idx_occ65/manifest.jsonl \
+  --out train/localface_occ65_deep8 \
+  --gen-arch deep8 --gen-ch 32 --size 512 --batch 8 --amp bf16 \
+  --lr 2e-4 --steps 30000 --init-steps 1500 --adv-ramp 3000 \
+  --w-l1 1.0 --w-perc 2.5 --w-adv 1.5 --w-edge 3.0 --edge-mode sobel-ms \
+  --aug-level 0 --d-ch 48 --d-n 3 --val-n 128
+
+# 파인튜닝 (기존 가중치에서 이어붙이기. 단일 변수만 추가)
+python3 -u train/train_student.py ... --out train/<새이름> \
+  --init-ckpt gan_ckpt/keep/student_d8_edge3_eq_final.pt \
+  --lr 1e-4 --steps 8000 --init-steps 500 --adv-ramp 1000 \
+  --w-equiv 10 --equiv-shift 4 --equiv-scale 0.02 --equiv-rot 2
+
+# 진단
+python3 run/shift_probe.py --crops out/oracle_occ65/crops --n 12 --ckpt <ckpt>   # 흔들림
+python3 run/measure_id.py --dir <페어폴더>                                        # 신원 잔존
+python3 run/style_sharpness.py <이미지들>                                          # 선명도(Laplacian 금지)
 
 # teacher oracle 감사 (학생/teacher 중 누가 병목인지 직접 확인)
 python3 run/video_teacher_oracle.py prepare --video input/swap2.mp4 \
@@ -867,26 +962,8 @@ python3 -u run/test_space_exact.py --input out/oracle_occ65/crops \
 mkdir -p out/oracle_occ65/pairs
 ln -sfn ../crops out/oracle_occ65/pairs/input
 ln -sfn ../teacher/target out/oracle_occ65/pairs/target
-python3 run/eval_student.py --ckpt gan_ckpt/keep/student_d8_occ65_final.pt \
-  --data out/oracle_occ65/pairs --n 12 --size 512 --bench 0 \
-  --sheet out/oracle_occ65/student_sheet.png
-
-# (구) 얼굴 좌표만 인덱싱 — crop-expand 규격
-NVIDIA_LIBS="$(find .venv/lib/python3.12/site-packages/nvidia -type d -name lib -print | paste -sd: -)"
-LD_LIBRARY_PATH="$NVIDIA_LIBS:${LD_LIBRARY_PATH:-}" \
-python3 -u run/build_localface_pairs.py \
-  --data out/pairs_anime12_13500 --out out/localface_index_13500 \
-  --crop-expand 0.5 --mask-scale-x 0.92 --mask-scale-y 1.0 --feather 0.04 \
-  --manifest-only --resume
-
-# 얼굴 전용 본학습: 원본 페어를 manifest 좌표로 즉석 crop·합성
-python3 -u train/train_student.py \
-  --data out/pairs_anime12_13500 \
-  --localize-manifest out/localface_index_13500/manifest.jsonl \
-  --out train/s_localface48 --size 512 --batch 8 --steps 40000 --gen-ch 48 \
-  --lr 2e-4 --aug-level 0 --val-ratio 0.05 --val-n 64 --workers 4 \
-  --w-l1 3.0 --w-perc 2.0 --w-adv 0 --id-loss 0 --face-mask-weight 4 \
-  --amp bf16 --perc-size 256 --sample-every 250 --ckpt-every 2500
+python3 run/eval_student.py --ckpt <ckpt> --data out/oracle_occ65/pairs \
+  --n 12 --size 512 --bench 0 --sheet out/oracle_occ65/student_sheet.png
 
 # 고정 validation 평가
 python3 -u run/eval_student.py --data out/pairs_anime12_13500 --n 64 --size 512 \
@@ -937,6 +1014,7 @@ python3 -u run/eval_student.py --data out/pairs_anime12_13500 --n 64 --size 512 
 | `flicker_metric.py` | 모션 보정 시간축 지표 — abs / edge / pop / hf. 얼굴 박스 기준 정규화 |
 | `landmark_probe.py` | MediaPipe Tasks API 검출률·지연·정렬 파라미터 지터 측정 |
 | `align_probe.py` | 박스 크롭 vs canonical 정렬 크롭의 프레임 간 변화량 비교 |
+| `shift_probe.py` | **이동 증폭·비등변성 측정** — 흔들림 판정의 기준 지표 |
 
 ---
 
@@ -1011,6 +1089,15 @@ python3 -u run/eval_student.py --data out/pairs_anime12_13500 --n 64 --size 512 
   체크포인트의 저장된 `args`를 먼저 출력한다.
 - **선이 문제면 선을 감독하는 손실을 먼저 켠다.** `w_edge`가 0인 채로 30,000스텝을 돌렸다.
 
+**런타임 (2026-08-04 추가 · 2)**
+- **unsharp는 halo를 만들고 그 halo가 흔들린다.** 선명하게 하려면 **단측 클램프**(`min(hi,0)`)를 써서
+  어두워지기만 하게 한다. 밝아지는 픽셀이 0개면 밝은 halo가 구조적으로 안 생긴다.
+- **선명함과 안정성은 순서가 있다.** 흔들림은 모델 성질이라 후처리로 못 고치고, 선 굵기는 얹을 수 있다.
+  → **안정성을 학습으로 먼저, 선명도를 후처리로 나중에.** 반대로 하면 둘 다 잃는다.
+- **ffmpeg `deflicker`는 이 문제와 무관하다** — 프레임 평균 휘도 하나로 보정하는 타임랩스용이다.
+  `tmix`/`hqdn3d`는 모션 보상 없는 시간 평균이라 우리가 실패한 EMA와 같고 `hqdn3d`는 GPL이다.
+- **애니 도메인 공개 가중치는 대부분 비상업이다.** 쓰기 전에 라이선스부터 확인한다.
+
 **방법론 (2026-08-04 추가)**
 - **면적 평균 지표는 작고 대비 큰 구조(눈)의 출렁임을 보지 못한다.** 눈은 화면의 2% 미만이다.
   연속 프레임의 해당 영역만 잘라 붙여 본다.
@@ -1044,55 +1131,45 @@ python3 -u run/eval_student.py --data out/pairs_anime12_13500 --n 64 --size 512 
 
 ---
 
-## 다음 단계 (2026-08-04 기준)
+## 다음 단계 (2026-08-05 기준)
 
-우선순위는 **① 선 선명도 → ② 앞머리 뭉개짐 → ③ 경계 이질감** 순이다.
-①이 원인이고 ②는 상당 부분 그 결과다. ③은 `--luma-match`로 일단 눌렀다.
+### A. 타겟 생성 순서 실험 (진행 중)
 
-### A. 저양식화 해소 (진행 중)
+1. 파일럿 120장에서 `measure_id`로 신원 증가폭 확인 → `--id-loss` 필요 여부 결정
+2. 3,000장 teacher 재실행 (약 10.5시간)
+3. `edge3_eq`에서 파인튜닝 8,000스텝, 타겟만 단일 변수
+4. 판정: 수염·머리 가닥이 그려지는가 / `shift_probe` 비등변이 나빠지지 않았는가 / 신원 cos
 
-1. **`w_edge` 단일 변수 파인튜닝** — `train/occ65_edge3`, 8,000스텝.
-   판정: (a) 코퍼스/영상 시트에서 눈·턱·머리 선이 굵어졌는가, (b) 영상에서 흔들림이 늘지 않았는가.
-   `--w-edge`는 선을 직접 감독하므로 흔들림을 같이 키울 수 있다. 둘을 함께 본다.
-2. **타겟 재생성** — 코퍼스 3~4천 장을 occupancy 0.65로 잘라 teacher를 재실행하고 파인튜닝.
-   oracle 시트에서 teacher가 타이트 크롭을 훨씬 굵게 그린다는 것을 확인했다. 1번 결과를 보고 판단한다.
-3. **하위 표본 정리** — 크롭 한 변 최소 61px(8.4배 확대) 같은 꼬리는 타겟이 죽이다. 하한선을 둔다.
+### B. 비식별화 (가장 오래 방치된 항목)
 
-### B. 시간적 안정성
+신원 cos **0.595**, 목표 0.3. `--id-loss`는 여전히 한 번도 켜지 않았다.
 
-1. **equivariance loss 단독 검증** — `--aug-level 0` + `--w-equiv`. 증강과 섞지 않는다.
-   판정 지표는 이동 증폭 1.30 → 목표 ≤1.1, 그리고 연속 눈 영역 프레임 스트립.
-2. BlurPool은 adversarial을 쓰는 한 배제한다. adversarial을 뺄 이유가 생기면 그때 재검토한다.
+1. 화풍이 안정된 checkpoint에서 작은 값부터 스윕. 목표는
+   **cos < 0.3을 만족하는 것 중 화풍 L1이 가장 낮은 점**
+2. id-loss가 화풍을 깨면 대안은 **MediaPipe 랜드마크 기반 기하 워프**
+   (설치·검증 완료, 이 용도로는 유일한 저비용 경로)
+3. 화질 개선은 전부 이 축을 밀어 올린다. A가 성공할수록 B가 급해진다
 
-### C. 비식별화 (가장 오래 방치된 항목)
+### C. 남은 구조적 과제
 
-현재 학생 신원 cos **0.595**, 목표 0.3. `id-loss`는 여전히 한 번도 켠 적이 없다.
-
-1. 화풍이 안정된 checkpoint에서 `--id-loss`를 0부터 작은 값으로 스윕한다.
-   목표는 **신원 cos < 0.3 중 화풍 L1이 가장 낮은 점**이다.
-2. `id-loss`가 화풍을 깨뜨리면 대안은 **MediaPipe 랜드마크 기반 기하 워프**다.
-   MediaPipe는 설치·검증돼 있고, 이 용도로는 유일한 저비용 경로다.
-3. **프레이밍을 넓히면 신원 cos가 0.823까지 오른다.** 화질을 위해 프레이밍을 넓히는 안은
-   비식별화와 정면 충돌하므로, 넓히려면 이 수치를 먼저 해결해야 한다.
-
-### D. 남은 구조적 과제
-
-1. **헤어라인 경계** — 얼굴 타원이 머리카락을 가로지른다. 진짜 해법은 머리 포함 세그멘테이션이며
-   그래야 경계가 인물 실루엣으로 옮겨간다. MediaPipe ImageSegmenter 계열이 후보다.
-2. **작은 얼굴** — `--cartoon-min 150`. swap3의 절반이 150px 미만이라 모자이크로 빠진다. 64~80 하향 검토.
-3. **속도 재측정** — 현재 수치는 L40S 기준이다. 요구사항은 L4다.
+1. **헤어라인 경계** — 얼굴 타원이 머리카락을 가로지른다. 머리 포함 세그멘테이션이 진짜 해법
+2. **작은 얼굴** — `--cartoon-min 150`. swap3의 절반이 미만이라 모자이크로 빠진다. 64~80 검토
+3. **속도 L4 재측정** — 현재 수치는 전부 L40S 기준이다. 요구사항은 L4다
+4. **DIS + TAA 후처리** — A가 흔들림을 충분히 잡으면 불필요. 아니면 그때 구현
 
 ### 실험 승격 기준
 
 1. **단일 변수.** 같은 방향으로 미는 변경이라도 결과가 나오면 하나씩 떼어낸다.
-   반대 방향으로 미는 변경을 동시에 넣지 않는다(`w-adv 2.0` + cGAN 동시 투입은 이 규칙 위반이었다).
+   반대 방향으로 미는 변경을 동시에 넣지 않는다.
 2. **육안이 최종 판정.** 지표는 후보를 좁히는 용도다.
-3. **기존 가중치는 보존한다.** `gan_ckpt/keep/`는 `chmod -w`로 잠긴 읽기 전용 보관소다.
-   새 실험은 `--init-ckpt`로 읽기만 하고 새 `--out` 디렉터리에 쓴다.
+3. **기존 가중치 보존.** `gan_ckpt/keep/`은 `chmod -w`. 새 실험은 `--init-ckpt`로 읽기만 하고
+   새 `--out`에 쓴다. 세대별 대조군을 지우지 않는다.
+4. **규격을 바꾸면 손실 가중치를 이전 실행에서 복사해 온다.** 첫 100스텝 로그에서 각 항의
+   자릿수를 대조한다(`w_edge` 유실 사고).
 
 **하지 않을 것:** 원인 확인 없이 학습부터 돌리기, Laplacian으로 선명도 판정하기,
 지표 개선만 보고 영상 확인 없이 승격하기, 저작권상 쓸 수 없는 실제 영상으로 학습하기,
-프레이밍을 넓혀 화질을 얻고 비식별화 후퇴를 눈감기.
+화질을 얻고 비식별화 후퇴를 눈감기, 라이선스 미확인 가중치 쓰기.
 
 ---
 
