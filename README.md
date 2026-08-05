@@ -11,6 +11,7 @@
 
 | 문서 | 답하는 질문 |
 |---|---|
+| **[docs/troubleshooting.md](docs/troubleshooting.md)** | **에러가 났다 — 증상별 원인과 조치** |
 | **[docs/rejected.md](docs/rejected.md)** | **"그거 해봤어?" — 기각·미채택 전체 색인. 새 아이디어가 떠오르면 여기부터** |
 | [docs/commands.md](docs/commands.md) | 명령어를 어떻게 치나 |
 | [docs/training-history.md](docs/training-history.md) | 학습이 왜 실패했다가 성공했나, 각 세대가 뭘 바꿨나 |
