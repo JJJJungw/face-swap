@@ -352,6 +352,57 @@ def color_from_input(styl, ref, mix=1.0, align_sigma=3.0,
     return cv2.cvtColor(np.clip(s, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
 
 
+def darken_lines(image, strength, sigma=1.0, ds=4):
+    """선만 어둡게 해서 그림을 또렷하게 만든다 (Anime4K Line Darkening, MIT).
+
+    ■ 왜 unsharp 가 아니라 이것인가 (2026-08-04)
+      --sharpen(unsharp) 은 실패했다. unsharp 는 **양방향 오버슈트**라 경계 양쪽에
+      밝은 halo 와 어두운 halo 를 동시에 만든다. 그 halo 의 위치가 프레임마다 흔들려서
+      선명해진 만큼 깜빡임이 새로 생겼다. 흔들림을 증폭한 게 아니라 만들어낸 것이다.
+
+      여기서는 고주파 성분을 **한쪽으로만** 클램프한다.
+          D = min(luma - blur(luma), 0)      -> D <= 0, 즉 어두워지기만 한다
+      밝아지는 픽셀이 0개이므로 밝은 halo 가 구조적으로 생기지 않는다.
+      마스크(D)를 한 번 더 블러해서 고립된 잡티가 마스크에 남지 않게 한다.
+
+      출처: bloc97/Anime4K (MIT) Line Darkening 셰이더. 알고리즘만 재구현했다.
+
+    ■ ds (다운샘플 배수)
+      원본 셰이더도 1/2~1/4 해상도에서 마스크를 계산한다. 저주파 마스크라
+      해상도를 낮춰도 결과가 거의 같고 비용만 준다.
+
+    ■ 순서 주의
+      **despeckle 다음에 걸어야 한다.** 어둡게 만드는 연산이라 잡티가 남아 있으면
+      잡티까지 같이 진해진다.
+    """
+    if strength <= 0:
+        return image
+    height, width = image.shape[:2]
+    luma = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    ds = max(1, int(ds))
+    small = cv2.resize(luma, (max(2, width // ds), max(2, height // ds)),
+                       interpolation=cv2.INTER_AREA)
+    dark = np.minimum(small - cv2.GaussianBlur(small, (0, 0), sigma), 0.0)
+    dark = cv2.GaussianBlur(dark, (0, 0), max(0.1, sigma * 0.5))
+    dark = cv2.resize(dark, (width, height), interpolation=cv2.INTER_LINEAR)
+    return np.clip(image.astype(np.float32) + (dark * strength)[:, :, None],
+                   0, 255).astype(np.uint8)
+
+
+def quantize_side(side, step):
+    """크롭 한 변을 step 배수로 반올림한다.
+
+    ■ 왜 필요한가 (2026-08-04)
+      occupancy 크롭은 side = sqrt(bw*bh/occupancy) 이므로 검출 박스가 1px 만
+      흔들려도 side 가 바뀐다. 그러면 512 로 리사이즈하는 배율이 매 프레임 달라지고,
+      **입력이 매번 다른 위상으로 재샘플링된다.** 이동에 등변하지 않는 망에는 치명적이다.
+      --box-smooth 는 박스 '위치'만 평활화했을 뿐 이 축을 건드리지 않았다.
+    """
+    if step <= 1:
+        return side
+    return float(max(step, int(round(side / step)) * step))
+
+
 def despeckle(image, strength, kernel=5, smooth_thresh=0.25):
     """피부 위의 고립된 작은 점(주근깨·잡티)만 지운다. 선은 남긴다.
 
@@ -472,7 +523,8 @@ def composite(frame, boxes, stylizer, cartoon_min, blur_mode="pixelate", expand=
               vivid_chroma=1.0, vivid_luma=1.0,
               luma_match=0.0, luma_sigma=0.12,
               input_denoise=0.0, input_temporal=0.0, prev_raw=None, flatten=0.0,
-              despeckle_strength=0.0, despeckle_kernel=5):
+              despeckle_strength=0.0, despeckle_kernel=5,
+              darken=0.0, darken_sigma=1.0, darken_ds=4, crop_quant=0):
     H, W = frame.shape[:2]; nc = nb = 0
     for x1, y1, x2, y2, sc in boxes:
         bw, bh = x2-x1, y2-y1; size = max(bw, bh)
@@ -483,6 +535,7 @@ def composite(frame, boxes, stylizer, cartoon_min, blur_mode="pixelate", expand=
                 side = float(ox2 - ox1)
             else:
                 side = size * (1.0 + 2.0 * expand)
+            side = quantize_side(side, crop_quant)
             center_x, center_y = (x1 + x2) * 0.5, (y1 + y2) * 0.5
             cx1 = int(np.floor(center_x - side * 0.5))
             cy1 = int(np.floor(center_y - side * 0.5))
@@ -540,6 +593,7 @@ def composite(frame, boxes, stylizer, cartoon_min, blur_mode="pixelate", expand=
                 proc = color_transfer(styl, crop, color_match)
             proc = despeckle(proc, despeckle_strength, despeckle_kernel)
             proc = flatten_skin(proc, flatten)
+            proc = darken_lines(proc, darken, darken_sigma, darken_ds)
             nc += 1
         else:
             proc = blur_crop(crop, blur_mode); nb += 1
@@ -616,6 +670,14 @@ def main():
                     help="스타일화 전 입력 잡음 제거(0=끔, 0.5~1.5). 붓질 자국을 줄인다")
     ap.add_argument("--input-temporal", type=float, default=0.0, dest="input_temporal",
                     help="스타일화 전 이전 프레임 입력과 혼합(0=끔, 0.2~0.4). 흔들림의 원인을 줄인다")
+    ap.add_argument("--darken", type=float, default=0.0, dest="darken",
+                    help="선만 어둡게 해 또렷하게(Anime4K Line Darkening). 1.0~2.5 권장. unsharp 와 달리 halo 없음")
+    ap.add_argument("--darken-sigma", type=float, default=1.0, dest="darken_sigma",
+                    help="선 굵기 스케일. 크면 굵고 넓은 선을 잡는다")
+    ap.add_argument("--darken-ds", type=int, default=4, dest="darken_ds",
+                    help="마스크 계산 다운샘플 배수. 4면 1/4 해상도에서 계산")
+    ap.add_argument("--crop-quant", type=int, default=0, dest="crop_quant",
+                    help="크롭 한 변을 이 배수로 반올림(0=off, 8 권장). 프레임간 리샘플링 위상 고정")
     ap.add_argument("--luma-match", type=float, default=0.0, dest="luma_match",
                     help="chroma 모드에서 저주파 밝기를 입력에 맞춘다(0~1). 크롭 경계 단차 제거")
     ap.add_argument("--luma-sigma", type=float, default=0.12, dest="luma_sigma",
@@ -697,6 +759,8 @@ def main():
             prev_raw=prev_raw, flatten=args.flatten,
             luma_match=args.luma_match, luma_sigma=args.luma_sigma,
             despeckle_strength=args.despeckle_strength, despeckle_kernel=args.despeckle_kernel,
+            darken=args.darken, darken_sigma=args.darken_sigma,
+            darken_ds=args.darken_ds, crop_quant=args.crop_quant,
             mask_scale_x=args.mask_scale_x, mask_scale_y=args.mask_scale_y,
             mask_feather=args.mask_feather,
         )
