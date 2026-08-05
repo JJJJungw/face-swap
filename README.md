@@ -965,10 +965,14 @@ ln -sfn ../teacher/target out/oracle_occ65/pairs/target
 python3 run/eval_student.py --ckpt <ckpt> --data out/oracle_occ65/pairs \
   --n 12 --size 512 --bench 0 --sheet out/oracle_occ65/student_sheet.png
 
-# 고정 validation 평가
-python3 -u run/eval_student.py --data out/pairs_anime12_13500 --n 64 --size 512 \
-  --include-file train/s_clean48/val_stems.txt --ckpt train/s_clean48/student_final.pt \
-  --sheet out/eval_s_clean48.png
+# 세대 비교 (여러 --ckpt 를 한 표로. 코퍼스 쪽 in-distribution 평가)
+python3 run/build_localface_pairs.py --data out/pairs_anime12_13500 --out out/occ65_eval64 \
+  --face-occupancy 0.65 --max-pad 0.02 --no-blend --output-size 512 --n 64
+python3 run/eval_student.py --data out/occ65_eval64 --n 64 --size 512 --bench 0 \
+  --ckpt gan_ckpt/keep/student_d8_occ65_final.pt \
+  --ckpt gan_ckpt/keep/student_d8_edge3_final.pt \
+  --ckpt gan_ckpt/keep/student_d8_edge3_eq_final.pt \
+  --sheet out/eval_generations.png
 ```
 
 상세 절차: **[docs/post-corpus-runbook.md](docs/post-corpus-runbook.md)**
