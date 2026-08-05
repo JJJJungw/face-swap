@@ -77,6 +77,42 @@ python3 run/eval_student.py --data out/occ65_eval64 --n 64 --size 512 --bench 0 
 
 ---
 
+## 평가 — 블라인드 A/B
+
+```bash
+# ① 고정 홀드아웃 (★ 학습 코퍼스는 --exclude-file 로 반드시 제외)
+python3 run/build_holdout.py --n 200 --seed 0 \
+  --exclude-file out/occ65_3000.txt \
+  --out out/holdout_200.txt --report out/holdout_200.json
+
+# ② 홀드아웃을 occ65 크롭으로
+python3 run/build_localface_pairs.py \
+  --data out/pairs_anime12_13500 --out out/holdout_crops \
+  --include-file out/holdout_200.txt \
+  --face-occupancy 0.65 --max-pad 0.02 --no-blend --output-size 512
+
+# ③ 비교할 모델들을 홀드아웃에 돌리기
+for M in occ65 edge3 edge3_eq; do
+  python3 run/stylize_dir.py \
+    --input out/holdout_crops/input --out out/eval_$M \
+    --ckpt gan_ckpt/keep/student_d8_${M}_final.pt \
+    --include-file out/holdout_200.txt
+done
+
+# ④ 블라인드 리뷰 페이지 생성 → 맥으로 받아서 더블클릭
+python3 run/ab_review.py \
+  --a out/eval_occ65 --b out/eval_edge3_eq \
+  --src out/holdout_crops/input \
+  --label-a base --label-b edge3_eq \
+  --include-file out/holdout_200.txt --n 60 --seed 2 \
+  --out out/ab_base_vs_eq.html
+```
+
+키: `←` 왼쪽 · `→` 오른쪽 · `Space` 무승부 · `Z` 되돌리기.
+Q1(원본 숨김) → Q2(원본 표시) 두 라운드. 끝나면 승률·p값·라벨 공개.
+
+---
+
 ## 스크립트 목록 (`run/`)
 | 스크립트 | 용도 |
 |---|---|
@@ -105,4 +141,7 @@ python3 run/eval_student.py --data out/occ65_eval64 --n 64 --size 512 --bench 0 
 | `landmark_probe.py` | MediaPipe Tasks API 검출률·지연·정렬 파라미터 지터 측정 |
 | `align_probe.py` | 박스 크롭 vs canonical 정렬 크롭의 프레임 간 변화량 비교 |
 | `shift_probe.py` | **이동 증폭·비등변성 측정** — 흔들림 판정의 기준 지표 |
+| `build_holdout.py` | 층화 고정 홀드아웃 추출 (연령·수염·안경·얼굴크기·ITA) |
+| `ab_review.py` | **블라인드 페어와이즈 A/B** — 자체 완결 HTML, 승률 + 정확 이항검정 |
+| `stylize_dir.py` | 폴더 일괄 스타일화 (.pt / .onnx) — A/B 입력 생성 |
 
