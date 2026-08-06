@@ -366,12 +366,50 @@ def id_embed(m, x):
 #   - 열화(블러·축소·노이즈·JPEG·색)는 **input에만** → target은 정답이라 깨끗해야 한다.
 #     그래야 "작고 더러운 사진 → 크고 깨끗한 카툰" 매핑을 배운다(복원+스타일화 동시).
 def _degrade(img, level, rng, size):
-    """input 전용 열화. 실제 촬영 체인 순서: 블러 → 축소 → 노이즈 → 압축 → 재확대."""
+    """input 전용 열화. 실제 촬영·방송 체인 순서를 따른다.
+
+        플래시/하이라이트 → 뷰티 필터 → 블러 → 축소 → 노이즈 → 압축 → 재확대
+        → 노출·색온도·무대조명 → 서브픽셀 지터
+
+    ■ 각 항목이 어떤 실패에서 나왔는가 (2026-08-06)
+      뷰티 필터   swap10(중국 예능)에서 얼굴이 밀랍 인형처럼 나왔다. 소스에 이미
+                  피부 스무딩이 걸려 있어 **학생이 선으로 바꿀 명암 변화가 없었다.**
+                  가우시안 블러로는 흉내 못 낸다 — 그건 선까지 뭉갠다.
+                  bilateral 은 대비 큰 화소를 보존하므로 **질감만 지우고 선은 남긴다.**
+      플래시      시상식·레드카펫. 국소 과노출로 얼굴 일부가 흰색으로 클리핑된다.
+      무대조명    강한 단색 조명. 기존 ±10% 채널 스케일로는 재현이 안 된다.
+      모션블러    액션·빠른 움직임. 기존에는 level 3 에서만, 확률 0.4 로 약했다.
+      서브픽셀    검출 박스가 프레임마다 흔들려 리샘플링 위상이 달라진다.
+                  비등변 잔차가 0.473 로 남아 있어 이 축이 살아 있다.
+
+    ■ 강도를 균일하게 올리지 말 것
+      과거 --aug-level 3 단독 학습이 실패했다. 입력을 62px 까지 뭉개서 512 로 늘리므로
+      과제가 *초해상도 + 환각 + 스타일화 동시 수행* 이 되고, L1 최적해가 흐릿한 평균이 된다.
+      **--aug-mix 로 대부분을 깨끗하게 두고 일부만 열화시킨다.**
+    """
     h, w = img.shape[:2]
+
+    # ⓪ 플래시 / 하이라이트 클리핑 — 광학 단계라 가장 먼저
+    if level >= 2 and rng.random() < 0.15:
+        f = img.astype(np.float32)
+        if rng.random() < 0.5:                                    # 전역 과노출
+            f *= rng.uniform(1.15, 1.6)
+        else:                                                     # 국소 스팟
+            cy, cx = rng.uniform(0.2, 0.8) * h, rng.uniform(0.2, 0.8) * w
+            yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+            r = rng.uniform(0.25, 0.6) * max(h, w)
+            spot = np.exp(-(((yy - cy) ** 2 + (xx - cx) ** 2) / (2 * r * r)))
+            f *= (1.0 + rng.uniform(0.3, 1.0) * spot)[:, :, None]
+        img = np.clip(f, 0, 255).astype(np.uint8)
+
+    # ⓪-b 뷰티 필터 (피부 스무딩) — 방송 후처리 단계. 블러보다 먼저 온다.
+    if level >= 1 and rng.random() < (0.20 if level == 1 else 0.35):
+        d = int(rng.integers(5, 13)) | 1
+        img = cv2.bilateralFilter(img, d, rng.uniform(40, 110), rng.uniform(40, 110))
 
     # ① 블러 (초점/모션) — 광학 단계라 축소보다 먼저
     if rng.random() < (0.35 if level < 3 else 0.5):
-        if level >= 3 and rng.random() < 0.4:                      # 모션 블러(방향성)
+        if level >= 2 and rng.random() < (0.45 if level == 2 else 0.6):   # 모션 블러(방향성)
             k = int(rng.integers(5, 16)) | 1
             ker = np.zeros((k, k), np.float32)
             ang, c = rng.uniform(0, np.pi), k // 2
@@ -417,6 +455,21 @@ def _degrade(img, level, rng, size):
         if level >= 2:
             f = np.clip(f * rng.uniform(0.9, 1.1, size=(1, 1, 3)), 0, 1)     # 채널별 = 색온도
         img = (f * 255).astype(np.uint8)
+
+    # ⑦ 무대 단색 조명 — 기존 ±10% 로는 재현 안 되는 강한 색 캐스트
+    if level >= 2 and rng.random() < 0.20:
+        tint = rng.uniform(0.55, 1.45, size=(1, 1, 3)).astype(np.float32)
+        strength = rng.uniform(0.3, 0.9)
+        blend = 1.0 + (tint - 1.0) * strength
+        img = np.clip(img.astype(np.float32) * blend, 0, 255).astype(np.uint8)
+
+    # ⑧ 서브픽셀 지터 — 검출 박스 흔들림으로 리샘플링 위상이 프레임마다 달라지는 것
+    #    input 에만 걸어 "같은 얼굴이 조금 다르게 샘플링돼도 같은 그림" 을 학습시킨다.
+    if level >= 1 and rng.random() < 0.5:
+        dx, dy = rng.uniform(-0.9, 0.9), rng.uniform(-0.9, 0.9)
+        M = np.float32([[1, 0, dx], [0, 1, dy]])
+        img = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_LINEAR,
+                             borderMode=cv2.BORDER_REFLECT_101)
 
     return img
 

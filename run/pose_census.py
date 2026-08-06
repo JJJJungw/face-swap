@@ -13,6 +13,7 @@
   MediaPipe FaceLandmarker 의 facial_transformation_matrix 에서 회전 행렬을 뽑아
   yaw(좌우) · pitch(상하) · roll(기울임) 을 오일러 각으로 환산한다.
   ※ 이 행렬은 output_facial_transformation_matrixes=True 일 때만 나온다.
+  ※ 축 이름은 공식이 아니라 **이미지로** 검증해서 확정했다. euler_from_matrix 주석 참고.
 
 ■ 읽는 법
   yaw   |0~15| 정면 · |15~35| 3/4 · |35~60| 측면 · |60+| 강한 측면
@@ -63,17 +64,33 @@ def build_landmarker(model_path):
 
 
 def euler_from_matrix(matrix):
-    """4x4 facial transformation matrix → (yaw, pitch, roll) 도 단위."""
+    """4x4 facial transformation matrix → (yaw, pitch, roll) 도 단위.
+
+    ■ 축 오라벨 사고 (2026-08-06) — 같은 실수를 반복하지 말 것
+      처음엔 표준 R = Rz·Ry·Rx 분해 결과 (Rz, Ry, Rx) 를 그대로
+      (yaw, pitch, roll) 이라고 이름 붙였다. 완전히 틀렸다.
+      그 결과 "측면 0.1%, 데이터가 없다"는 정반대 결론이 나왔고
+      base 재학습 설계를 그 위에 짤 뻔했다.
+
+      각 축에서 각도가 가장 큰 이미지 6장씩 뽑아 시트로 눈으로 확인해서 확정:
+        atan2(-R[2,0], sy)     → 완전 측면 얼굴(±62~69°)   = 진짜 yaw
+        atan2( R[2,1], R[2,2]) → 위·아래 보는 얼굴(±30~34°) = 진짜 pitch
+        atan2( R[1,0], R[0,0]) → 고개 기울임(±25~41°)       = 진짜 roll
+
+      MediaPipe 의 얼굴 좌표계는 카메라 광학축 기준이라 표준
+      항공기 오일러 관례와 축 순서가 다르다. 행렬 분해 공식만 보고
+      이름을 붙이지 말 것 — 반드시 이미지로 검증할 것.
+    """
     R = np.array(matrix)[:3, :3]
     sy = math.sqrt(R[0, 0] ** 2 + R[1, 0] ** 2)
     if sy > 1e-6:
-        pitch = math.atan2(-R[2, 0], sy)
-        yaw = math.atan2(R[1, 0], R[0, 0])
-        roll = math.atan2(R[2, 1], R[2, 2])
+        yaw = math.atan2(-R[2, 0], sy)
+        pitch = math.atan2(R[2, 1], R[2, 2])
+        roll = math.atan2(R[1, 0], R[0, 0])
     else:
-        pitch = math.atan2(-R[2, 0], sy)
-        yaw = 0.0
-        roll = math.atan2(-R[1, 2], R[1, 1])
+        yaw = math.atan2(-R[2, 0], sy)
+        pitch = math.atan2(-R[1, 2], R[1, 1])
+        roll = 0.0
     return math.degrees(yaw), math.degrees(pitch), math.degrees(roll)
 
 
@@ -100,7 +117,25 @@ def main():
     ap.add_argument("--model", default="models/face_landmarker.task")
     ap.add_argument("--report", default="out/pose_census.json")
     ap.add_argument("--tag", default="corpus")
+    ap.add_argument("--from-report", default=None,
+                    help="이미 뽑아둔 리포트 json 의 rows 로 표만 다시 계산한다(측정 재실행 없음)")
+    ap.add_argument("--relabel", action="store_true",
+                    help="--from-report 와 함께. 2026-08-06 이전의 잘못된 축 이름을 바로잡아 읽는다"
+                         " (구 pitch→yaw, 구 roll→pitch, 구 yaw→roll)")
+    ap.add_argument("--axis-sheet", default=None,
+                    help="축별 최대 각도 상위 6장을 시트로 저장할 디렉터리. 축 이름 검증용")
     args = ap.parse_args()
+
+    if args.from_report:
+        raw = json.loads(Path(args.from_report).read_text(encoding="utf-8"))["rows"]
+        if args.relabel:
+            rows = [{"stem": r["stem"], "yaw": r["pitch"], "pitch": r["roll"], "roll": r["yaw"]}
+                    for r in raw]
+            print("[relabel] 구 pitch→yaw, 구 roll→pitch, 구 yaw→roll 로 바로잡아 읽는다")
+        else:
+            rows = raw
+        report(rows, len(rows), args)
+        return
 
     items = []
     if args.images:
@@ -152,6 +187,33 @@ def main():
     if not rows:
         raise SystemExit("검출 0장. 모델 경로나 입력을 확인할 것")
 
+    if args.axis_sheet:
+        save_axis_sheets(rows, items, args.axis_sheet)
+
+    report(rows, len(items), args)
+
+
+def save_axis_sheets(rows, items, outdir):
+    """축별로 |각도| 상위 6장을 붙여 저장한다. 축 이름이 맞는지 눈으로 검증하는 용도."""
+    path_of = {it["stem"]: it["path"] for it in items}
+    os.makedirs(outdir, exist_ok=True)
+    for axis in ("yaw", "pitch", "roll"):
+        top = sorted(rows, key=lambda r: -abs(r[axis]))[:6]
+        tiles = []
+        for r in top:
+            img = cv2.imread(path_of.get(r["stem"], ""), cv2.IMREAD_COLOR)
+            if img is None:
+                continue
+            img = cv2.resize(img, (256, 256))
+            cv2.putText(img, f"{axis} {r[axis]:+.0f}", (8, 28),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            tiles.append(img)
+        if tiles:
+            cv2.imwrite(os.path.join(outdir, f"axis_{axis}.jpg"), np.hstack(tiles))
+    print(f"[sheet] 축 검증 시트 → {outdir}/axis_*.jpg")
+
+
+def report(rows, attempted, args):
     yaw = np.array([r["yaw"] for r in rows])
     pitch = np.array([r["pitch"] for r in rows])
     roll = np.array([r["roll"] for r in rows])
@@ -166,7 +228,7 @@ def main():
             print(f"  {key:<8}{c:>6}  {100*c/total:5.1f}%  {bar}")
         return {k: counts.get(k, 0) for k in names}
 
-    print(f"\n[검출] {total}/{len(items)} ({100*total/max(1,len(items)):.1f}%)  실패 {failed}")
+    print(f"\n[검출] {total}/{attempted} ({100*total/max(1,attempted):.1f}%)")
     y = table("yaw  좌우", yaw, YAW_EDGES, YAW_NAMES)
     p = table("pitch 상하", pitch, PITCH_EDGES, PITCH_NAMES)
     r = table("roll  기울임", roll, ROLL_EDGES, ROLL_NAMES)
@@ -184,7 +246,7 @@ def main():
 
     Path(args.report).parent.mkdir(parents=True, exist_ok=True)
     Path(args.report).write_text(json.dumps({
-        "tag": args.tag, "n": total, "attempted": len(items), "failed": failed,
+        "tag": args.tag, "n": total, "attempted": attempted,
         "yaw": y, "pitch": p, "roll": r,
         "rows": rows,
     }, ensure_ascii=False), encoding="utf-8")
