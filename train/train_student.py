@@ -365,7 +365,7 @@ def id_embed(m, x):
 #   - 기하 변환(반전/크롭/종횡비)은 input·target **양쪽에** → 페어 정합 유지
 #   - 열화(블러·축소·노이즈·JPEG·색)는 **input에만** → target은 정답이라 깨끗해야 한다.
 #     그래야 "작고 더러운 사진 → 크고 깨끗한 카툰" 매핑을 배운다(복원+스타일화 동시).
-def _degrade(img, level, rng, size):
+def _degrade(img, level, rng, size, beauty_p=None):
     """input 전용 열화. 실제 촬영·방송 체인 순서를 따른다.
 
         플래시/하이라이트 → 뷰티 필터 → 블러 → 축소 → 노이즈 → 압축 → 재확대
@@ -381,6 +381,13 @@ def _degrade(img, level, rng, size):
       모션블러    액션·빠른 움직임. 기존에는 level 3 에서만, 확률 0.4 로 약했다.
       서브픽셀    검출 박스가 프레임마다 흔들려 리샘플링 위상이 달라진다.
                   비등변 잔차가 0.473 로 남아 있어 이 축이 살아 있다.
+
+    ■ beauty_p (2026-08-06 2차)
+      1차 augmix 에서 뷰티필터 실적용률이 **7.5%** 였다
+      (mix 0:0.7/1:0.2/2:0.1 × p 0.20/0.35). swap10 턱선이 '생기다 만' 수준에 그쳤다.
+      --aug-mix 를 올려 용량을 키우면 축소·모션블러까지 같이 세져 단일 변수가 깨지고,
+      level 2 축소(154px)가 늘어 과제가 초해상도로 변질된다(아래 참고).
+      그래서 **이 항목의 확률만** 따로 연다. beauty_p=0.8 → 실적용률 24%.
 
     ■ 강도를 균일하게 올리지 말 것
       과거 --aug-level 3 단독 학습이 실패했다. 입력을 62px 까지 뭉개서 512 로 늘리므로
@@ -403,7 +410,8 @@ def _degrade(img, level, rng, size):
         img = np.clip(f, 0, 255).astype(np.uint8)
 
     # ⓪-b 뷰티 필터 (피부 스무딩) — 방송 후처리 단계. 블러보다 먼저 온다.
-    if level >= 1 and rng.random() < (0.20 if level == 1 else 0.35):
+    p_beauty = (0.20 if level == 1 else 0.35) if beauty_p is None else float(beauty_p)
+    if level >= 1 and rng.random() < p_beauty:
         d = int(rng.integers(5, 13)) | 1
         img = cv2.bilateralFilter(img, d, rng.uniform(40, 110), rng.uniform(40, 110))
 
@@ -536,6 +544,7 @@ def manifest_face_mask(record, output_size):
 
 class PairImgs(Dataset):
     def __init__(self, root, size, aug=False, aug_level=0, pairs=None, aug_mix=None, seed=0,
+                 beauty_p=None,
                  load_masks=False, localize_manifest=None):
         din, dtg = os.path.join(root, "input"), os.path.join(root, "target")
         self.pairs = list(pairs) if pairs is not None else discover_pairs(din, dtg)
@@ -545,6 +554,7 @@ class PairImgs(Dataset):
         # 구 --aug 플래그 호환: 켜져 있고 --aug-level 미지정이면 1
         self.level = aug_level if aug_level > 0 else (1 if aug else 0)
         self.aug_mix = aug_mix
+        self.beauty_p = beauty_p
         self.seed = seed
         self.rng = None
         self.load_masks = load_masks
@@ -641,7 +651,7 @@ class PairImgs(Dataset):
             mask = cv2.resize(np.ascontiguousarray(mask), (self.size, self.size), interpolation=cv2.INTER_LINEAR)
 
         if level >= 1:
-            a = _degrade(a, level, rng, self.size)             # ★ input에만
+            a = _degrade(a, level, rng, self.size, self.beauty_p)   # ★ input에만
 
         ta = torch.from_numpy(cv2.cvtColor(a, cv2.COLOR_BGR2RGB).copy()).permute(2, 0, 1).float() / 127.5 - 1
         tb = torch.from_numpy(cv2.cvtColor(b, cv2.COLOR_BGR2RGB).copy()).permute(2, 0, 1).float() / 127.5 - 1
@@ -732,6 +742,9 @@ def main():
                     help="샘플 저장 시 validation L1을 계산할 최대 페어 수")
     ap.add_argument("--aug-mix", default=None, dest="aug_mix",
                     help="샘플별 증강 혼합. 예: 0:0.7,1:0.2,2:0.1")
+    ap.add_argument("--beauty-p", type=float, default=None, dest="beauty_p",
+                    help="뷰티필터(bilateral) 열화 확률만 따로 지정. 미지정=level별 기본(0.20/0.35). "
+                         "실적용률 = P(level>=1) x beauty_p")
     ap.add_argument("--overfit-n", type=int, default=0, dest="overfit_n",
                     help="진단용으로 앞 N개 페어만 사용하고 validation/증강을 끔")
     ap.add_argument("--resume", nargs="?", const="auto", default=None,
@@ -1102,6 +1115,7 @@ def main():
     use_face_masks = args.face_mask_weight > 1
     ds = PairImgs(
         args.data, args.size, args.aug, args.aug_level, train_pairs, aug_mix, args.seed,
+        args.beauty_p,
         load_masks=use_face_masks, localize_manifest=args.localize_manifest,
     )
     val_ds = (
@@ -1117,8 +1131,14 @@ def main():
         pin_memory=(dev == "cuda"), persistent_workers=(args.workers > 0), generator=generator,
     ))
     print(f"[data] train={len(ds)} val={len(val_ds) if val_ds else 0} "
-          f"aug_mix={aug_mix} face_mask_weight={args.face_mask_weight:g} "
+          f"aug_mix={aug_mix} beauty_p={args.beauty_p} "
+          f"face_mask_weight={args.face_mask_weight:g} "
           f"localize_manifest={args.localize_manifest or 'none'}")
+    # ★ 손실 가중치를 반드시 로그에 남긴다.
+    #   base 가 w_edge=0 인 줄 모르고 30,000스텝을 돌린 사고(2026-08-04)의 재발 방지.
+    print(f"[loss] w_l1={args.w_l1:g} w_perc={args.w_perc:g} w_adv={args.w_adv:g} "
+          f"w_edge={args.w_edge:g}({args.edge_mode}) w_equiv={args.w_equiv:g} "
+          f"w_fm={args.w_fm:g} w_tv={args.w_tv:g} w_flat={args.w_flat:g} id_loss={args.id_loss:g}")
     print(f"[model] gen_arch={args.gen_arch} gen_ch={args.gen_ch} "
           f"params={sum(p.numel() for p in G.parameters())/1e6:.2f}M")
     print(f"[speed] amp={args.amp} perc_size={args.perc_size or args.size} tf32={dev == 'cuda'}")
