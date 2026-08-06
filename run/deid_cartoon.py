@@ -634,6 +634,45 @@ def composite(frame, boxes, stylizer, cartoon_min, blur_mode="pixelate", expand=
         ).astype(np.uint8)
     return nc, nb
 
+def probe_sar(path):
+    """입력의 sample_aspect_ratio 를 (num, den) 로 돌려준다. 못 읽으면 (1, 1).
+
+    ■ 왜 필요한가 (2026-08-06)
+      유튜브에서 받은 팬캠이 **아나모픽**이었다. 저장은 720x1280 인데
+      SAR 256:81 이라 표시는 16:9 가로다. cv2.VideoCapture 는 SAR 을 무시하고
+      저장된 픽셀만 주므로, 얼굴이 **가로로 3.16배 눌린 상태**로
+      검출기와 GAN 에 들어갔다. 학습 코퍼스에 없는 종횡비라 완전한 분포 밖 입력이고,
+      출력에도 SAR 이 안 붙어 표시 비율까지 뒤집혔다(9:16).
+
+      즉 증상은 "결과가 세로로 눌려 보인다" 였지만, 진짜 피해는 **모델이 찌그러진
+      얼굴을 봤다**는 쪽이었다. 화질로 판단하기 전에 SAR 부터 확인할 것.
+    """
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=sample_aspect_ratio",
+             "-of", "default=nw=1:nk=1", path],
+            capture_output=True, text=True, timeout=20).stdout.strip()
+        num, den = (int(v) for v in out.split(":"))
+        return (num, den) if num > 0 and den > 0 else (1, 1)
+    except Exception:
+        return (1, 1)
+
+
+def square_pixel_size(width, height, sar):
+    """아나모픽 프레임을 정사각 픽셀로 펼 목표 해상도. 총 화소수는 유지한다.
+
+    단순히 폭에 SAR 을 곱하면 720x1280 → 2276x1280 으로 화소가 3배 늘어
+    처리 비용만 커진다. 표시 비율(DAR)만 맞추고 화소수는 원본과 같게 잡는다.
+    720x1280 · SAR 256:81 → DAR 16:9 → **1280x720**.
+    """
+    num, den = sar
+    dar = (width / height) * (num / den)
+    target_h = int(round((width * height / dar) ** 0.5))
+    target_w = int(round(target_h * dar))
+    return max(2, target_w - target_w % 2), max(2, target_h - target_h % 2)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--video", required=True)
@@ -704,6 +743,8 @@ def main():
     ap.add_argument("--gan-onnx", default="gan_ckpt/animegan_512.onnx", dest="gan_onnx", help="ONNX GAN 경로(없으면 자동 export)")
     ap.add_argument("--gan-onnx-size", type=int, default=512, dest="gan_onnx_size", help="ONNX GAN 고정 입력크기")
     ap.add_argument("--max-frames", type=int, default=0, dest="max_frames", help="N프레임만 처리(측정용). 0=전체")
+    ap.add_argument("--no-sar-fix", action="store_true", dest="no_sar_fix",
+                    help="아나모픽 정규화를 끈다(진단용). 기본은 켬 — 끄면 얼굴이 눌린 채 처리된다")
     ap.add_argument("--out", default="out/deid_cartoon.mp4")
     args = ap.parse_args()
     if args.face_expand < 0:
@@ -723,6 +764,18 @@ def main():
 
     cap = cv2.VideoCapture(args.video)
     W = int(cap.get(3)); H = int(cap.get(4)); fps = cap.get(5) or 30.0; total = int(cap.get(7))
+
+    # ── 아나모픽 정규화. SAR 이 1:1 이 아니면 정사각 픽셀로 펴서 처리한다.
+    #    펴지 않으면 얼굴이 눌린 채로 검출기·GAN 에 들어간다(2026-08-06 swap11).
+    sar = (1, 1) if args.no_sar_fix else probe_sar(args.video)
+    unsqueeze = sar != (1, 1)
+    if unsqueeze:
+        SW, SH = square_pixel_size(W, H, sar)
+        print(f"[sar] 아나모픽 입력 SAR={sar[0]}:{sar[1]} → {W}x{H} 를 {SW}x{SH} 로 펴서 처리")
+    else:
+        SW, SH = W, H
+    W, H = SW, SH
+
     print(f"{W}x{H} @ {fps:.0f}fps, {total} frames | enc={args.encoder} trt={args.trt} "
           f"gan={args.gan_backend} compile={args.compile} half={args.half} gan_size={args.gan_size}")
 
@@ -742,6 +795,8 @@ def main():
     while True:
         ok, frame = cap.read()
         if not ok: break
+        if unsqueeze:
+            frame = cv2.resize(frame, (W, H), interpolation=cv2.INTER_LANCZOS4)
         i += 1
         a = time.perf_counter()
         raw = frame.copy() if args.input_temporal > 0 else None

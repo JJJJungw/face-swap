@@ -13,6 +13,10 @@
 | 랜드마크 canonical 정렬 (MediaPipe) | ❌ | 프레임간 변화량 비 0.99 / 0.83 / 1.01. 변화의 지배 요인은 강체 운동이 아니라 표정·조명 | [training-history](training-history.md#랜드마크-정렬은-답이-아니었다-mediapipe) |
 | `--aug-level 1` (충실도 증강) | ❌ | 지표는 전부 개선(이동 증폭 1.30→1.06)됐으나 영상에서 주근깨·눈썹 일렁임·눈 붕괴. **육안 기각** | [training-history](training-history.md#증강-기각--지표가-다-좋아졌는데-영상은-나빠졌다) |
 | `--aug-level 3` (강한 열화) | ❌ | 과제가 초해상도+환각+스타일화 동시 수행이 되어 L1 최적해가 흐릿한 평균. 화풍을 배울 기회 자체가 없었다 | [training-history](training-history.md#2차에서-배운-것) |
+| `occ65_tgt3k` 단독 교체 (타이트 크롭 teacher 타겟) | ❌ | 블라인드 A/B 선명도 **67.9% 승(p=0.0127)** 인데 신원 잔존 0.602 → **0.776**. 품질은 이겼으나 제품 게이트에서 탈락. **가중치 25%로 수프에 재활용** | [training-history](training-history.md#결과--게이트가-실제로-작동했다-2026-08-05) |
+| `w_edge` 3 → 5 (`soup075_edge5`) | ❌ | edge density 10.74→11.36% 인데 edge contrast 181.0→**179.2**. Sobel L1 이 작은 gradient 를 동등 취급해 **선이 굵어지는 대신 잔선이 는다** | [training-history](training-history.md#soup075-위의-단일-변수-시도-두-개--둘-다-기각-2026-08-06) |
+| `w_flat` 0 → 2.0 (`soup075_flat2`) | ❌ | flatness 0.95 → **1.03**, edge_contrast 1.03 → 0.93. `style_sharpness` 가 이미 타겟보다 평탄하다고 알려주고 있었다. **없는 문제를 고치려 한 손실** | 〃 |
+| 모델 수프 (가중치 선형 보간) | ✅ | 신원이 α 에 **완벽히 선형**(0.25당 +0.045)이라 화풍↔신원 교환비를 연속 조절 가능. 비등변성은 두 부모보다 좋음 | [training-history](training-history.md#모델-수프--기각한-모델을-버리지-않는-법-2026-08-06) |
 | 용량 증설 (ch 48 → 64) | ⏸ | 속도 예산은 남지만 병목이 용량이 아니라 손실·타겟이었다 | [training-history](training-history.md#속도-여유) |
 | `--style-scale` 상향 (1.0 → 2.0) | ❌ | 신원 cos가 0.086밖에 안 떨어짐. 구조 보존형 LoRA는 원리적으로 신원을 못 지운다 | [deidentification](deidentification.md#현재-상태) |
 
