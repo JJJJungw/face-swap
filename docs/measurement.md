@@ -186,11 +186,16 @@ gentle soft brushwork, muted natural colors.
 Keep the exact same pose, gaze and expression, same framing and composition.   ← 얼굴을 바꾸지 말라는 지시
 ```
 
-반면 모델 카드의 공식 예시는 **짧다**:
+반면 공식 예시 프롬프트는 **짧다**. 현재 코퍼스가 쓰는 것도 이것이다
+(`run/generate_anime_13500.sh`):
 
 ```
-Transform into anime. flat cel shading
+Transform into anime.
 ```
+
+> 이 절에 한때 `Transform into anime. flat cel shading` 이라고 적혀 있었으나 **오기였다**(2026-08-06 정정).
+> 실제 사용 프롬프트는 위와 같다. 프롬프트 문구는 README 가 아니라
+> `run/generate_anime_13500.sh` 와 `manifest.jsonl` 을 기준으로 삼는다.
 
 ### 이 하나가 이후 문제를 전부 설명한다
 
