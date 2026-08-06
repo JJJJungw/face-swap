@@ -627,6 +627,10 @@ def main():
     ap.add_argument("--w-fm", type=float, default=0.0, dest="w_fm",
                     help="discriminator feature matching. conditional GAN 안정화는 1~5 권장")
     ap.add_argument("--w-tv", type=float, default=0.0, dest="w_tv")
+    ap.add_argument("--w-flat", type=float, default=0.0, dest="w_flat",
+                    help="타겟이 평탄한 곳에서만 출력 gradient 를 벌한다. 잡선 억제. 1~5 권장")
+    ap.add_argument("--flat-thresh", type=float, default=0.05, dest="flat_thresh",
+                    help="[-1,1] 스케일 타겟 gradient 기준. 이보다 크면 '선'으로 보고 벌하지 않는다")
     ap.add_argument("--id-loss", type=float, default=0.0, dest="id_loss", help="신원억제(0=off). input 신원에서 멀어지게")
     ap.add_argument("--id-margin", type=float, default=0.3, dest="id_margin")
     ap.add_argument("--face-mask-weight", type=float, default=1.0, dest="face_mask_weight",
@@ -692,6 +696,8 @@ def main():
         ap.error("--val-n must be non-negative")
     if args.face_mask_weight < 1:
         ap.error("--face-mask-weight must be at least 1")
+    if args.flat_thresh <= 0:
+        ap.error("--flat-thresh must be positive")
     if args.perc_size < 0:
         ap.error("--perc-size must be non-negative")
     if args.w_fm < 0:
@@ -878,6 +884,35 @@ def main():
             return multiscale_sobel_loss(fake, tgt)
         return difference_edge_loss(fake, tgt)
 
+    def flatness_loss(fake, tgt):
+        """타겟이 평탄한 곳에서만 출력의 gradient 를 벌한다.
+
+        ■ 왜 필요한가 (2026-08-06)
+          목적함수에 "굵은 선을 그려라"(w_edge)는 있었지만 "평평한 면은 비워라"는 없었다.
+          그래서 w_edge 를 3.0 → 5.0 으로 올리자 선이 굵어진 게 아니라 **없던 약한 선이 늘었다**
+          (엣지 밀도 +5.8%, 엣지 대비 −1.0%). 긁힌 듯한 잡선이 생겨 "지저분하다"가 됐다.
+
+          애니 화풍의 정의가 **평평한 면 + 강한 선**인데 손실에는 후자만 있었던 것이다.
+          White-box Cartoonization 의 surface/texture 분해, DCT-Net 의 TV 항이 모두 전자를 담당한다.
+
+        ■ 왜 그냥 TV(--w-tv) 를 쓰면 안 되는가
+          TV 는 출력의 **모든** gradient 를 벌하므로 우리가 원하는 굵은 선까지 같이 누른다.
+          타겟 gradient 로 마스크를 만들어 **평탄한 곳에만** 걸어야 한다.
+
+        ■ flat_thresh
+          [-1,1] 스케일의 타겟 gradient 기준값. 이보다 크면 '선'으로 보고 벌하지 않는다.
+          0.05 ≈ 6/255. 너무 높이면 진짜 선까지 눌러 전체가 밋밋해진다.
+        """
+        fdx = fake[:, :, :, 1:] - fake[:, :, :, :-1]
+        fdy = fake[:, :, 1:, :] - fake[:, :, :-1, :]
+        with torch.no_grad():
+            tdx = (tgt[:, :, :, 1:] - tgt[:, :, :, :-1]).abs().mean(1, keepdim=True)
+            tdy = (tgt[:, :, 1:, :] - tgt[:, :, :-1, :]).abs().mean(1, keepdim=True)
+            wx = 1.0 - (tdx / args.flat_thresh).clamp(0.0, 1.0)
+            wy = 1.0 - (tdy / args.flat_thresh).clamp(0.0, 1.0)
+        return 0.5 * ((fdx.abs().mean(1, keepdim=True) * wx).mean()
+                      + (fdy.abs().mean(1, keepdim=True) * wy).mean())
+
     def set_requires_grad(model, enabled):
         for parameter in model.parameters():
             parameter.requires_grad_(enabled)
@@ -929,6 +964,10 @@ def main():
                 equiv = F.l1_loss(fake_of_warped[:, :, b:-b, b:-b],
                                   warped_fake[:, :, b:-b, b:-b])
                 g = g + args.w_equiv * equiv
+            flat = torch.tensor(0.0, device=dev)
+            if args.w_flat > 0:
+                flat = flatness_loss(fake, tgt)
+                g = g + args.w_flat * flat
             if args.w_tv > 0:
                 tv = ((fake[:, :, 1:] - fake[:, :, :-1]).abs().mean()
                       + (fake[:, :, :, 1:] - fake[:, :, :, :-1]).abs().mean())
@@ -940,7 +979,8 @@ def main():
                 g = g + args.id_loss * idl
         return fake, g, dict(l1=l1.item(), perc=perc.item(), edge=edge.item(),
                              adv=float(adv.detach()), fm=float(fm.detach()),
-                             equiv=float(equiv.detach()), idl=float(idl.detach()))
+                             equiv=float(equiv.detach()), flat=float(flat.detach()),
+                             idl=float(idl.detach()))
 
     def d_loss(inp, tgt):
         with amp_context():
@@ -1095,6 +1135,7 @@ def main():
             print(f"[{step}/{args.steps}] wadv={w_adv_eff:.2f} D={float(dl):.3f} G={gl.item():.3f} "
                   f"l1={parts['l1']:.3f} perc={parts['perc']:.3f} edge={parts['edge']:.3f} "
                   f"adv={parts['adv']:.2f} fm={parts['fm']:.3f} eqv={parts['equiv']:.4f} "
+                  f"flat={parts['flat']:.4f} "
                   f"id={parts['idl']:.3f} step/s={steps_per_second:.2f}")
             log_time = time.perf_counter()
             log_step = step
