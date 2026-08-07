@@ -770,6 +770,9 @@ def main():
                     help="run/build_part_masks.py 로 구운 부위 경계 마스크 폴더")
     ap.add_argument("--w-edge-part", type=float, default=0.0, dest="w_edge_part",
                     help="부위 경계(코·턱선·눈·눈썹·입술)에서만 걸리는 edge 손실. 시작값 3~6")
+    ap.add_argument("--part-gate-thresh", type=float, default=0.06, dest="part_gate_thresh",
+                    help="타겟 gradient 게이트([-1,1] 스케일). teacher가 안 그린 자리는 부위 손실 0. "
+                         "0=게이트 끔(가려진 입·눈에 선을 그리라고 시키게 되므로 권장 안 함)")
     ap.add_argument("--beauty-p", type=float, default=None, dest="beauty_p",
                     help="뷰티필터(bilateral) 열화 확률만 따로 지정. 미지정=level별 기본(0.20/0.35). "
                          "실적용률 = P(level>=1) x beauty_p")
@@ -994,9 +997,29 @@ def main():
           부위 경계로 국한하면 그 이득 경로가 막힌다. 잔선을 늘려서는 손실이 줄지 않고
           **사라지는 특징을 그려야만** 줄어든다.
 
+        ■ ★ 타겟 게이트 — 없는 것을 그리라고 시키지 않는다 (--part-gate-thresh)
+          랜드마크는 **가려져도** 얼굴 형태를 추정해서 찍는다. 미리보기에서 확인했다:
+            · 수술용 마스크 위에 입술 윤곽이 찍힘
+            · 선글라스 위에 눈 윤곽이 찍힘
+          그런데 teacher 타겟은 그 자리에 마스크·선글라스를 그렸지 입술·눈을 그리지 않았다.
+          그대로 걸면 **마스크 위에 입술 선을 그리라고 시키는 것**이 되어 아티팩트가 된다.
+
+          그래서 타겟 gradient 로 게이트한다. teacher 가 그 자리에 아무것도 안 그렸으면
+          가중치가 0 으로 떨어진다. 우리가 고치려는 것은
+          "teacher 는 코를 그렸는데 학생이 안 그렸다" 이지
+          "teacher 가 안 그린 것을 그려라" 가 아니므로 방향도 맞다.
+
+          이웃 5x5 최대값을 쓴다. 선이 1~2px 어긋나 있어도 게이트가 열려야 하기 때문이다.
+
         ■ 정규화
           마스크 합으로 나눈다. 그래야 마스크 면적이 변해도 가중치의 의미가 유지된다.
         """
+        if args.part_gate_thresh > 0:
+            with torch.no_grad():
+                gdx, gdy = sobel_edges(tgt)
+                gmag = (gdx.abs() + gdy.abs()).mean(1, keepdim=True)
+                gmag = F.max_pool2d(gmag, 5, 1, 2)            # 이웃 허용
+                pm = pm * (gmag / args.part_gate_thresh).clamp(0.0, 1.0)
         losses = []
         for scale in (1, 2, 4):
             if scale > 1:
