@@ -17,6 +17,8 @@
 | `w_edge` 3 → 5 (`soup075_edge5`) | ❌ | edge density 10.74→11.36% 인데 edge contrast 181.0→**179.2**. Sobel L1 이 작은 gradient 를 동등 취급해 **선이 굵어지는 대신 잔선이 는다** | [training-history](training-history.md#soup075-위의-단일-변수-시도-두-개--둘-다-기각-2026-08-06) |
 | `w_flat` 0 → 2.0 (`soup075_flat2`) | ❌ | flatness 0.95 → **1.03**, edge_contrast 1.03 → 0.93. `style_sharpness` 가 이미 타겟보다 평탄하다고 알려주고 있었다. **없는 문제를 고치려 한 손실** | 〃 |
 | 모델 수프 (가중치 선형 보간) | ✅ | 신원이 α 에 **완벽히 선형**(0.25당 +0.045)이라 화풍↔신원 교환비를 연속 조절 가능. 비등변성은 두 부모보다 좋음 | [training-history](training-history.md#모델-수프--기각한-모델을-버리지-않는-법-2026-08-06) |
+| `--aug-mix` 열화 증강 (입력 전용) | ✅ | 타겟은 깨끗이 두고 입력만 일부 망가뜨림. **val L1 0.1470 → `--beauty-p 0.8` 로 0.1411 (계보 최고).** 깨끗한 입력 성능이 오히려 개선 = 정규화로 작동 | [training-history](training-history.md#입력-분포로-푼-문제--열화-증강-2026-08-06) |
+| `--id-loss` 로 신원 낮추기 | ⏸ | 얼굴 임베딩은 **기하가 지배**하므로 모델이 신원을 낮추는 가장 싼 길이 기하 왜곡이다. teacher `geo` 프롬프트가 신원 0.401 을 찍었을 때 정확히 그 실패("눈이 너무 크다")로 기각됐다. 화풍으로 비식별화를 얻는 편이 낫다 | [training-history](training-history.md#결과--게이트가-실제로-작동했다-2026-08-05) |
 | 용량 증설 (ch 48 → 64) | ⏸ | 속도 예산은 남지만 병목이 용량이 아니라 손실·타겟이었다 | [training-history](training-history.md#속도-여유) |
 | `--style-scale` 상향 (1.0 → 2.0) | ❌ | 신원 cos가 0.086밖에 안 떨어짐. 구조 보존형 LoRA는 원리적으로 신원을 못 지운다 | [deidentification](deidentification.md#현재-상태) |
 
@@ -27,6 +29,7 @@
 | `--sharpen` (unsharp mask) | ❌ | 양방향 오버슈트 → 경계 양쪽 halo → halo가 프레임마다 흔들림. **깜빡임을 새로 만든다** | [runtime-pipeline](runtime-pipeline.md#채택-anime4k-line-darkening---darken) |
 | CAS (AMD FidelityFX) | ❌ | 고립 잡티를 "저대비 영역"으로 분류해 **더 강하게** 샤프닝. 방향이 반대 | [runtime-pipeline](runtime-pipeline.md#기각된-다른-후보들) |
 | XDoG | ❌ | 임계 기반이라 프레임마다 on/off로 튀어 unsharp보다 플리커가 심함 | [runtime-pipeline](runtime-pipeline.md#기각된-다른-후보들) |
+| `--darken-ds` 하향 (4 → 2 → 1) | ❌ | 프레임 수치차 평균 1.5/255(0.6%)로 시각 역치 아래. 최대 68이라 얇은 선을 찾긴 찾았으나 **그런 화소가 너무 적다.** 선 진하기(1.03)는 이미 teacher 초과, 결핍은 선 개수(0.85) — **도구와 결핍의 축이 다르다** | [measurement](measurement.md#--darken-ds-기각--도구와-결핍의-축이-달랐다-2026-08-06) |
 | `--darken` (Anime4K Line Darkening) | ✅ | 단측 클램프라 halo 없음. 선명도 +8%, 흔들림 +16%. **채택** | [runtime-pipeline](runtime-pipeline.md#채택-anime4k-line-darkening---darken) |
 
 ## 런타임 — 안정성

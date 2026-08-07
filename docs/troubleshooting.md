@@ -119,6 +119,7 @@ for N in a b c; do scp -i key.pem user@host:/home/ubuntu/face-swap/out/$N.mp4 .;
 긴 마크다운을 `cat > file <<'EOF'` 로 터미널에 붙여넣으면 중간이 잘려 `>` 프롬프트에 갇힌다.
 `Ctrl+C` 로 빠져나온 뒤, **긴 문서는 히어독 대신 레포에 커밋해서 `git pull` 로 옮긴다.**
 
+
 ---
 
 ## 학습
