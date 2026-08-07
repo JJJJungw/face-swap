@@ -41,7 +41,7 @@
   python3 run/transition_width.py --dir out/oracle_occ65/teacher/target --dir out/id_a075/target
   python3 run/transition_width.py --dir <teacher> --dir <student> --n 24 --dump out/tw.json
 """
-import argparse, glob, json, os
+import argparse, glob, json, os, zlib
 from pathlib import Path
 
 import cv2
@@ -82,7 +82,7 @@ def sample_bilinear(img, xs, ys):
 
 
 def rise_distances(bgr, radius=12.0, step=0.25, grad_pct=90.0,
-                   min_delta=8.0, mono_tol=0.22, max_points=1500, rng=None):
+                   min_delta=8.0, mono_tol=0.22, max_points=1500, seed=0):
     """경계마다 10→90% 상승 거리(px) 목록을 돌려준다."""
     lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
     L = lab[:, :, 0].astype(np.float32)          # 0~255 스케일
@@ -104,7 +104,7 @@ def rise_distances(bgr, radius=12.0, step=0.25, grad_pct=90.0,
     if ys.size == 0:
         return []
     if ys.size > max_points:
-        idx = (rng or np.random.default_rng(0)).choice(ys.size, max_points, replace=False)
+        idx = np.random.default_rng(seed).choice(ys.size, max_points, replace=False)
         ys, xs = ys[idx], xs[idx]
 
     # 법선 = gradient 방향
@@ -191,7 +191,6 @@ def main():
     ap.add_argument("--dump", default=None, help="결과 json 경로")
     args = ap.parse_args()
 
-    rng = np.random.default_rng(0)
     rows = []
     for d in args.dir:
         files = list_images(d, args.n)
@@ -200,8 +199,12 @@ def main():
             im = cv2.imread(f, cv2.IMREAD_COLOR)
             if im is None:
                 continue
+            # ★ 시드를 파일명으로 고정한다(2026-08-07 버그 수정).
+            #   전에는 rng 를 폴더 간에 공유해서, 앞에 폴더를 몇 개 놓느냐에 따라
+            #   같은 폴더가 3.0% / 3.7% 로 다르게 나왔다. 순위는 안 바뀌지만 재현이 안 된다.
+            seed = zlib.crc32(Path(f).stem.encode())   # hash()는 프로세스마다 달라진다
             rise += rise_distances(im, args.radius, 0.25, args.grad_pct,
-                                   args.min_delta, rng=rng)
+                                   args.min_delta, seed=seed)
             m = midband_fraction(im)
             if not np.isnan(m):
                 mid.append(m)

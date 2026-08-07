@@ -766,6 +766,12 @@ def main():
                     help="샘플 저장 시 validation L1을 계산할 최대 페어 수")
     ap.add_argument("--aug-mix", default=None, dest="aug_mix",
                     help="샘플별 증강 혼합. 예: 0:0.7,1:0.2,2:0.1")
+    ap.add_argument("--w-adv-soft", type=float, default=0.0, dest="w_adv_soft",
+                    help="소프트 램프 네거티브 가중치. 블러한 타겟을 판별자에 '가짜'로 추가한다. "
+                         "경계 폭만 다른 두 클래스라 판별자가 폭 판정기를 만든다. 시작값 0.5")
+    ap.add_argument("--soft-sigma", type=float, default=2.0, dest="soft_sigma",
+                    help="네거티브를 만들 가우시안 sigma(px @512). 3을 넘기지 말 것 — "
+                         "'진짜' 클래스에 halo 가 섞여 생성자가 오버슈트를 배운다")
     ap.add_argument("--part-mask-dir", default=None, dest="part_mask_dir",
                     help="run/build_part_masks.py 로 구운 부위 경계 마스크 폴더")
     ap.add_argument("--w-edge-part", type=float, default=0.0, dest="w_edge_part",
@@ -1139,14 +1145,73 @@ def main():
                              equiv=float(equiv.detach()), flat=float(flat.detach()),
                              idl=float(idl.detach()))
 
+    def soft_ramp(x, sigma):
+        """타겟의 **명암 경계만** 완만하게 만든 사본. 가우시안 블러.
+
+        색·구도·선 개수·신원은 그대로고 경계 폭만 달라진다. 그게 핵심이다.
+        """
+        radius = max(1, int(round(3 * sigma)))
+        k = 2 * radius + 1
+        t = torch.arange(k, device=x.device, dtype=x.dtype) - radius
+        g = torch.exp(-(t ** 2) / (2 * sigma * sigma))
+        g = (g / g.sum()).view(1, 1, 1, k)
+        c = x.shape[1]
+        y = F.conv2d(F.pad(x, (radius, radius, 0, 0), mode="reflect"),
+                     g.repeat(c, 1, 1, 1), groups=c)
+        y = F.conv2d(F.pad(y, (0, 0, radius, radius), mode="reflect"),
+                     g.transpose(2, 3).repeat(c, 1, 1, 1), groups=c)
+        return y
+
     def d_loss(inp, tgt):
+        """LSGAN 판별자 손실. --w-adv-soft 가 켜지면 **소프트 램프 네거티브**가 추가된다.
+
+        ■ 왜 필요한가 (2026-08-07)
+          요구는 "명암 경계가 계단처럼 딱 끊겼으면"인데, 학생 계단 비율이 3.7% 이고
+          teacher 는 9.2% 다(run/transition_width.py). **천장까지 2.5배 여유가 있다.**
+
+          그런데 학생 쪽 손실을 손으로 설계한 시도가 세 번 모두 실패했다.
+            w_edge 3→5      ❌ 잔선만 늘었다
+            w_flat 2.0      ❌ 전 지표 악화. 없는 문제를 고치려 했다
+            부위 게이트 edge ❌ 계단 3.7%→2.0%. 선은 더 그렸는데 더 부드럽게 그렸다
+
+          마지막 것이 원인을 알려줬다. **Sobel L1 은 폭에 눈이 멀었다.**
+          12px 완만한 경사와 1px 계단의 총 gradient 크기가 같으면 손실이 같다.
+          위치를 좁혀도(부위 게이트) 폭에 눈먼 손실은 여전히 폭에 눈이 멀었다.
+          지표에서 이미 발견한 맹점을 손실에서 그대로 반복한 것이다.
+
+        ■ 그래서 기준을 손으로 쓰지 않고 판별자에게 배우게 한다
+          CartoonGAN(CVPR 2018)의 edge-promoting 을 **선 대신 명암 경계로** 옮긴다.
+          원 논문은 윤곽선을 뭉갠 만화 이미지를 판별자에 '가짜'로 넣어 선을 얻었다.
+
+              L_D = (D(y)-1)^2 + D(G(x))^2 + w_soft * D(blur(y))^2
+                                             └── 진짜인데 가짜로 라벨링
+
+          `y` 와 `blur(y)` 는 팔레트·구도·선 개수·신원이 **전부 같고 경계 폭만 다르다.**
+          판별자가 볼 수 있는 단서가 그것뿐이므로 **폭 판정기를 만들 수밖에 없고**,
+          생성자 기울기가 정확히 그 축을 가리킨다.
+          생성자 손실은 건드리지 않는다 — 판별자가 보는 대상만 좁히는 것이다.
+
+        ■ --w-adv 를 올리는 것과 무엇이 다른가
+          그것은 **모든** GAN 압력을 키운다. 구조보다 아티팩트가 먼저 온다.
+          이쪽은 압력의 크기가 아니라 **방향**을 바꾼다.
+
+        ■ 주의
+          sigma 를 키우면 '진짜' 클래스에 오버슈트·halo 가 포함돼 생성자가 그것을 배운다.
+          sigma <= 3, w_soft <= 1.0 을 지킬 것.
+        """
         with amp_context():
             fake = G(inp).detach()
             if args.conditional_gan:
                 dr, df = D(torch.cat([inp, tgt], 1)), D(torch.cat([inp, fake], 1))
             else:
                 dr, df = D(tgt), D(fake)                  # 진짜 애니 target →1, 생성물 →0
-            return 0.5 * (F.mse_loss(dr, torch.ones_like(dr)) + F.mse_loss(df, torch.zeros_like(df)))
+            loss = 0.5 * (F.mse_loss(dr, torch.ones_like(dr))
+                          + F.mse_loss(df, torch.zeros_like(df)))
+            if args.w_adv_soft > 0:
+                soft = soft_ramp(tgt, args.soft_sigma)
+                ds = D(torch.cat([inp, soft], 1)) if args.conditional_gan else D(soft)
+                loss = loss + args.w_adv_soft * F.mse_loss(ds, torch.zeros_like(ds))
+            return loss
 
     if args.smoke:
         print(f"[smoke] dev={dev} size={args.size}")
