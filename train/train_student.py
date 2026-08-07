@@ -544,7 +544,7 @@ def manifest_face_mask(record, output_size):
 
 class PairImgs(Dataset):
     def __init__(self, root, size, aug=False, aug_level=0, pairs=None, aug_mix=None, seed=0,
-                 beauty_p=None,
+                 beauty_p=None, part_dir=None,
                  load_masks=False, localize_manifest=None):
         din, dtg = os.path.join(root, "input"), os.path.join(root, "target")
         self.pairs = list(pairs) if pairs is not None else discover_pairs(din, dtg)
@@ -555,6 +555,7 @@ class PairImgs(Dataset):
         self.level = aug_level if aug_level > 0 else (1 if aug else 0)
         self.aug_mix = aug_mix
         self.beauty_p = beauty_p
+        self.part_dir = part_dir
         self.seed = seed
         self.rng = None
         self.load_masks = load_masks
@@ -618,6 +619,17 @@ class PairImgs(Dataset):
         if mask is not None and mask.shape[:2] != a.shape[:2]:
             mask = cv2.resize(mask, (a.shape[1], a.shape[0]), interpolation=cv2.INTER_LINEAR)
 
+        pmask = None
+        if self.part_dir:
+            ppath = os.path.join(self.part_dir, f"{pair.stem}.png")
+            if not os.path.isfile(ppath):
+                raise SystemExit(f"part mask missing: {ppath}  (run/build_part_masks.py 먼저)")
+            pmask = cv2.imread(ppath, cv2.IMREAD_GRAYSCALE)
+            if pmask is None:
+                raise SystemExit(f"part mask unreadable: {ppath}")
+            if pmask.shape[:2] != a.shape[:2]:
+                pmask = cv2.resize(pmask, (a.shape[1], a.shape[0]), interpolation=cv2.INTER_LINEAR)
+
         if self.rng is None:
             worker = get_worker_info()
             worker_seed = worker.seed if worker is not None else self.seed
@@ -633,6 +645,8 @@ class PairImgs(Dataset):
                 a, b = a[:, ::-1], b[:, ::-1]
                 if mask is not None:
                     mask = mask[:, ::-1]
+                if pmask is not None:
+                    pmask = pmask[:, ::-1]
             if level >= 2 and rng.random() < 0.7:
                 # 런타임은 expand 0.15 박스를 종횡비 무시하고 정사각으로 눌러 넣는다.
                 # → 타이트 크롭 + 종횡비 왜곡 재현. 반드시 양쪽에 같이.
@@ -644,20 +658,30 @@ class PairImgs(Dataset):
                 a = a[y0:y0 + th, x0:x0 + tw]; b = b[y0:y0 + th, x0:x0 + tw]
                 if mask is not None:
                     mask = mask[y0:y0 + th, x0:x0 + tw]
+                if pmask is not None:
+                    pmask = pmask[y0:y0 + th, x0:x0 + tw]
 
         a = cv2.resize(np.ascontiguousarray(a), (self.size, self.size), interpolation=cv2.INTER_AREA)
         b = cv2.resize(np.ascontiguousarray(b), (self.size, self.size), interpolation=cv2.INTER_AREA)
         if mask is not None:
             mask = cv2.resize(np.ascontiguousarray(mask), (self.size, self.size), interpolation=cv2.INTER_LINEAR)
+        if pmask is not None:
+            pmask = cv2.resize(np.ascontiguousarray(pmask), (self.size, self.size), interpolation=cv2.INTER_LINEAR)
 
         if level >= 1:
             a = _degrade(a, level, rng, self.size, self.beauty_p)   # ★ input에만
 
         ta = torch.from_numpy(cv2.cvtColor(a, cv2.COLOR_BGR2RGB).copy()).permute(2, 0, 1).float() / 127.5 - 1
         tb = torch.from_numpy(cv2.cvtColor(b, cv2.COLOR_BGR2RGB).copy()).permute(2, 0, 1).float() / 127.5 - 1
-        if mask is None:
+        tm = (torch.from_numpy(mask.copy()).unsqueeze(0).float() / 255.0
+              if mask is not None else None)
+        if pmask is not None:
+            tp = torch.from_numpy(pmask.copy()).unsqueeze(0).float() / 255.0
+            # face_mask 자리가 비면 1로 채운다. face_mask_weight=1.0 이면 가중 L1 이
+            # 평균 L1 과 수치적으로 동일하므로 기존 동작이 바뀌지 않는다.
+            return ta, tb, (tm if tm is not None else torch.ones_like(tp)), tp
+        if tm is None:
             return ta, tb
-        tm = torch.from_numpy(mask.copy()).unsqueeze(0).float() / 255.0
         return ta, tb, tm
 
 
@@ -742,6 +766,10 @@ def main():
                     help="샘플 저장 시 validation L1을 계산할 최대 페어 수")
     ap.add_argument("--aug-mix", default=None, dest="aug_mix",
                     help="샘플별 증강 혼합. 예: 0:0.7,1:0.2,2:0.1")
+    ap.add_argument("--part-mask-dir", default=None, dest="part_mask_dir",
+                    help="run/build_part_masks.py 로 구운 부위 경계 마스크 폴더")
+    ap.add_argument("--w-edge-part", type=float, default=0.0, dest="w_edge_part",
+                    help="부위 경계(코·턱선·눈·눈썹·입술)에서만 걸리는 edge 손실. 시작값 3~6")
     ap.add_argument("--beauty-p", type=float, default=None, dest="beauty_p",
                     help="뷰티필터(bilateral) 열화 확률만 따로 지정. 미지정=level별 기본(0.20/0.35). "
                          "실적용률 = P(level>=1) x beauty_p")
@@ -950,6 +978,40 @@ def main():
             return multiscale_sobel_loss(fake, tgt)
         return difference_edge_loss(fake, tgt)
 
+    def part_edge_loss(fake, tgt, pm):
+        """**부위 경계 위에서만** 걸리는 sobel L1 (코·턱선·눈·눈썹·입술).
+
+        ■ 왜 w_edge 를 올리는 대신 이것인가 (2026-08-07)
+          증상은 "흐리다"가 아니라 **누락**이다 — 코가 통째로 사라진다.
+          edge_density 가 teacher 의 0.85 인데 그 부족분이 균등하게 빠지지 않고
+          **위치가 가장 불확실한 특징부터** 빠진다. 정면 얼굴에서 코가 정확히 그것이다.
+          L1 은 위치가 애매한 선을 **안 그리는 쪽**이 최적이다.
+
+          기존 Sobel 손실은 화면 전체를 균등하게 본다. 화소 수는 작은 gradient 쪽이
+          압도적이라 가중치를 올리면 굵은 선이 아니라 **잔선**이 는다
+          (w_edge 3.0→5.0: 밀도 10.74%→11.36%, 대비 181.0→179.2, 육안 "지저분해").
+
+          부위 경계로 국한하면 그 이득 경로가 막힌다. 잔선을 늘려서는 손실이 줄지 않고
+          **사라지는 특징을 그려야만** 줄어든다.
+
+        ■ 정규화
+          마스크 합으로 나눈다. 그래야 마스크 면적이 변해도 가중치의 의미가 유지된다.
+        """
+        losses = []
+        for scale in (1, 2, 4):
+            if scale > 1:
+                f = F.avg_pool2d(fake, scale, scale)
+                t = F.avg_pool2d(tgt, scale, scale)
+                w = F.avg_pool2d(pm, scale, scale)
+            else:
+                f, t, w = fake, tgt, pm
+            fdx, fdy = sobel_edges(f)
+            tdx, tdy = sobel_edges(t)
+            denom = w.sum() * f.shape[1] + 1e-6
+            losses.append(0.5 * (((fdx - tdx).abs() * w).sum()
+                                 + ((fdy - tdy).abs() * w).sum()) / denom)
+        return sum(losses) / len(losses)
+
     def flatness_loss(fake, tgt):
         """타겟이 평탄한 곳에서만 출력의 gradient 를 벌한다.
 
@@ -983,7 +1045,7 @@ def main():
         for parameter in model.parameters():
             parameter.requires_grad_(enabled)
 
-    def g_losses(inp, tgt, w_adv_eff, face_mask=None):
+    def g_losses(inp, tgt, w_adv_eff, face_mask=None, part_mask=None):
         with amp_context():
             fake = G(inp)
             if face_mask is not None:
@@ -997,6 +1059,11 @@ def main():
                 perc = perceptual_loss(fake, tgt)        # 다층 perceptual
             edge = edge_loss(perceptual_fake if face_mask is not None else fake, tgt)
             g = args.w_l1 * l1 + args.w_perc * perc + args.w_edge * edge
+            edge_part = torch.tensor(0.0, device=dev)
+            if part_mask is not None and args.w_edge_part > 0:
+                edge_part = part_edge_loss(
+                    perceptual_fake if face_mask is not None else fake, tgt, part_mask)
+                g = g + args.w_edge_part * edge_part
             adv = torch.tensor(0.0, device=dev)
             fm = torch.tensor(0.0, device=dev)
             if w_adv_eff > 0:
@@ -1044,6 +1111,7 @@ def main():
                 idl = F.relu(cos - args.id_margin).mean()
                 g = g + args.id_loss * idl
         return fake, g, dict(l1=l1.item(), perc=perc.item(), edge=edge.item(),
+                             edge_part=float(edge_part.detach()),
                              adv=float(adv.detach()), fm=float(fm.detach()),
                              equiv=float(equiv.detach()), flat=float(flat.detach()),
                              idl=float(idl.detach()))
@@ -1115,7 +1183,7 @@ def main():
     use_face_masks = args.face_mask_weight > 1
     ds = PairImgs(
         args.data, args.size, args.aug, args.aug_level, train_pairs, aug_mix, args.seed,
-        args.beauty_p,
+        args.beauty_p, args.part_mask_dir,
         load_masks=use_face_masks, localize_manifest=args.localize_manifest,
     )
     val_ds = (
@@ -1131,13 +1199,14 @@ def main():
         pin_memory=(dev == "cuda"), persistent_workers=(args.workers > 0), generator=generator,
     ))
     print(f"[data] train={len(ds)} val={len(val_ds) if val_ds else 0} "
-          f"aug_mix={aug_mix} beauty_p={args.beauty_p} "
+          f"aug_mix={aug_mix} beauty_p={args.beauty_p} part_masks={args.part_mask_dir or 'none'} "
           f"face_mask_weight={args.face_mask_weight:g} "
           f"localize_manifest={args.localize_manifest or 'none'}")
     # ★ 손실 가중치를 반드시 로그에 남긴다.
     #   base 가 w_edge=0 인 줄 모르고 30,000스텝을 돌린 사고(2026-08-04)의 재발 방지.
     print(f"[loss] w_l1={args.w_l1:g} w_perc={args.w_perc:g} w_adv={args.w_adv:g} "
-          f"w_edge={args.w_edge:g}({args.edge_mode}) w_equiv={args.w_equiv:g} "
+          f"w_edge={args.w_edge:g}({args.edge_mode}) w_edge_part={args.w_edge_part:g} "
+          f"w_equiv={args.w_equiv:g} "
           f"w_fm={args.w_fm:g} w_tv={args.w_tv:g} w_flat={args.w_flat:g} id_loss={args.id_loss:g}")
     print(f"[model] gen_arch={args.gen_arch} gen_ch={args.gen_ch} "
           f"params={sum(p.numel() for p in G.parameters())/1e6:.2f}M")
@@ -1174,7 +1243,7 @@ def main():
                     with amp_context():
                         vf = G(va).clamp(-1, 1)
                     losses.extend(F.l1_loss(vf, vt, reduction="none").mean((1, 2, 3)).cpu().tolist())
-                    if len(batch[0]) == 3:
+                    if len(batch[0]) >= 3:
                         vm = torch.stack([item[2] for item in batch]).to(dev)
                         face_error = ((vf - vt).abs() * vm).sum((1, 2, 3))
                         face_norm = vm.sum((1, 2, 3)).clamp_min(1.0) * vf.shape[1]
@@ -1188,11 +1257,14 @@ def main():
     for step in range(start_step + 1, args.steps + 1):
         train_batch = next(loader)
         inp, tgt = train_batch[:2]
-        face_mask = train_batch[2] if len(train_batch) == 3 else None
+        face_mask = train_batch[2] if len(train_batch) >= 3 else None
+        part_mask = train_batch[3] if len(train_batch) == 4 else None
         inp = inp.to(dev, non_blocking=True)
         tgt = tgt.to(dev, non_blocking=True)
         if face_mask is not None:
             face_mask = face_mask.to(dev, non_blocking=True)
+        if part_mask is not None:
+            part_mask = part_mask.to(dev, non_blocking=True)
         w_adv_eff = 0.0 if step <= args.init_steps else args.w_adv * min(1.0, (step - args.init_steps) / max(1, args.adv_ramp))
         if w_adv_eff > 0:
             set_requires_grad(D, True)
@@ -1200,14 +1272,14 @@ def main():
         else:
             dl = torch.tensor(0.0)
         set_requires_grad(D, False)
-        fake, gl, parts = g_losses(inp, tgt, w_adv_eff, face_mask); optG.zero_grad(); gl.backward(); optG.step()
+        fake, gl, parts = g_losses(inp, tgt, w_adv_eff, face_mask, part_mask); optG.zero_grad(); gl.backward(); optG.step()
         set_requires_grad(D, True)
         if step % 100 == 0:
             elapsed = time.perf_counter() - log_time
             steps_per_second = (step - log_step) / max(elapsed, 1e-9)
             print(f"[{step}/{args.steps}] wadv={w_adv_eff:.2f} D={float(dl):.3f} G={gl.item():.3f} "
                   f"l1={parts['l1']:.3f} perc={parts['perc']:.3f} edge={parts['edge']:.3f} "
-                  f"adv={parts['adv']:.2f} fm={parts['fm']:.3f} eqv={parts['equiv']:.4f} "
+                  f"epart={parts['edge_part']:.4f} adv={parts['adv']:.2f} fm={parts['fm']:.3f} eqv={parts['equiv']:.4f} "
                   f"flat={parts['flat']:.4f} "
                   f"id={parts['idl']:.3f} step/s={steps_per_second:.2f}")
             log_time = time.perf_counter()
