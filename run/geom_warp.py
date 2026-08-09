@@ -154,6 +154,9 @@ def main():
     if not files:
         raise SystemExit(f"이미지 없음: {args.in_dir}")
     print(f"[warp] {len(files)}장 · α={args.alpha}")
+    print("  ※ 신원이 안 떨어지면 아래 '제어점 변위' 를 먼저 볼 것.")
+    print("    변위가 얼굴 한 변의 1% 미만이면 워프가 작았던 것이고,")
+    print("    5% 이상인데 신원이 그대로면 이 임베딩에서 기하는 싼 축이 아니다.")
 
     lm, to_mp = build_landmarker(args.model)
 
@@ -186,19 +189,30 @@ def main():
         tag = f"a{int(round(alpha * 100)):02d}"
         outdir = os.path.join(args.out, tag)
         os.makedirs(outdir, exist_ok=True)
+        moved = []
         for i, (f, p) in enumerate(zip(keep, shapes)):
             im = cv2.imread(f, cv2.IMREAD_COLOR)
             m = similarity(p[ANCHOR], ref[ANCHOR])
             inv = cv2.invertAffineTransform(m)
             target = apply_affine(inv, canon)              # 캐노니컬을 이 얼굴의 좌표계로
             q = (1.0 - alpha) * p + alpha * target         # α 만큼 당긴다
+            # ★ 실제 변위를 반드시 기록한다 (2026-08-07).
+            #   신원이 안 떨어졌을 때 "워프가 작아서"인지 "기하가 신원을 안 옮겨서"인지
+            #   이 숫자가 없으면 구분할 수 없다. 첫 판에서 이걸 빼먹어 판정이 막혔다.
+            d = np.linalg.norm(q[CONTROL] - p[CONTROL], axis=1)
+            moved.append((d.mean(), np.median(d), d.max(), im.shape[0]))
             warped = rbf_warp(im, p[CONTROL], q[CONTROL])
             cv2.imwrite(os.path.join(outdir, Path(f).name), warped)
             if args.preview and alpha == args.alpha[-1] and len(previews) < 6:
                 previews.append((cv2.imread(f, cv2.IMREAD_COLOR), warped))
             if (i + 1) % 50 == 0:
                 print(f"  {tag} {i+1}/{len(keep)}")
+        mv = np.array(moved)
+        side = mv[:, 3].mean()
         print(f"[warp] {tag} → {outdir}")
+        print(f"       제어점 변위 px  평균 {mv[:,0].mean():.2f} · 중앙 {mv[:,1].mean():.2f} "
+              f"· 최대 {mv[:,2].mean():.2f}   (얼굴 한 변 {side:.0f}px 기준 "
+              f"평균 {100*mv[:,0].mean()/side:.2f}%)")
 
     if args.preview and previews:
         rows = [np.hstack([cv2.resize(a, (256, 256)), cv2.resize(b, (256, 256))])
