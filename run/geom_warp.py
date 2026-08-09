@@ -144,6 +144,10 @@ def main():
                     help="표준 얼굴 쪽으로 당기는 비율. 반복 지정 가능")
     ap.add_argument("--n", type=int, default=0, help="0=전부")
     ap.add_argument("--model", default="models/face_landmarker.task")
+    ap.add_argument("--shape-swap", action="store_true", dest="shape_swap",
+                    help="평균 얼굴 대신 **다른 사람의 얼굴형**으로 워프한다(진단용). "
+                         "질감·색은 그대로 두고 기하만 최대로 바꾸는 조건. "
+                         "여기서도 신원이 안 떨어지면 이 임베딩에서 기하는 신원을 안 옮긴다")
     ap.add_argument("--preview", default=None, help="상위 6장 비교 시트")
     args = ap.parse_args()
 
@@ -153,7 +157,8 @@ def main():
         files = files[:args.n]
     if not files:
         raise SystemExit(f"이미지 없음: {args.in_dir}")
-    print(f"[warp] {len(files)}장 · α={args.alpha}")
+    mode = "형태 바꿔치기(다른 사람 얼굴형)" if args.shape_swap else "평균 얼굴로 수축"
+    print(f"[warp] {len(files)}장 · α={args.alpha} · 모드={mode}")
     print("  ※ 신원이 안 떨어지면 아래 '제어점 변위' 를 먼저 볼 것.")
     print("    변위가 얼굴 한 변의 1% 미만이면 워프가 작았던 것이고,")
     print("    5% 이상인데 신원이 그대로면 이 임베딩에서 기하는 싼 축이 아니다.")
@@ -192,9 +197,15 @@ def main():
         moved = []
         for i, (f, p) in enumerate(zip(keep, shapes)):
             im = cv2.imread(f, cv2.IMREAD_COLOR)
-            m = similarity(p[ANCHOR], ref[ANCHOR])
-            inv = cv2.invertAffineTransform(m)
-            target = apply_affine(inv, canon)              # 캐노니컬을 이 얼굴의 좌표계로
+            if args.shape_swap:
+                # 다음 사람의 얼굴형을 이 얼굴의 위치·크기·기울기에 맞춰 가져온다.
+                # 개인 고유 기하를 '평균으로 줄이는' 게 아니라 '남의 것으로 갈아끼우는' 조건.
+                o = shapes[(i + 1) % len(shapes)]
+                target = apply_affine(similarity(o[ANCHOR], p[ANCHOR]), o)
+            else:
+                m = similarity(p[ANCHOR], ref[ANCHOR])
+                inv = cv2.invertAffineTransform(m)
+                target = apply_affine(inv, canon)          # 캐노니컬을 이 얼굴의 좌표계로
             q = (1.0 - alpha) * p + alpha * target         # α 만큼 당긴다
             # ★ 실제 변위를 반드시 기록한다 (2026-08-07).
             #   신원이 안 떨어졌을 때 "워프가 작아서"인지 "기하가 신원을 안 옮겨서"인지
