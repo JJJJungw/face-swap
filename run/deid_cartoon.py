@@ -868,7 +868,16 @@ def main():
         ok, frame = cap.read()
         if not ok: break
         if unsqueeze:
-            frame = cv2.resize(frame, (W, H), interpolation=cv2.INTER_LANCZOS4)
+            # ■ 속도 (2026-08-10)
+            #   여기서 LANCZOS4(8x8 커널)를 쓰고 있었다. 100만 화소 x 3채널에 매 프레임.
+            #   swap12 에서 프레임당 43.3ms 중 측정된 합이 25.0ms 뿐이라 18ms 가 비었는데
+            #   그게 이 한 줄이었다. **프로파일러 바깥이라 안 잡혔다.**
+            #   크롭 리사이즈의 LANCZOS 낭비는 고쳐놓고 전체 프레임에는 그대로 쓰고 있었다.
+            _p = time.perf_counter()
+            frame = cv2.resize(frame, (W, H), interpolation=cv2.INTER_AREA
+                               if (W * H) < (frame.shape[1] * frame.shape[0])
+                               else cv2.INTER_LINEAR)
+            _t("unsqueeze", _p)
         i += 1
         a = time.perf_counter()
         raw = frame.copy() if args.input_temporal > 0 else None
