@@ -365,7 +365,65 @@ def id_embed(m, x):
 #   - 기하 변환(반전/크롭/종횡비)은 input·target **양쪽에** → 페어 정합 유지
 #   - 열화(블러·축소·노이즈·JPEG·색)는 **input에만** → target은 정답이라 깨끗해야 한다.
 #     그래야 "작고 더러운 사진 → 크고 깨끗한 카툰" 매핑을 배운다(복원+스타일화 동시).
-def _degrade(img, level, rng, size, beauty_p=None):
+_GRID = {}
+
+
+def _dir_grid(h, w, ang):
+    """각도 ang 방향의 -0.7~0.7 그라디언트. 좌표 그리드는 크기별로 캐시한다."""
+    key = (h, w)
+    if key not in _GRID:
+        yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+        _GRID[key] = (xx / max(w, 1) - 0.5, yy / max(h, 1) - 0.5)
+    gx, gy = _GRID[key]
+    return math.cos(ang) * gx + math.sin(ang) * gy
+
+
+def _stage_light(img, rng, strength_max=0.85):
+    """[input 전용] 촬영 조명을 흉내 낸다 — 방향성 키라이트 · 하드 그림자 · 저조도 · 리림.
+
+    ■ 왜 필요한가 (2026-08-10)
+      드라마 영상(swap13)에서 얼굴이 회백색으로 뜨고 이목구비가 무너졌다.
+      원인은 **코퍼스에 방향성 조명이 아예 없다**는 것이다.
+      SFHQ 는 전부 균일한 스튜디오 조명이고, 기존 증강의 노출 범위는
+      감마 0.7~1.4 · 밝기 ±0.08 로 너무 좁다.
+
+      그리고 감마를 낮추는 것으로는 부족하다. 그건 얼굴을 **균일하게** 어둡게 만들 뿐이다.
+      실제 촬영 조명의 특징은 어두움이 아니라 **방향성**이다 —
+      얼굴 절반에 그림자가 지고, 역광이 윤곽을 긋고, 창문 그림자가 하드한 경계를 만든다.
+
+      포즈와 달리 조명은 **합성으로 흉내 낼 수 있다.** 그래서 teacher 굽기 예산(10.5시간)은
+      포즈에 쓰고 조명은 여기서 만든다.
+    """
+    f = img.astype(np.float32) / 255.0
+    h, w = f.shape[:2]
+    d = _dir_grid(h, w, rng.uniform(0, 2 * math.pi))
+
+    # ① 방향성 키라이트 — 한쪽은 밝고 반대쪽은 어둡다
+    ramp = 1.0 + rng.uniform(0.25, strength_max) * (d / 0.7)
+
+    # ② 하드 그림자 경계 (창틀·벽 모서리). soft 가 작을수록 칼같은 경계
+    if rng.random() < 0.35:
+        edge = rng.uniform(-0.25, 0.25)
+        soft = rng.uniform(0.02, 0.18)
+        m = 1.0 / (1.0 + np.exp(-(d - edge) / soft))
+        ramp = ramp * (1.0 - rng.uniform(0.30, 0.75) * (1.0 - m))
+    f *= ramp[:, :, None]
+
+    # ③ 저조도 + 블랙 리프트(필름·야간 장면의 들린 검정)
+    if rng.random() < 0.5:
+        f *= rng.uniform(0.25, 0.75)
+        f += rng.uniform(0.0, 0.06)
+
+    # ④ 리림라이트 — 가장자리만 밝게, 색조 포함
+    if rng.random() < 0.30:
+        rim = np.clip((np.abs(d) - 0.45) / 0.25, 0, 1)[:, :, None]
+        tint = rng.uniform(0.9, 1.5, size=(1, 1, 3)).astype(np.float32)
+        f = f + rim * rng.uniform(0.15, 0.5) * tint
+
+    return np.clip(f * 255.0, 0, 255).astype(np.uint8)
+
+
+def _degrade(img, level, rng, size, beauty_p=None, light_p=None):
     """input 전용 열화. 실제 촬영·방송 체인 순서를 따른다.
 
         플래시/하이라이트 → 뷰티 필터 → 블러 → 축소 → 노이즈 → 압축 → 재확대
@@ -395,6 +453,18 @@ def _degrade(img, level, rng, size, beauty_p=None):
       **--aug-mix 로 대부분을 깨끗하게 두고 일부만 열화시킨다.**
     """
     h, w = img.shape[:2]
+
+    # ⓪-a 촬영 조명 — 광학 단계의 맨 앞. 방향성 키라이트·하드 그림자·저조도·리림
+    p_light = 0.0 if light_p is None else float(light_p)
+    if level >= 1 and p_light > 0 and rng.random() < p_light:
+        img = _stage_light(img, rng)
+
+    # ⓪-a2 필름 그레인 — 휘도 위주(채널 공통)라 컬러 노이즈와 다르다.
+    #      드라마·필름 룩 전반에 깔려 있고, 어두운 장면일수록 두드러진다.
+    #      기존 노이즈는 level>=3 에서만, 채널 독립이라 이 상황을 재현하지 못했다.
+    if level >= 1 and rng.random() < 0.35:
+        g = rng.normal(0.0, rng.uniform(2.0, 9.0), (h, w, 1)).astype(np.float32)
+        img = np.clip(img.astype(np.float32) + g, 0, 255).astype(np.uint8)
 
     # ⓪ 플래시 / 하이라이트 클리핑 — 광학 단계라 가장 먼저
     if level >= 2 and rng.random() < 0.15:
@@ -544,7 +614,7 @@ def manifest_face_mask(record, output_size):
 
 class PairImgs(Dataset):
     def __init__(self, root, size, aug=False, aug_level=0, pairs=None, aug_mix=None, seed=0,
-                 beauty_p=None, part_dir=None,
+                 beauty_p=None, light_p=None, part_dir=None,
                  load_masks=False, localize_manifest=None):
         din, dtg = os.path.join(root, "input"), os.path.join(root, "target")
         self.pairs = list(pairs) if pairs is not None else discover_pairs(din, dtg)
@@ -555,6 +625,7 @@ class PairImgs(Dataset):
         self.level = aug_level if aug_level > 0 else (1 if aug else 0)
         self.aug_mix = aug_mix
         self.beauty_p = beauty_p
+        self.light_p = light_p
         self.part_dir = part_dir
         self.seed = seed
         self.rng = None
@@ -669,7 +740,7 @@ class PairImgs(Dataset):
             pmask = cv2.resize(np.ascontiguousarray(pmask), (self.size, self.size), interpolation=cv2.INTER_LINEAR)
 
         if level >= 1:
-            a = _degrade(a, level, rng, self.size, self.beauty_p)   # ★ input에만
+            a = _degrade(a, level, rng, self.size, self.beauty_p, self.light_p)   # ★ input에만
 
         ta = torch.from_numpy(cv2.cvtColor(a, cv2.COLOR_BGR2RGB).copy()).permute(2, 0, 1).float() / 127.5 - 1
         tb = torch.from_numpy(cv2.cvtColor(b, cv2.COLOR_BGR2RGB).copy()).permute(2, 0, 1).float() / 127.5 - 1
@@ -779,6 +850,10 @@ def main():
     ap.add_argument("--part-gate-thresh", type=float, default=0.06, dest="part_gate_thresh",
                     help="타겟 gradient 게이트([-1,1] 스케일). teacher가 안 그린 자리는 부위 손실 0. "
                          "0=게이트 끔(가려진 입·눈에 선을 그리라고 시키게 되므로 권장 안 함)")
+    ap.add_argument("--light-p", type=float, default=None, dest="light_p",
+                    help="촬영 조명 열화 확률(방향성 키라이트·하드 그림자·저조도·리림). "
+                         "코퍼스는 전부 균일한 스튜디오 조명이라 이게 없으면 야간 장면에서 무너진다. "
+                         "시작값 0.6")
     ap.add_argument("--beauty-p", type=float, default=None, dest="beauty_p",
                     help="뷰티필터(bilateral) 열화 확률만 따로 지정. 미지정=level별 기본(0.20/0.35). "
                          "실적용률 = P(level>=1) x beauty_p")
@@ -1271,7 +1346,7 @@ def main():
     use_face_masks = args.face_mask_weight > 1
     ds = PairImgs(
         args.data, args.size, args.aug, args.aug_level, train_pairs, aug_mix, args.seed,
-        args.beauty_p, args.part_mask_dir,
+        args.beauty_p, args.light_p, args.part_mask_dir,
         load_masks=use_face_masks, localize_manifest=args.localize_manifest,
     )
     val_ds = (
@@ -1287,7 +1362,7 @@ def main():
         pin_memory=(dev == "cuda"), persistent_workers=(args.workers > 0), generator=generator,
     ))
     print(f"[data] train={len(ds)} val={len(val_ds) if val_ds else 0} "
-          f"aug_mix={aug_mix} beauty_p={args.beauty_p} part_masks={args.part_mask_dir or 'none'} "
+          f"aug_mix={aug_mix} beauty_p={args.beauty_p} light_p={args.light_p} part_masks={args.part_mask_dir or 'none'} "
           f"face_mask_weight={args.face_mask_weight:g} "
           f"localize_manifest={args.localize_manifest or 'none'}")
     # ★ 손실 가중치를 반드시 로그에 남긴다.
