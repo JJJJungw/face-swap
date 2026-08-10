@@ -600,12 +600,21 @@ def composite(frame, boxes, stylizer, cartoon_min, blur_mode="pixelate", expand=
             _raw = stylizer.stylize(gan_in)
             _t("gan", _p)
             _p = time.perf_counter()
-            # 배율이 1.0 근처(GAN 512 → 크롭 530 등)면 LANCZOS4 는 낭비다.
-            # 8x8 커널이라 INTER_LINEAR 보다 5~8배 비싼데 이 배율에서 화질 차이가 없다.
+            # GAN 은 512 고정 출력이고 크롭 크기는 영상마다 다르다(swap2 ~530, swap10 ~700).
+            # LANCZOS4 는 8x8 커널이라 비싸다. 배율에 따라 필요한 만큼만 쓴다.
+            #   ~1.0  선형이면 충분 (표본 위치가 거의 그대로)
+            #   ~2.5  큐빅(4x4). LANCZOS4 대비 절반 이하 비용에 차이가 거의 없다
+            #   그 이상만 LANCZOS4
+            # ※ 처음엔 창을 [0.85, 1.20] 으로 잡았는데 swap10(배율 1.4)이 창 밖이라
+            #   최적화가 통째로 안 먹었다. 크롭 크기를 확인하지 않고 창을 정한 탓이다.
             _sc = (cx2 - cx1) / max(1, _raw.shape[1])
-            styl = cv2.resize(_raw, (cx2-cx1, cy2-cy1),
-                              interpolation=(cv2.INTER_LINEAR if 0.85 <= _sc <= 1.20
-                                             else cv2.INTER_LANCZOS4))
+            _interp = (cv2.INTER_LINEAR if 0.85 <= _sc <= 1.15
+                       else cv2.INTER_CUBIC if _sc <= 2.5
+                       else cv2.INTER_LANCZOS4)
+            styl = cv2.resize(_raw, (cx2-cx1, cy2-cy1), interpolation=_interp)
+            if PROF_ON:
+                PROF["_crop_side_sum"] = PROF.get("_crop_side_sum", 0.0) + (cx2 - cx1)
+                PROF["_crop_n"] = PROF.get("_crop_n", 0.0) + 1
             _t("resize", _p)
             styl = sharpen_crop(styl, sharpen)
             _p = time.perf_counter()
@@ -901,10 +910,16 @@ def main():
           f"(그중 GAN {ms(t_styl):.1f}, CPU합성 {ms(t_comp_cpu):.1f}) | 인코딩write {ms(t_write):.1f}")
     print(f"GAN 호출 {styl.n}회, 호출당 {1000*styl.t/max(styl.n,1):.1f}ms")
     if PROF_ON and PROF:
+        side_sum = PROF.pop("_crop_side_sum", 0.0)
+        side_n = PROF.pop("_crop_n", 0.0)
         total = sum(PROF.values())
         print("\n합성 내부 단계별 (프레임당 ms)")
         for k, v in sorted(PROF.items(), key=lambda x: -x[1]):
             print(f"  {k:<20}{v/max(i,1):8.2f}ms{100*v/max(total,1e-9):7.1f}%")
+        if side_n:
+            side = side_sum / side_n
+            print(f"  ※ 크롭 한 변 평균 {side:.0f}px (GAN 512 대비 배율 {side/512:.2f}x)"
+                  f" — CPU 비용은 면적에 비례한다")
 
 if __name__ == "__main__":
     main()
