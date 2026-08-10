@@ -339,17 +339,34 @@ def color_from_input(styl, ref, mix=1.0, align_sigma=3.0,
     """
     if mix <= 0 and luma_match <= 0:
         return styl
-    s = cv2.cvtColor(styl, cv2.COLOR_BGR2LAB).astype(np.float32)
-    r = cv2.cvtColor(ref, cv2.COLOR_BGR2LAB).astype(np.float32)
+
+    # ■ 속도 (2026-08-10)
+    #   이 함수 하나가 프레임당 16.9ms 로 CPU 합성의 절반이었다. 낭비가 셋이었다.
+    #     ① 전체 이미지를 float32 로 두 번 변환 — L 채널만 실수 연산이 필요한데
+    #        530x530x3 배열 두 개(3.4MB x2)를 통째로 올리고 있었다
+    #     ② 크로마 블러가 float32 + **비연속 슬라이스**(r[:,:,1:]) — OpenCV 가 복사부터 한다
+    #     ③ mix=1.0 인데 s*(1-1) + r*1 을 계산 — 그냥 대입이면 된다
+    #   아래는 셋을 없앤 것이고, 결과는 uint8 반올림 오차(±1) 범위에서 동일하다.
+    s = cv2.cvtColor(styl, cv2.COLOR_BGR2LAB)          # uint8 유지
+    r = cv2.cvtColor(ref, cv2.COLOR_BGR2LAB)
+
     if luma_match > 0:
         sigma = max(1.0, luma_sigma * min(s.shape[0], s.shape[1]))
-        s[:, :, 0] += luma_match * (lowpass(r[:, :, 0], sigma)
-                                    - lowpass(s[:, :, 0], sigma))
+        sl = s[:, :, 0].astype(np.float32)             # L 채널만 float
+        rl = r[:, :, 0].astype(np.float32)
+        sl += luma_match * (lowpass(rl, sigma) - lowpass(sl, sigma))
+        s[:, :, 0] = np.clip(sl, 0, 255).astype(np.uint8)
+
     if mix > 0:
+        rc = np.ascontiguousarray(r[:, :, 1:])          # 연속으로 만든 뒤 uint8 블러
         if align_sigma > 0:
-            r[:, :, 1:] = cv2.GaussianBlur(r[:, :, 1:], (0, 0), align_sigma)
-        s[:, :, 1:] = s[:, :, 1:] * (1.0 - mix) + r[:, :, 1:] * mix
-    return cv2.cvtColor(np.clip(s, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
+            rc = cv2.GaussianBlur(rc, (0, 0), align_sigma)
+        if mix >= 0.999:
+            s[:, :, 1:] = rc                            # 전량 교체 = 대입
+        else:
+            s[:, :, 1:] = cv2.addWeighted(
+                np.ascontiguousarray(s[:, :, 1:]), 1.0 - mix, rc, mix, 0.0)
+    return cv2.cvtColor(s, cv2.COLOR_LAB2BGR)
 
 
 def darken_lines(image, strength, sigma=1.0, ds=4):
@@ -583,7 +600,12 @@ def composite(frame, boxes, stylizer, cartoon_min, blur_mode="pixelate", expand=
             _raw = stylizer.stylize(gan_in)
             _t("gan", _p)
             _p = time.perf_counter()
-            styl = cv2.resize(_raw, (cx2-cx1, cy2-cy1), interpolation=cv2.INTER_LANCZOS4)
+            # 배율이 1.0 근처(GAN 512 → 크롭 530 등)면 LANCZOS4 는 낭비다.
+            # 8x8 커널이라 INTER_LINEAR 보다 5~8배 비싼데 이 배율에서 화질 차이가 없다.
+            _sc = (cx2 - cx1) / max(1, _raw.shape[1])
+            styl = cv2.resize(_raw, (cx2-cx1, cy2-cy1),
+                              interpolation=(cv2.INTER_LINEAR if 0.85 <= _sc <= 1.20
+                                             else cv2.INTER_LANCZOS4))
             _t("resize", _p)
             styl = sharpen_crop(styl, sharpen)
             _p = time.perf_counter()
@@ -643,8 +665,10 @@ def composite(frame, boxes, stylizer, cartoon_min, blur_mode="pixelate", expand=
             # 얼굴이 빠르게 움직이면 잔상이 생기므로 0.3~0.5 가 실용 범위다.
             proc_roi = temporal * prev_frame[py1:py2, px1:px2].astype(np.float32) \
                        + (1.0 - temporal) * proc_roi
+        # a*(1-m) + b*m  ==  a + (b-a)*m  — 곱셈이 2회에서 1회로 준다
+        _orig_f = original.astype(np.float32)
         frame[py1:py2, px1:px2] = (
-            original*(1-mask_roi) + proc_roi*mask_roi
+            _orig_f + (proc_roi - _orig_f) * mask_roi
         ).astype(np.uint8)
         _t("blend", _p)
     return nc, nb
