@@ -579,8 +579,14 @@ def composite(frame, boxes, stylizer, cartoon_min, blur_mode="pixelate", expand=
                         prev_crop, input_temporal,
                         crop[oy1:oy2, ox1:ox2], 1.0 - input_temporal, 0)
             gan_in = denoise_crop(gan_in, input_denoise)
-            styl = cv2.resize(stylizer.stylize(gan_in), (cx2-cx1, cy2-cy1), interpolation=cv2.INTER_LANCZOS4)
+            _p = time.perf_counter()
+            _raw = stylizer.stylize(gan_in)
+            _t("gan", _p)
+            _p = time.perf_counter()
+            styl = cv2.resize(_raw, (cx2-cx1, cy2-cy1), interpolation=cv2.INTER_LANCZOS4)
+            _t("resize", _p)
             styl = sharpen_crop(styl, sharpen)
+            _p = time.perf_counter()
             if color_mode == "chroma":
                 proc = color_from_input(styl, crop, color_match, color_align,
                                         luma_match, luma_sigma)
@@ -591,12 +597,18 @@ def composite(frame, boxes, stylizer, cartoon_min, blur_mode="pixelate", expand=
                                               mask=color_mask if color_mask.any() else None)
             else:
                 proc = color_transfer(styl, crop, color_match)
+            _t("color", _p)
+            _p = time.perf_counter()
             proc = despeckle(proc, despeckle_strength, despeckle_kernel)
             proc = flatten_skin(proc, flatten)
+            _t("despeckle+flatten", _p)
+            _p = time.perf_counter()
             proc = darken_lines(proc, darken, darken_sigma, darken_ds)
+            _t("darken", _p)
             nc += 1
         else:
             proc = blur_crop(crop, blur_mode); nb += 1
+        _p = time.perf_counter()
         crop_h, crop_w = crop.shape[:2]
         mask = np.zeros((crop_h, crop_w), dtype=np.uint8)
         if mask_mode == "face-ellipse":
@@ -620,6 +632,8 @@ def composite(frame, boxes, stylizer, cartoon_min, blur_mode="pixelate", expand=
             fk = min(151, fk)
         # 페더도 큰 커널이면 비싸다. 저역통과 헬퍼로 동일 효과를 싸게 낸다.
         m = lowpass(mask.astype(np.float32), max(1.0, fk / 3.0)) / 255.0
+        _t("mask", _p)
+        _p = time.perf_counter()
         original = frame[py1:py2, px1:px2]
         proc_roi = proc[oy1:oy2, ox1:ox2].astype(np.float32)
         mask_roi = m[oy1:oy2, ox1:ox2, None]
@@ -632,7 +646,27 @@ def composite(frame, boxes, stylizer, cartoon_min, blur_mode="pixelate", expand=
         frame[py1:py2, px1:px2] = (
             original*(1-mask_roi) + proc_roi*mask_roi
         ).astype(np.uint8)
+        _t("blend", _p)
     return nc, nb
+
+PROF = {}
+PROF_ON = False
+
+
+def _t(name, t0):
+    """합성 내부 단계별 누적 시간(ms). --profile-composite 일 때만 켠다.
+
+    ■ 왜 필요한가 (2026-08-10)
+      전체 프레임당 CPU 합성이 27.9~52.6ms 로 병목인데(전체의 63~77%),
+      그 안에 후보가 예닐곱 개다 — LANCZOS4 리사이즈, Lab 왕복 2회, 저주파 매칭,
+      선 어둡게, 타원 마스크 생성, float 합성.
+      **어느 것이 몇 ms 인지 모르는 채로 고치면 헛수고할 확률이 높다.**
+      비용은 크롭 면적에 비례하므로 얼굴이 큰 영상에서 재야 한다.
+    """
+    if not PROF_ON:
+        return
+    PROF[name] = PROF.get(name, 0.0) + (time.perf_counter() - t0) * 1000.0
+
 
 def probe_sar(path):
     """입력의 sample_aspect_ratio 를 (num, den) 로 돌려준다. 못 읽으면 (1, 1).
@@ -743,6 +777,8 @@ def main():
     ap.add_argument("--gan-onnx", default="gan_ckpt/animegan_512.onnx", dest="gan_onnx", help="ONNX GAN 경로(없으면 자동 export)")
     ap.add_argument("--gan-onnx-size", type=int, default=512, dest="gan_onnx_size", help="ONNX GAN 고정 입력크기")
     ap.add_argument("--max-frames", type=int, default=0, dest="max_frames", help="N프레임만 처리(측정용). 0=전체")
+    ap.add_argument("--profile-composite", action="store_true", dest="profile_composite",
+                    help="합성 내부를 단계별로 계측해 마지막에 표로 출력한다(진단용)")
     ap.add_argument("--no-sar-fix", action="store_true", dest="no_sar_fix",
                     help="아나모픽 정규화를 끈다(진단용). 기본은 켬 — 끄면 얼굴이 눌린 채 처리된다")
     ap.add_argument("--out", default="out/deid_cartoon.mp4")
@@ -761,6 +797,9 @@ def main():
     else:
         gs = args.gan_size or (512 if args.compile else 0)   # compile은 고정크기 필요→기본 512
         styl = AnimeGAN(half=args.half, gan_size=gs, compile=args.compile)
+
+    global PROF_ON
+    PROF_ON = args.profile_composite
 
     cap = cv2.VideoCapture(args.video)
     W = int(cap.get(3)); H = int(cap.get(4)); fps = cap.get(5) or 30.0; total = int(cap.get(7))
@@ -837,6 +876,11 @@ def main():
     print(f"프레임당 ms: 검출 {ms(t_det):.1f} | 합성 {ms(t_comp):.1f}"
           f"(그중 GAN {ms(t_styl):.1f}, CPU합성 {ms(t_comp_cpu):.1f}) | 인코딩write {ms(t_write):.1f}")
     print(f"GAN 호출 {styl.n}회, 호출당 {1000*styl.t/max(styl.n,1):.1f}ms")
+    if PROF_ON and PROF:
+        total = sum(PROF.values())
+        print("\n합성 내부 단계별 (프레임당 ms)")
+        for k, v in sorted(PROF.items(), key=lambda x: -x[1]):
+            print(f"  {k:<20}{v/max(i,1):8.2f}ms{100*v/max(total,1e-9):7.1f}%")
 
 if __name__ == "__main__":
     main()
