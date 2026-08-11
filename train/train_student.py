@@ -488,7 +488,10 @@ def _stage_light(img, rng, strength_max=0.85):
     #    검정 입력에서 얼굴을 그리게 하면 과제가 환각으로 변질된다 —
     #    --aug-level 3 단독 학습이 실패한 것과 같은 기전이다.
     #    어두운 분위기는 남기되 바닥은 들어올린다.
-    mu = float(f.mean())
+    #    평균은 **중앙 60%** 에서 잰다. 전체 평균으로 재면 배경이 밝을 때(역광·흰 벽)
+    #    AE 가 안 걸려 얼굴만 실루엣으로 죽는다. 학습 입력은 occ65 크롭이라 얼굴이 중앙이다.
+    y0, x0 = int(h * 0.2), int(w * 0.2)
+    mu = float(f[y0:h - y0, x0:w - x0].mean())
     lo = rng.uniform(0.10, 0.22)
     if mu < lo:
         f *= lo / max(mu, 1e-3)
