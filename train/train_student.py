@@ -378,8 +378,27 @@ def _dir_grid(h, w, ang):
     return math.cos(ang) * gx + math.sin(ang) * gy
 
 
+def _radial_grid(h, w, cx, cy):
+    """중심 (cx, cy)(정규화 -0.5~0.5 좌표)로부터의 거리 제곱. 그리드는 _GRID 캐시를 공유한다."""
+    key = (h, w)
+    if key not in _GRID:
+        yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+        _GRID[key] = (xx / max(w, 1) - 0.5, yy / max(h, 1) - 0.5)
+    gx, gy = _GRID[key]
+    return (gx - cx) ** 2 + (gy - cy) ** 2
+
+
+# 광원 색온도 (BGR 게인). 실제 촬영 광원은 무채색이 아니다.
+_LIGHT_TINTS = (
+    np.array([0.88, 0.97, 1.12], np.float32),   # 텅스텐 · 가로등 · 석양 (주황)
+    np.array([1.14, 1.01, 0.88], np.float32),   # 블루아워 · 달빛 · 그늘 (청)
+    np.array([0.94, 1.10, 0.94], np.float32),   # 형광 · 사무실 (녹)
+    np.array([0.96, 0.92, 1.14], np.float32),   # 네온 · 무대 (자홍)
+)
+
+
 def _stage_light(img, rng, strength_max=0.85):
-    """[input 전용] 촬영 조명을 흉내 낸다 — 방향성 키라이트 · 하드 그림자 · 저조도 · 리림.
+    """[input 전용] 촬영 조명을 흉내 낸다 — 광원 형태 · 차폐 패턴 · 색온도 · 저조도 · 리림.
 
     ■ 왜 필요한가 (2026-08-10)
       드라마 영상(swap13)에서 얼굴이 회백색으로 뜨고 이목구비가 무너졌다.
@@ -393,32 +412,86 @@ def _stage_light(img, rng, strength_max=0.85):
 
       포즈와 달리 조명은 **합성으로 흉내 낼 수 있다.** 그래서 teacher 굽기 예산(10.5시간)은
       포즈에 쓰고 조명은 여기서 만든다.
+
+    ■ 1차(08-10)가 너무 단순했다 (08-11 확장)
+      1차는 **무채색 평행광 1개 + sigmoid 경계 1개**가 전부였다. swap12/13 에서 개선은
+      확인됐으나 실제 촬영은 이보다 훨씬 다양하다. 네 가지를 더한다.
+
+      광원 형태   평행광만으로는 얼굴 위 **국소 하이라이트**가 안 생긴다.
+                  스탠드·촛불·가로등은 점광원이고 역제곱으로 감쇠한다.
+      필라이트    1차는 그림자 쪽이 그냥 죽었다. 실제로는 반사판·환경광이 바닥을 만든다.
+                  floor 를 두고, 낮으면 하드 / 높으면 소프트가 되게 한다.
+      차폐 패턴   블라인드 줄무늬 · 나뭇잎 얼룩. 경계가 하나뿐인 그림자는 실내 촬영의 일부일 뿐이다.
+      자동 노출   위가 전부 곱셈이라 겹치면 화면이 새까매진다. 실제 카메라는 얼굴에 노출을 맞춘다.
+                  시트로 확인했을 때 1차 구현은 표본의 절반이 판독 불가였다. ⑦에서 바닥을 든다.
+      색온도      **1차의 가장 큰 누락.** 조명이 전부 무채색이었다. 실내 촬영의 기본형은
+                  텅스텐 키(주황) + 창문 그림자(청) 처럼 **밝은 쪽과 그림자 쪽의 색이 다르다.**
+                  input 에만 걸리므로 학생은 "주황빛 얼굴 → 정상 색 카툰"을 배운다.
     """
     f = img.astype(np.float32) / 255.0
     h, w = f.shape[:2]
-    d = _dir_grid(h, w, rng.uniform(0, 2 * math.pi))
 
-    # ① 방향성 키라이트 — 한쪽은 밝고 반대쪽은 어둡다
-    ramp = 1.0 + rng.uniform(0.25, strength_max) * (d / 0.7)
+    # ① 광원 형태 — 평행광 또는 점광원.
+    #    n 은 [-1,1] 로 정규화한 "빛이 닿는 정도". +1=정면으로 받음, -1=완전 그림자.
+    if rng.random() < 0.30:
+        r2 = _radial_grid(h, w, rng.uniform(-0.55, 0.55), rng.uniform(-0.55, 0.55))
+        n = 2.0 / (1.0 + r2 / rng.uniform(0.02, 0.25)) - 1.0
+    else:
+        n = _dir_grid(h, w, rng.uniform(0, 2 * math.pi)) / 0.7
 
-    # ② 하드 그림자 경계 (창틀·벽 모서리). soft 가 작을수록 칼같은 경계
-    if rng.random() < 0.35:
-        edge = rng.uniform(-0.25, 0.25)
-        soft = rng.uniform(0.02, 0.18)
-        m = 1.0 / (1.0 + np.exp(-(d - edge) / soft))
+    # ② 키라이트 + 필라이트. floor 가 필라이트다 — 낮으면 하드, 높으면 소프트.
+    ramp = 1.0 + rng.uniform(0.25, strength_max) * n
+    ramp = np.maximum(ramp, rng.uniform(0.20, 0.60))
+
+    # ③ 차폐 패턴 — 창틀 경계 하나 / 블라인드 줄무늬 / 나뭇잎 얼룩
+    r = rng.random()
+    if r < 0.25:
+        d2 = _dir_grid(h, w, rng.uniform(0, 2 * math.pi))
+        m = 1.0 / (1.0 + np.exp(-(d2 - rng.uniform(-0.25, 0.25)) / rng.uniform(0.02, 0.18)))
         ramp = ramp * (1.0 - rng.uniform(0.30, 0.75) * (1.0 - m))
+    elif r < 0.40:
+        d2 = _dir_grid(h, w, rng.uniform(0, 2 * math.pi))
+        s = np.sin(d2 * (2 * math.pi / rng.uniform(0.10, 0.35)) + rng.uniform(0, 2 * math.pi))
+        m = 1.0 / (1.0 + np.exp(-s / rng.uniform(0.12, 0.60)))
+        ramp = ramp * (1.0 - rng.uniform(0.20, 0.55) * (1.0 - m))
+    elif r < 0.52:
+        k = int(rng.integers(4, 11))
+        g = cv2.resize(rng.normal(0.0, 1.0, (k, k)).astype(np.float32), (w, h),
+                       interpolation=cv2.INTER_CUBIC)
+        m = 1.0 / (1.0 + np.exp(-(g - rng.uniform(-0.3, 0.6)) / rng.uniform(0.08, 0.50)))
+        ramp = ramp * (1.0 - rng.uniform(0.25, 0.60) * (1.0 - m))
+
     f *= ramp[:, :, None]
 
-    # ③ 저조도 + 블랙 리프트(필름·야간 장면의 들린 검정)
+    # ④ 색온도 — 밝은 쪽과 그림자 쪽에 서로 반대 방향의 색이 실린다
+    if rng.random() < 0.70:
+        base = _LIGHT_TINTS[int(rng.integers(0, len(_LIGHT_TINTS)))]
+        amt = rng.uniform(0.25, 1.0)
+        lit = 1.0 + (base - 1.0) * amt
+        sha = 1.0 + (1.0 / base - 1.0) * amt * rng.uniform(0.0, 0.8)
+        t = np.clip((n + 1.0) * 0.5, 0.0, 1.0)[:, :, None]
+        f *= sha + (lit - sha) * t
+
+    # ⑤ 저조도 + 블랙 리프트(필름·야간 장면의 들린 검정)
     if rng.random() < 0.5:
-        f *= rng.uniform(0.25, 0.75)
+        f *= rng.uniform(0.30, 0.80)
         f += rng.uniform(0.0, 0.06)
 
-    # ④ 리림라이트 — 가장자리만 밝게, 색조 포함
+    # ⑥ 리림라이트 — 가장자리만 밝게, 색조 포함
     if rng.random() < 0.30:
-        rim = np.clip((np.abs(d) - 0.45) / 0.25, 0, 1)[:, :, None]
+        rim = np.clip((np.abs(n) - 0.65) / 0.35, 0, 1)[:, :, None]
         tint = rng.uniform(0.9, 1.5, size=(1, 1, 3)).astype(np.float32)
         f = f + rim * rng.uniform(0.15, 0.5) * tint
+
+    # ⑦ 자동 노출 — 실제 카메라는 얼굴에 노출을 맞춘다.
+    #    ①~⑥ 이 곱셈이라 그냥 두면 셋이 겹쳤을 때 화면이 새까매진다.
+    #    검정 입력에서 얼굴을 그리게 하면 과제가 환각으로 변질된다 —
+    #    --aug-level 3 단독 학습이 실패한 것과 같은 기전이다.
+    #    어두운 분위기는 남기되 바닥은 들어올린다.
+    mu = float(f.mean())
+    lo = rng.uniform(0.10, 0.22)
+    if mu < lo:
+        f *= lo / max(mu, 1e-3)
 
     return np.clip(f * 255.0, 0, 255).astype(np.uint8)
 
